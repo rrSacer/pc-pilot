@@ -768,20 +768,25 @@ export class Ops {
         return pids;
     }
 
-    // Wait for a new window of a process we spawned or, when byApp is set (the app had no
-    // window before our launch, e.g. a D-Bus activated one that gives no pid), of `app`.
-    async _waitNewWindow(app, pids, allBefore, waitMs, token, byApp) {
+    // Wait for a new window of a process we spawned (or a descendant), else of `app` per
+    // the tracker. Returns [window, spawned]; only a spawned one may be authored (a
+    // tracker match proves nothing: D-Bus activated apps give no pid, and an app's
+    // existing process may be the user's).
+    async _waitNewWindow(app, allBefore, waitMs, token) {
         const deadline = GLib.get_monotonic_time() + waitMs * 1000;
-        const ready = x => x.get_compositor_private() && x.get_frame_rect().width > 0;
-        const ours = x => pids.includes(x.get_pid()) ||
-            (byApp && app !== null && app.get_windows().includes(x));
+        const fresh = x => !allBefore.has(x.get_id()) &&
+            x.get_compositor_private() && x.get_frame_rect().width > 0;
         while (GLib.get_monotonic_time() < deadline) {
             await token.sleep(100);
-            const w = listWindows().find(x => !allBefore.has(x.get_id()) && ready(x) && ours(x));
-            if (w)
-                return w;
+            const wins = listWindows().filter(fresh);
+            const spawned = wins.find(x => this.session.spawnedByUs(x.get_pid()));
+            if (spawned)
+                return [spawned, true];
+            const tracked = app ? wins.find(x => app.get_windows().includes(x)) : null;
+            if (tracked)
+                return [tracked, false];
         }
-        return null;
+        return [null, false];
     }
 
     async _appLaunch(args, token) {
@@ -803,22 +808,20 @@ export class Ops {
             return result;
         }
         token.check(); // never launch for a session that is over
-        let pids;
         try {
-            pids = this._spawn(app.get_app_info(), uris);
+            this._spawn(app.get_app_info(), uris); // records the pids in the session
         } catch (e) {
             throw new OpError(E_FAILED, `launch failed: ${e.message}`);
         }
         // Opening URIs in a running app often reuses an existing window: don't wait long.
-        // For a running app only a window of the process we spawned is ours; a new window
-        // of the app's existing process may well be the user's.
-        const w = await this._waitNewWindow(app, pids, allBefore,
-            running ? Math.min(waitMs, 1500) : waitMs, token, !running);
+        const [w, spawned] = await this._waitNewWindow(app, allBefore,
+            running ? Math.min(waitMs, 1500) : waitMs, token);
         token.check();
         if (w) {
-            // Returned by our op: the AI's. If the session started the app, so is the
-            // rest of its family; a running app's other windows are the user's.
-            this.session.author(w, {family: !running});
+            // Returned to the AI and made by a process we spawned: the AI's. A tracker-only
+            // match is reported but stays the user's (ai:false).
+            if (spawned)
+                this.session.author(w);
             // Focus-stealing prevention can leave a freshly launched window unfocused;
             // the agent launched it to use it.
             await this._activate(w, token);
@@ -870,17 +873,17 @@ export class Ops {
         // The session starts the handler: its window (and family) is the AI's.
         const allBefore = new Set(listWindows().map(w => w.get_id()));
         token.check(); // immediately before launching
-        let pids;
         try {
-            pids = this._spawn(handler, [uri]);
+            this._spawn(handler, [uri]);
         } catch (e) {
             throw new OpError(E_FAILED, e.message);
         }
-        const w = await this._waitNewWindow(app, pids, allBefore, waitMs, token, true);
+        const [w, spawned] = await this._waitNewWindow(app, allBefore, waitMs, token);
         token.check();
         if (!w)
             return {};
-        this.session.author(w, {family: true});
+        if (spawned)
+            this.session.author(w);
         await this._activate(w, token);
         return {window: this._info(w)};
     }

@@ -2,18 +2,21 @@
 //
 // - Snapshot (taken right before the ack): windows with state, focus, pointer, workspace.
 //   `new` = created after it. That is a time fact, not a permission.
-// - Authorship: time is never authorization (apps open windows by themselves while the
-//   AI works). A window is the AI's (closable by the wrapup) only if
-//   (a) app.launch/open_uri returned it, or
-//   (b) it belongs to an application the session itself started: same app id or process
-//       as a window we got back from app.launch/open_uri for an app that was not running.
-//   Everything else created during the session stays `new` but is left alone.
+// - Authorship: neither time nor app ids are authorization (apps open windows by
+//   themselves while the AI works, and other processes share app ids). A window is the
+//   AI's (closable by the wrapup) only if
+//   (a) app.launch/open_uri returned it to the AI (it matched a process we spawned), or
+//   (b) its process is one we spawned, or a descendant of one.
+//   Everything else created during the session stays `new` but is left alone, including
+//   further windows of D-Bus activated or already-running apps: the AI closes those.
 // - Journal: for pre-existing windows, the properties our ops changed and the value we
 //   last applied. The wrapup restores a property only if it still holds that value.
 // - Wrapup memory: windows already asked to close and windows that appeared during a
 //   wrapup (e.g. "save changes?") are never sent a close (again).
 
-import {listWindows, windowInfo} from './windows.js';
+import GLib from 'gi://GLib';
+
+import {listWindows} from './windows.js';
 
 const GEOMETRY_SLOP = 2; // px; clients may round sizes
 export const PROPS = ['geometry', 'maximized', 'fullscreen', 'minimized'];
@@ -22,17 +25,19 @@ function workspaceOf(w) {
     return w.is_on_all_workspaces() ? -1 : (w.get_workspace()?.index() ?? -1);
 }
 
-// Keys identifying a window's application: its app id (unless the tracker only made up a
-// per-window one) and its process.
-export function windowKeys(w) {
-    const keys = [];
-    const appId = windowInfo(w).app_id;
-    if (appId && !appId.startsWith('window:'))
-        keys.push(`app:${appId}`);
-    const pid = w.get_pid();
-    if (pid > 0)
-        keys.push(`pid:${pid}`);
-    return keys;
+// Parent pid from /proc (an in-memory read), or 0.
+function parentPid(pid) {
+    try {
+        const [ok, bytes] = GLib.file_get_contents(`/proc/${pid}/stat`);
+        if (!ok)
+            return 0;
+        const stat = new TextDecoder().decode(bytes);
+        // "pid (comm) state ppid ...": comm may contain spaces/parens, so split after it.
+        const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+        return Number(rest[1]) || 0;
+    } catch {
+        return 0;
+    }
 }
 
 export function windowState(w) {
@@ -62,7 +67,8 @@ export class SessionState {
 
     _reset() {
         this._authored = new Set(); // explicitly returned by our ops
-        this._launched = new Set(); // keys (app:/pid:) of applications the session started
+        this._spawned = new Set(); // pids the session spawned
+        this._pidVerdict = new Map(); // pid -> descends from a spawned pid (cache)
         this._spawnedInWrapup = new Set();
         this._attempted = new Set();
         this._journal = new Map(); // id -> Map(prop -> value we last applied)
@@ -103,20 +109,35 @@ export class SessionState {
             this._spawnedInWrapup.add(w.get_id());
     }
 
-    // app.launch/open_uri returned this new window. family: the session started its
-    // application (it was not running), so the app's later windows are the AI's too.
-    author(w, {family = false} = {}) {
-        if (!this._snap || !this.isNew(w))
-            return;
-        this._authored.add(w.get_id());
-        if (family)
-            windowKeys(w).forEach(k => this._launched.add(k));
+    // app.launch/open_uri returned this new window to the AI.
+    author(w) {
+        if (this._snap && this.isNew(w))
+            this._authored.add(w.get_id());
     }
 
-    // The session spawned this process (app.launch/open_uri of an app not running).
+    // The session spawned this process (app.launch/open_uri).
     launchedPid(pid) {
-        if (this._snap && pid > 0)
-            this._launched.add(`pid:${pid}`);
+        if (this._snap && pid > 0) {
+            this._spawned.add(pid);
+            this._pidVerdict.clear();
+        }
+    }
+
+    // Is pid one we spawned, or a descendant of one?
+    spawnedByUs(pid) {
+        if (pid <= 0 || this._spawned.size === 0)
+            return false;
+        if (this._pidVerdict.has(pid))
+            return this._pidVerdict.get(pid);
+        let verdict = false;
+        for (let p = pid, depth = 0; p > 1 && depth < 32; p = parentPid(p), depth++) {
+            if (this._spawned.has(p)) {
+                verdict = true;
+                break;
+            }
+        }
+        this._pidVerdict.set(pid, verdict);
+        return verdict;
     }
 
     setWrapping(on) {
@@ -130,7 +151,7 @@ export class SessionState {
     isAuthored(w) {
         if (!this.isNew(w))
             return false;
-        return this._authored.has(w.get_id()) || windowKeys(w).some(k => this._launched.has(k));
+        return this._authored.has(w.get_id()) || this.spawnedByUs(w.get_pid());
     }
 
     spawnedInWrapup(w) {
