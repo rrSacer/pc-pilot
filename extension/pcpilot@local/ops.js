@@ -439,10 +439,16 @@ export class Ops {
                     await token.sleep(Math.max(1, Math.round(duration / steps)));
                 }
             } else {
-                // A drag is deliberate: gentle bow, no overshoot; duration_ms if given.
+                // A drag is deliberate: gentle bow, no overshoot. An explicit duration_ms is
+                // how long the button stays pressed: the glide may be capped (1.5 s in
+                // human style, 0 for a drag of < 2 px), the hold never is.
                 const path = planPath([x1, y1], [x2, y2], style,
                     {drag: true, duration: given ? Math.max(duration, 1) : undefined});
+                const t0 = GLib.get_monotonic_time();
                 await glide(this._input, path, token);
+                const held = (GLib.get_monotonic_time() - t0) / 1000;
+                if (given && held < duration)
+                    await token.sleep(Math.round(duration - held));
             }
             await this._moveTo(x2, y2, token);
             await token.sleep(30);
