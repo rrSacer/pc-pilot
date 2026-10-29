@@ -220,18 +220,21 @@ export class SessionState {
         return this._snap?.windows.get(w.get_id()) ?? null;
     }
 
-    // After one of our ops changed `props` of a pre-existing window, remember the values
-    // it now has (the state we applied).
-    record(w, props) {
-        if (!this._snap || this.isNew(w))
+    // After one of our ops ran on a pre-existing window, journal the properties (among
+    // `props`) that it actually changed since `before`, with the value it applied.
+    record(w, before, props = PROPS) {
+        if (!this._snap || this.isNew(w) || !before)
             return;
         const now = windowState(w);
+        const changed = props.filter(p => !sameProp(p, before[p], now[p]));
+        if (changed.length === 0)
+            return;
         let entry = this._journal.get(w.get_id());
         if (!entry) {
             entry = new Map();
             this._journal.set(w.get_id(), entry);
         }
-        for (const p of props)
+        for (const p of changed)
             entry.set(p, now[p]);
     }
 

@@ -16,7 +16,7 @@ import {MODIFIER_KEYVALS, charToKeyval, parseChord} from './keys.js';
 import {animate, glide} from './motion.js';
 import {STYLES, minJerk, planPath, scrollAnchor, scrollCadence, typingCadence} from './path.js';
 import {E_BAD_ARGS, E_FAILED, E_INACTIVE, E_NOT_FOUND, E_UNKNOWN_OP, OpError} from './protocol.js';
-import {PROPS, SessionState, restoreWindow} from './session.js';
+import {PROPS, SessionState, restoreWindow, sameProp, windowState} from './session.js';
 import {clampToMonitors, findWindow, listWindows, rect, windowInfo} from './windows.js';
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot');
@@ -933,23 +933,43 @@ export class Ops {
     // Activate a window on the AI's behalf, journaling what that changed.
     async _activateRecorded(w, token) {
         const ws = global.workspace_manager.get_active_workspace_index();
+        const before = windowState(w);
         await this._activate(w, token);
-        this.session.record(w, ACTION_PROPS.activate);
+        this.session.record(w, before, ACTION_PROPS.activate);
         const now = global.workspace_manager.get_active_workspace_index();
         if (now !== ws)
             this.session.recordWorkspace(now);
     }
 
+    // Wait (briefly) for a client to finish applying a new geometry.
+    async _settled(w, token) {
+        let last = windowState(w).geometry;
+        for (let i = 0; i < 8; i++) {
+            try {
+                await token.sleep(40);
+            } catch {
+                return; // session over: nothing to journal anyway
+            }
+            const now = windowState(w).geometry;
+            if (sameProp('geometry', last, now))
+                return;
+            last = now;
+        }
+    }
+
     async _windowAction(args, token) {
         const w = findWindow(args.id);
+        const props = args.action !== 'activate' ? ACTION_PROPS[args.action] : null;
+        const before = props ? windowState(w) : null;
         try {
             return await this._windowActionImpl(w, args, token);
         } finally {
-            // Journal whatever the action changed on a pre-existing window, even if it was
-            // interrupted half-way (the wrapup then restores only what still matches).
-            const props = ACTION_PROPS[args.action];
-            if (props && args.action !== 'activate')
-                this.session.record(w, props);
+            // Journal only what the action actually changed on a pre-existing window (even
+            // if interrupted half-way); the wrapup restores only values still in place.
+            if (props && this.session.baseline(w)) {
+                await this._settled(w, token);
+                this.session.record(w, before, props);
+            }
         }
     }
 
