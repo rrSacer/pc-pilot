@@ -16,7 +16,7 @@ import {MODIFIER_KEYVALS, charToKeyval, parseChord} from './keys.js';
 import {animate, glide} from './motion.js';
 import {STYLES, minJerk, planPath, scrollAnchor, scrollCadence, typingCadence} from './path.js';
 import {E_BAD_ARGS, E_FAILED, E_INACTIVE, E_NOT_FOUND, E_UNKNOWN_OP, OpError} from './protocol.js';
-import {SessionState, restoreWindow} from './session.js';
+import {PROPS, SessionState, restoreWindow} from './session.js';
 import {clampToMonitors, findWindow, listWindows, rect, windowInfo} from './windows.js';
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot');
@@ -45,6 +45,22 @@ const MAX_LAUNCH_WAIT_MS = 15000;
 const HUMAN_TYPING_EXTRA_MS = 4000;
 const GEOMETRY_MS = {human: 250, fast: 120, instant: 0};
 const WRAPUP_CAP_MS = 8000;
+// Ops that act on the desktop; windows appearing during/after them are attributed to
+// the AI (see session.js). Read-only ops and the wrapup itself are not.
+const AI_DRIVEN = new Set([
+    'pointer.move', 'pointer.click', 'pointer.drag', 'pointer.scroll',
+    'key.press', 'key.type', 'app.launch', 'open_uri', 'window.action',
+]);
+// Which journaled properties each window action changes on a pre-existing window.
+const ACTION_PROPS = {
+    activate: ['minimized'],
+    maximize: ['maximized', 'geometry'],
+    unmaximize: ['maximized', 'geometry'],
+    minimize: ['minimized'],
+    fullscreen: ['fullscreen', 'geometry'],
+    unfullscreen: ['fullscreen', 'geometry'],
+    resize: PROPS, move: PROPS, fit: PROPS,
+};
 const CLOSE_WAIT_MS = 1500;
 const MIN_WINDOW_PX = 80;
 
@@ -215,7 +231,12 @@ export class Ops {
             throw new OpError(E_UNKNOWN_OP, `unknown op: ${op}`);
         if (args === null || typeof args !== 'object' || Array.isArray(args))
             throw new OpError(E_BAD_ARGS, 'args must be an object');
-        return h.call(this, args, token);
+        if (!AI_DRIVEN.has(op))
+            return h.call(this, args, token);
+        // Windows created while this runs (or shortly after) are the AI's doing.
+        this.session.beginAiOp();
+        return Promise.resolve().then(() => h.call(this, args, token))
+            .finally(() => this.session.endAiOp());
     }
 
     // ---- screen ----
@@ -769,7 +790,7 @@ export class Ops {
             } else if (before.size > 0) {
                 // Already running: bring it forward rather than spawning another window.
                 const [w] = app.get_windows();
-                await this._activate(w, token);
+                await this._activateRecorded(w, token);
                 await token.sleep(100);
                 result.window = this._info(w);
                 return result;
@@ -795,6 +816,7 @@ export class Ops {
                     (Shell.WindowTracker.get_default().get_window_app(x)?.get_id() ?? 'window:')
                         .startsWith('window:'));
             if (w) {
+                this.session.author(w); // our op returned it: the AI's window
                 // Focus-stealing prevention can leave a freshly launched window unfocused;
                 // the agent launched it to use it.
                 await this._activate(w, token);
@@ -839,9 +861,10 @@ export class Ops {
             await token.sleep(50);
     }
 
-    // windowInfo plus `new`: created during this session.
+    // windowInfo plus `new` (created during this session) and `ai` (opened by the AI:
+    // what the wrapup will clean up).
     _info(w) {
-        return {...windowInfo(w), new: this.session.isNew(w)};
+        return {...windowInfo(w), new: this.session.isNew(w), ai: this.session.isAuthored(w)};
     }
 
     _windowList() {
@@ -900,8 +923,30 @@ export class Ops {
         return num(v, name, {min: MIN_WINDOW_PX, max: 32767});
     }
 
+    // Activate a window on the AI's behalf, journaling what that changed.
+    async _activateRecorded(w, token) {
+        const ws = global.workspace_manager.get_active_workspace_index();
+        await this._activate(w, token);
+        this.session.record(w, ACTION_PROPS.activate);
+        const now = global.workspace_manager.get_active_workspace_index();
+        if (now !== ws)
+            this.session.recordWorkspace(now);
+    }
+
     async _windowAction(args, token) {
         const w = findWindow(args.id);
+        try {
+            return await this._windowActionImpl(w, args, token);
+        } finally {
+            // Journal whatever the action changed on a pre-existing window, even if it was
+            // interrupted half-way (the wrapup then restores only what still matches).
+            const props = ACTION_PROPS[args.action];
+            if (props && args.action !== 'activate')
+                this.session.record(w, props);
+        }
+    }
+
+    async _windowActionImpl(w, args, token) {
         const style = styleOf(args);
         const time = global.get_current_time();
         const corner = r => [r.x + r.width - 10, r.y + r.height - 10];
@@ -941,7 +986,7 @@ export class Ops {
         }
         switch (args.action) {
         case 'activate':
-            await this._activate(w, token);
+            await this._activateRecorded(w, token);
             break;
         case 'close':
             w.delete(time);
@@ -1010,6 +1055,34 @@ export class Ops {
         return result;
     }
 
+    // Which new windows the wrapup may close. A window is closed only if the AI authored
+    // it and nothing in its transient family (root ancestor and everything under it) must
+    // be preserved: kept, pre-existing, not authored, or born during a wrapup. So keeping a
+    // dialog protects its parent, keeping a parent protects its dialogs, and dialogs of the
+    // user's own windows are never touched. Returns [[window, reason|null]] for new windows.
+    _closePlan(keep, closeNew) {
+        const all = listWindows();
+        const rootId = w => (w.find_root_ancestor?.() ?? w).get_id();
+        const s = this.session;
+        const pinned = w => keep.has(w.get_id()) || !s.isNew(w) || !s.isAuthored(w) ||
+            s.spawnedInWrapup(w);
+        const protectedRoots = new Set(all.filter(pinned).map(rootId));
+        return all.filter(w => s.isNew(w)).map(w => {
+            let reason = null;
+            if (keep.has(w.get_id()))
+                reason = 'kept';
+            else if (!closeNew)
+                reason = 'close_new=false';
+            else if (s.spawnedInWrapup(w) || s.attempted(w))
+                reason = 'not_closed'; // a refusal (or its dialog): never asked twice
+            else if (!s.isAuthored(w))
+                reason = 'not_authored';
+            else if (protectedRoots.has(rootId(w)))
+                reason = 'family_protected';
+            return [w, reason];
+        });
+    }
+
     async _wrapupSteps(keep, closeNew, returnTo, token, result) {
         const brief = w => ({id: w.get_id(), title: w.get_title() ?? '', app_id: windowInfo(w).app_id});
         const reported = new Set();
@@ -1018,49 +1091,57 @@ export class Ops {
             result.left_open.push({...brief(w), reason});
         };
 
-        // 1. Windows opened during the session.
+        // 1. Windows the AI opened during the session (see _closePlan for what is spared).
         const closing = [];
-        for (const w of listWindows().filter(x => this.session.isNew(x))) {
-            if (keep.has(w.get_id()))
-                leave(w, 'kept');
-            else if (!closeNew)
-                leave(w, 'close_new=false');
+        for (const [w, reason] of this._closePlan(keep, closeNew)) {
+            if (reason)
+                leave(w, reason);
             else
                 closing.push([w.get_id(), brief(w), w]);
         }
         if (closing.length > 0) {
-            const time = global.get_current_time();
-            for (const [, , w] of closing)
-                w.delete(time); // graceful: the app may ask to save instead
-            const deadline = GLib.get_monotonic_time() + CLOSE_WAIT_MS * 1000;
-            const open = () => new Set(listWindows().map(x => x.get_id()));
-            while (closing.some(([id]) => open().has(id)) && GLib.get_monotonic_time() < deadline)
-                await token.sleep(100);
-            const still = open();
+            this.session.setWrapping(true); // windows born now ("save?") are protected
+            try {
+                const time = global.get_current_time();
+                for (const [, , w] of closing) {
+                    this.session.markAttempted(w); // one request per window per session
+                    w.delete(time); // graceful: the app may ask to save instead
+                }
+                const deadline = GLib.get_monotonic_time() + CLOSE_WAIT_MS * 1000;
+                const open = () => new Set(listWindows().map(x => x.get_id()));
+                while (closing.some(([id]) => open().has(id)) && GLib.get_monotonic_time() < deadline)
+                    await token.sleep(100);
+            } finally {
+                this.session.setWrapping(false);
+            }
+            const now = new Set(listWindows().map(x => x.get_id()));
             for (const [id, info, w] of closing) {
-                if (still.has(id))
+                if (now.has(id))
                     leave(w, 'not_closed');
                 else
                     result.closed.push(info);
             }
             // Anything new that popped up meanwhile (e.g. "save changes?") stays, reported.
             for (const w of listWindows()) {
-                if (this.session.isNew(w) && !reported.has(w.get_id()) && !keep.has(w.get_id()))
-                    leave(w, 'not_closed');
+                if (this.session.isNew(w) && !reported.has(w.get_id()))
+                    leave(w, keep.has(w.get_id()) ? 'kept' : 'not_closed');
             }
         }
 
-        // 2. Pre-existing windows the session changed.
-        for (const [w, base] of this.session.changed()) {
+        // 2. Pre-existing windows: undo only properties our ops changed and that still hold
+        // the value we applied (an app or the user may have changed them since).
+        for (const [w, base, props] of this.session.restorable()) {
             try {
-                restoreWindow(w, base);
+                restoreWindow(w, base, props);
                 result.restored.push(w.get_id());
             } catch (e) {
                 console.warn(`pcpilot: could not restore window ${w.get_id()}: ${e.message}`);
             }
         }
         const ws = this.session.workspace;
-        if (ws !== null && global.workspace_manager.get_active_workspace_index() !== ws)
+        const applied = this.session.appliedWorkspace;
+        const active = global.workspace_manager.get_active_workspace_index();
+        if (ws !== null && applied !== null && active === applied && active !== ws)
             global.workspace_manager.get_workspace_by_index(ws)?.activate(global.get_current_time());
         if (result.restored.length > 0)
             await token.sleep(150);
