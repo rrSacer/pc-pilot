@@ -77,6 +77,7 @@ class PCPilotTrail extends St.DrawingArea {
         super._init({reactive: false, visible: false});
         this._points = []; // {x, y, t} in stage coords, oldest first
         this._origin = [0, 0];
+        this._head = null;
         this._timeline = null;
         this.connect('destroy', () => this._stopTicking());
     }
@@ -88,7 +89,10 @@ class PCPilotTrail extends St.DrawingArea {
         this._points.push({x, y, t: nowMs()});
         if (this._points.length > TRAIL_MAX_POINTS)
             this._points.shift();
-        this._ensureTicking();
+        if (this._timeline)
+            this._tick(); // follow the arrow now, not on the next frame
+        else
+            this._ensureTicking();
     }
 
     clear() {
@@ -101,7 +105,8 @@ class PCPilotTrail extends St.DrawingArea {
         if (this._timeline)
             return;
         // A repeating frame-clock timeline: ticks only while there is something to fade.
-        this._timeline = new Clutter.Timeline({duration: 1000, repeat_count: -1, actor: this});
+        // Bound to the stage: this actor is hidden (no frame clock) until it has points.
+        this._timeline = new Clutter.Timeline({duration: 1000, repeat_count: -1, actor: global.stage});
         this._timeline.connect('new-frame', () => this._tick());
         this._timeline.start();
         this._tick();
@@ -118,11 +123,18 @@ class PCPilotTrail extends St.DrawingArea {
         const cutoff = nowMs() - TRAIL_MS;
         while (this._points.length > 0 && this._points[0].t < cutoff)
             this._points.shift();
-        if (this._points.length < 2) {
-            this.clear();
+        if (this._points.length === 0) {
+            this.clear(); // everything faded: stop ticking until the pointer moves again
             return;
         }
-        let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+        if (this._points.length < 2) {
+            this.visible = false; // a single point is not a line yet
+            return;
+        }
+        // The newest end sits on the live pointer so the tail never lags behind the arrow.
+        const [hx, hy] = global.get_pointer();
+        this._head = {x: hx, y: hy};
+        let x1 = hx, y1 = hy, x2 = hx, y2 = hy;
         for (const p of this._points) {
             x1 = Math.min(x1, p.x);
             y1 = Math.min(y1, p.y);
@@ -139,15 +151,15 @@ class PCPilotTrail extends St.DrawingArea {
 
     vfunc_repaint() {
         const cr = this.get_context();
-        const pts = this._points;
         const now = nowMs();
+        const pts = this._head ? [...this._points, {...this._head, t: now}] : this._points;
         cr.setLineCap(Cairo.LineCap.ROUND);
         for (let i = 1; i < pts.length; i++) {
             const life = 1 - Math.min(1, (now - pts[i].t) / TRAIL_MS);
             if (life <= 0)
                 continue;
-            cr.setSourceRGBA(...TRAIL_RGB, 0.75 * life);
-            cr.setLineWidth(0.8 + 3.6 * life);
+            cr.setSourceRGBA(...TRAIL_RGB, 0.8 * life);
+            cr.setLineWidth(1.2 + 4.8 * life);
             cr.moveTo(pts[i - 1].x - this._origin[0], pts[i - 1].y - this._origin[1]);
             cr.lineTo(pts[i].x - this._origin[0], pts[i].y - this._origin[1]);
             cr.stroke();

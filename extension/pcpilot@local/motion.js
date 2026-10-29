@@ -29,7 +29,6 @@ export function animate(duration, onFrame, token) {
             if (stallId)
                 GLib.source_remove(stallId);
             stallId = 0;
-            timeline.disconnectObject?.(timeline);
             timeline.stop();
             if (error) {
                 reject(error);
