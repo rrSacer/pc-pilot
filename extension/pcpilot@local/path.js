@@ -100,15 +100,26 @@ export function planPath(from, to, style, opts = {}) {
 // Per-character pauses for "human" typing: 35-90 ms with a longer beat after spaces and
 // punctuation now and then; the whole thing is scaled down to stay under `capMs`.
 export function typingCadence(chars, capMs = 4000, rand = Math.random) {
-    const delays = chars.map(ch => {
+    const raw = chars.map(ch => {
         let d = 35 + rand() * 55;
         if (/[\s.,;:!?]/.test(ch) && rand() < 0.5)
             d += 60 + rand() * 120;
         return d;
     });
-    const sum = delays.reduce((a, b) => a + b, 0);
+    // Integer delays whose total never exceeds capMs: floor each scaled value, then hand
+    // the leftover milliseconds (fewer than one per character) to the largest remainders.
+    const sum = raw.reduce((a, b) => a + b, 0);
     const k = sum > capMs ? capMs / sum : 1;
-    return delays.map(d => Math.round(d * k));
+    const scaled = raw.map(d => d * k);
+    const out = scaled.map(Math.floor);
+    const budget = Math.min(Math.floor(capMs), Math.round(sum * k));
+    let left = budget - out.reduce((a, b) => a + b, 0);
+    if (left > 0) {
+        const order = scaled.map((d, i) => [d - Math.floor(d), i]).sort((a, b) => b[0] - a[0]);
+        for (let j = 0; j < order.length && left > 0; j++, left--)
+            out[order[j][1]]++;
+    }
+    return out;
 }
 
 // Gaps between wheel steps: slower at the ends, quicker in the middle.
