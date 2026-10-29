@@ -148,6 +148,11 @@ export default class PCPilotExtension extends Extension {
             return;
         }
         this._active = true;
+        try {
+            this._ops.session.snapshot(); // baseline for `new` windows and the wrapup
+        } catch (e) {
+            console.error(`pcpilot: session snapshot failed: ${e.message}`);
+        }
         this._writeTestState();
         const ack = {event: 'state_ack', active: true};
         if (this._session !== null)

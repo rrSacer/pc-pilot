@@ -14,6 +14,7 @@ import * as Keyboard from 'resource:///org/gnome/shell/ui/status/keyboard.js';
 import {BUTTONS, Input} from './input.js';
 import {MODIFIER_KEYVALS, charToKeyval, parseChord} from './keys.js';
 import {glide} from './motion.js';
+import {SessionState} from './session.js';
 import {findWindow, listWindows, windowInfo} from './windows.js';
 import {STYLES, planPath, scrollAnchor, scrollCadence, typingCadence} from './path.js';
 import {E_BAD_ARGS, E_FAILED, E_INACTIVE, E_NOT_FOUND, E_UNKNOWN_OP, OpError} from './protocol.js';
@@ -181,6 +182,7 @@ export class Ops {
         this._input = input;
         this._shots = [];
         this._shotSeq = 0;
+        this.session = new SessionState();
         this._handlers = {
             'screen.info': this._screenInfo,
             'screenshot': this._screenshot,
@@ -762,7 +764,7 @@ export class Ops {
                 const [w] = app.get_windows();
                 await this._activate(w, token);
                 await token.sleep(100);
-                result.window = windowInfo(w);
+                result.window = this._info(w);
                 return result;
             } else {
                 app.launch(0, -1, Shell.AppLaunchGpu.APP_PREF);
@@ -790,7 +792,7 @@ export class Ops {
                 // the agent launched it to use it.
                 await this._activate(w, token);
                 await token.sleep(100);
-                result.window = windowInfo(w);
+                result.window = this._info(w);
                 break;
             }
         }
@@ -798,7 +800,7 @@ export class Ops {
             const w = global.display.focus_window;
             const mine = w && app.get_windows().includes(w) ? w : app.get_windows()[0];
             if (mine)
-                result.window = windowInfo(mine);
+                result.window = this._info(mine);
         }
         return result;
     }
@@ -830,8 +832,13 @@ export class Ops {
             await token.sleep(50);
     }
 
+    // windowInfo plus `new`: created during this session.
+    _info(w) {
+        return {...windowInfo(w), new: this.session.isNew(w)};
+    }
+
     _windowList() {
-        return {windows: listWindows().map(windowInfo)};
+        return {windows: listWindows().map(w => this._info(w))};
     }
 
     async _windowAction(args, token) {
