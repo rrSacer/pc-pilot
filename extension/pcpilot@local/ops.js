@@ -5,7 +5,6 @@
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 
@@ -15,6 +14,7 @@ import * as Keyboard from 'resource:///org/gnome/shell/ui/status/keyboard.js';
 import {BUTTONS, Input} from './input.js';
 import {MODIFIER_KEYVALS, charToKeyval, parseChord} from './keys.js';
 import {glide} from './motion.js';
+import {findWindow, listWindows, windowInfo} from './windows.js';
 import {STYLES, planPath, scrollAnchor, scrollCadence, typingCadence} from './path.js';
 import {E_BAD_ARGS, E_FAILED, E_INACTIVE, E_NOT_FOUND, E_UNKNOWN_OP, OpError} from './protocol.js';
 
@@ -120,10 +120,6 @@ function str(v, name, {optional = false} = {}) {
     return v;
 }
 
-function rect(r) {
-    return {x: r.x, y: r.y, width: r.width, height: r.height};
-}
-
 function clipboardGetText() {
     return new Promise(resolve => {
         St.Clipboard.get_default().get_text(St.ClipboardType.CLIPBOARD, (_cb, text) => resolve(text));
@@ -177,47 +173,6 @@ async function pngSize(file) {
     } finally {
         stream.close(null);
     }
-}
-
-export function windowInfo(w) {
-    const f = w.get_frame_rect();
-    const b = w.get_buffer_rect();
-    const app = Shell.WindowTracker.get_default().get_window_app(w);
-    return {
-        id: w.get_id(),
-        title: w.get_title() ?? '',
-        app_id: app?.get_id() ?? w.get_gtk_application_id() ?? w.get_wm_class() ?? '',
-        pid: w.get_pid(),
-        ...rect(f),
-        buffer: rect(b),
-        focused: w.has_focus(),
-        minimized: w.minimized,
-        workspace: w.is_on_all_workspaces() ? -1 : (w.get_workspace()?.index() ?? -1),
-    };
-}
-
-const LISTED_TYPES = new Set([
-    Meta.WindowType.NORMAL, Meta.WindowType.DIALOG, Meta.WindowType.MODAL_DIALOG,
-    Meta.WindowType.UTILITY,
-]);
-
-function listWindows() {
-    const wins = global.get_window_actors()
-        .map(a => a.meta_window)
-        .filter(w => w && !w.is_override_redirect() && LISTED_TYPES.has(w.get_window_type()));
-    // Top of the stack first.
-    return global.display.sort_windows_by_stacking(wins).reverse();
-}
-
-function findWindow(id) {
-    if (typeof id === 'string' && /^\d+$/.test(id))
-        id = Number(id);
-    if (typeof id !== 'number')
-        throw new OpError(E_BAD_ARGS, 'id must be a window id');
-    const w = listWindows().find(x => x.get_id() === id);
-    if (!w)
-        throw new OpError(E_NOT_FOUND, `no window ${id}`);
-    return w;
 }
 
 export class Ops {
