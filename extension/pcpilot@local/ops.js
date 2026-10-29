@@ -1117,7 +1117,8 @@ export class Ops {
 
     // Which new windows the wrapup may close. A window is closed only if the AI authored
     // it and nothing in its transient family (root ancestor and everything under it) must
-    // be preserved: kept, pre-existing, not authored, or born during a wrapup. So keeping a
+    // be preserved: kept, pre-existing, not authored, born during a wrapup, or already
+    // asked to close. So keeping a
     // dialog protects its parent, keeping a parent protects its dialogs, and dialogs of the
     // user's own windows are never touched. Returns [[window, reason|null]] for new windows.
     _closePlan(keep, closeNew) {
@@ -1125,15 +1126,18 @@ export class Ops {
         const rootId = w => (w.find_root_ancestor?.() ?? w).get_id();
         const s = this.session;
         const pinned = w => keep.has(w.get_id()) || !s.isNew(w) || !s.isAuthored(w) ||
-            s.spawnedInWrapup(w);
+            s.spawnedInWrapup(w) || s.attempted(w);
         const protectedRoots = new Set(all.filter(pinned).map(rootId));
+        // A window we already asked to close (and refused) protects its whole family,
+        // including dialogs it opens later (e.g. a slow "save changes?").
+        const refusedRoots = new Set(all.filter(w => s.attempted(w)).map(rootId));
         return all.filter(w => s.isNew(w)).map(w => {
             let reason = null;
             if (keep.has(w.get_id()))
                 reason = 'kept';
             else if (!closeNew)
                 reason = 'close_new=false';
-            else if (s.spawnedInWrapup(w) || s.attempted(w))
+            else if (s.spawnedInWrapup(w) || s.attempted(w) || refusedRoots.has(rootId(w)))
                 reason = 'not_closed'; // a refusal (or its dialog): never asked twice
             else if (!s.isAuthored(w))
                 reason = 'not_authored';
