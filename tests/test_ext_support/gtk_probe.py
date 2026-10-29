@@ -120,7 +120,12 @@ def on_activate(app):
         log(ev="close_request", asked=state["asked"])
         if os.environ.get("PROBE_CONFIRM_CLOSE") == "1" and not state["asked"]:
             state["asked"] = True
-            dialog(TITLE + " Save?")
+            # PROBE_CONFIRM_DELAY_MS: a slow app that asks only after a while.
+            delay = int(os.environ.get("PROBE_CONFIRM_DELAY_MS", "0"))
+            if delay > 0:
+                GLib.timeout_add(delay, lambda: (dialog(TITLE + " Save?"), False)[1])
+            else:
+                dialog(TITLE + " Save?")
             return True
         return False
 
