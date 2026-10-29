@@ -43,7 +43,7 @@ function settleWithin(promise, ms) {
 
 export default class PCPilotExtension extends Extension {
     enable() {
-        this._overlay = new Overlay();
+        this._overlay = new Overlay({onCursorChange: () => this._writeTestState()});
         this._input = new Input();
         this._ops = new Ops({overlay: this._overlay, input: this._input});
         this._gen = 0;
@@ -148,6 +148,7 @@ export default class PCPilotExtension extends Extension {
             return;
         }
         this._active = true;
+        this._writeTestState();
         const ack = {event: 'state_ack', active: true};
         if (this._session !== null)
             ack.session = this._session;
@@ -160,11 +161,48 @@ export default class PCPilotExtension extends Extension {
         this._active = false;
         this._session = null;
         this._sessionUp = false;
-        this._token.cancel();
-        this._flush();
-        this._input?.releaseAll();
-        this._restoreHotCorners();
-        this._overlay?.hide(wasUp && reason !== null ? toastText(reason) : null);
+        // Every step runs even if an earlier one throws; the user's cursor comes first.
+        const steps = [
+            () => this._overlay?.cursor?.release(),
+            () => this._token.cancel(), // stops glides, animations and a wrapup in flight
+            () => this._flush(),
+            () => this._input?.releaseAll(),
+            () => this._restoreHotCorners(),
+            () => this._overlay?.hide(wasUp && reason !== null ? toastText(reason) : null),
+            () => this._ops?.session?.clear(),
+        ];
+        for (const step of steps) {
+            try {
+                step();
+            } catch (e) {
+                console.error(`pcpilot: cleanup step failed: ${e.message}\n${e.stack}`);
+            }
+        }
+        this._writeTestState();
+    }
+
+    // Test-only introspection (PCPILOT_TEST_HOOKS=1 in the shell's environment, set by the
+    // headless test harness, never in a real session): cursor/session state as JSON in
+    // $XDG_RUNTIME_DIR/pcpilot/test-state.json, written on every state change.
+    _writeTestState() {
+        if (GLib.getenv('PCPILOT_TEST_HOOKS') !== '1')
+            return;
+        try {
+            const dir = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'pcpilot']);
+            GLib.mkdir_with_parents(dir, 0o700);
+            const tracker = global.backend.get_cursor_tracker();
+            GLib.file_set_contents(GLib.build_filenamev([dir, 'test-state.json']), JSON.stringify({
+                active: this._active,
+                session: this._session,
+                cursor_inhibited: this._overlay?.cursor?.inhibited ?? false,
+                cursor_engaged: this._overlay?.cursor?.engaged ?? false,
+                real_cursor_visible: tracker.get_pointer_visible(),
+                hot_corners_suspended: this._hotCornersId !== 0,
+                time: GLib.get_monotonic_time(),
+            }));
+        } catch (e) {
+            console.warn(`pcpilot: test state: ${e.message}`);
+        }
     }
 
     // Refuse everything still queued (it belongs to a session that is over).

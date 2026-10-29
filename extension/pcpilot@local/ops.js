@@ -385,6 +385,7 @@ export class Ops {
 
     // Glide along a human/fast path, then land exactly (also covers the first-event quirk).
     async _glideTo(x, y, style, token, opts = {}) {
+        this._overlay.engageCursor?.();
         if (style !== 'instant') {
             const [px, py] = global.get_pointer();
             const path = planPath([px, py], [x, y], style, opts);
@@ -442,6 +443,7 @@ export class Ops {
             for (let i = 0; i < count; i++) {
                 if (i > 0)
                     await token.sleep(40);
+                this._overlay.cursor?.ripple();
                 this._input.button(button, true);
                 await token.sleep(10);
                 this._input.button(button, false);
@@ -516,6 +518,9 @@ export class Ops {
         ];
         for (const [n, dir] of steps) {
             const gaps = scrollCadence(n, style);
+            if (n > 0)
+                this._overlay.cursor?.scrollHint(
+                    dir === Clutter.ScrollDirection.DOWN || dir === Clutter.ScrollDirection.RIGHT ? 1 : -1);
             for (let i = 0; i < n; i++) {
                 this._input.scroll(dir);
                 await token.sleep(gaps[i]);

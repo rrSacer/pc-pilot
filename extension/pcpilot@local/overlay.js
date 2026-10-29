@@ -8,6 +8,8 @@ import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
+import {AICursor} from './cursor.js';
+
 const RED = '#ff453a';
 const PULSE_MS = 1400;
 const TOAST_MS = 2500;
@@ -18,7 +20,8 @@ function esc(s) {
 }
 
 export class Overlay {
-    constructor() {
+    // onCursorChange: called whenever the AI cursor is engaged/released.
+    constructor({onCursorChange = null} = {}) {
         this._active = false;
         this._label = 'IA';
         this._hotkey = 'Ctrl+Alt+Esc';
@@ -69,11 +72,28 @@ export class Overlay {
         this._pill.add_child(pillLine);
         this._pill.add_child(this._pillStatus);
 
+        // The AI cursor lives in the overlay group: hidden from screenshots with it.
+        this._cursorLayer = new St.Widget({reactive: false});
+        this._group.add_child(this._cursorLayer);
+        this._cursor = new AICursor(this._cursorLayer, onCursorChange);
+
         this._monitorsId = Main.layoutManager.connect('monitors-changed', () => this._build());
         this._build();
     }
 
+    get cursor() {
+        return this._cursor;
+    }
+
+    // Show the AI cursor again (e.g. an op after a wrapup faded it) while a session is up.
+    engageCursor() {
+        if (this._active)
+            this._cursor?.engage();
+    }
+
     destroy() {
+        this._cursor?.destroy(); // gives the real cursor back first
+        this._cursor = null;
         this._stopPulse();
         if (this._toastId)
             GLib.source_remove(this._toastId);
@@ -141,6 +161,7 @@ export class Overlay {
             this._toastBox.set({x: primary.x, y: primary.y, width: primary.width, height: primary.height});
             this._group.add_child(this._toastBox);
         }
+        this._group.set_child_above_sibling(this._cursorLayer, null);
         this._sync();
     }
 
@@ -173,10 +194,13 @@ export class Overlay {
         this._sync();
         this._raise();
         this._startPulse();
+        this._cursor.engage();
         return this._waitPainted();
     }
 
     hide(toastText = null) {
+        // Real cursor back immediately, on every end path, before anything else.
+        this._cursor?.release();
         if (!this._group)
             return;
         this._active = false;
