@@ -2,30 +2,21 @@
 //
 // - Snapshot (taken right before the ack): windows with state, focus, pointer, workspace.
 //   `new` = created after it. That is a time fact, not a permission.
-// - Authorship: a window is the AI's (closable by the wrapup) only if
-//   (a) one of our ops returned it (app.launch), or
-//   (b) it was created while an AI-driven op was running or within ATTRIBUTION_MS after
-//       one, AND it belongs to the same application as that op's target: the app/pid of
-//       the focused window or of the window under the pointer when the op started or
-//       ended, or an app the session launched/opened.
-//   Windows of any other application stay `new` but are left alone. Residual: a window
-//   the same application opens on its own during an AI op is still taken as the AI's.
+// - Authorship: time is never authorization (apps open windows by themselves while the
+//   AI works). A window is the AI's (closable by the wrapup) only if
+//   (a) app.launch/open_uri returned it, or
+//   (b) it belongs to an application the session itself started: same app id or process
+//       as a window we got back from app.launch/open_uri for an app that was not running.
+//   Everything else created during the session stays `new` but is left alone.
 // - Journal: for pre-existing windows, the properties our ops changed and the value we
 //   last applied. The wrapup restores a property only if it still holds that value.
 // - Wrapup memory: windows already asked to close and windows that appeared during a
 //   wrapup (e.g. "save changes?") are never sent a close (again).
 
-import GLib from 'gi://GLib';
-
 import {listWindows, windowInfo} from './windows.js';
 
-export const ATTRIBUTION_MS = 3000;
 const GEOMETRY_SLOP = 2; // px; clients may round sizes
 export const PROPS = ['geometry', 'maximized', 'fullscreen', 'minimized'];
-
-function nowMs() {
-    return GLib.get_monotonic_time() / 1000;
-}
 
 function workspaceOf(w) {
     return w.is_on_all_workspaces() ? -1 : (w.get_workspace()?.index() ?? -1);
@@ -41,24 +32,6 @@ export function windowKeys(w) {
     const pid = w.get_pid();
     if (pid > 0)
         keys.push(`pid:${pid}`);
-    return keys;
-}
-
-// The AI's current targets: the focused window and the window under the pointer.
-function targetKeys() {
-    const keys = new Set();
-    const focus = global.display.focus_window;
-    if (focus)
-        windowKeys(focus).forEach(k => keys.add(k));
-    const [px, py] = global.get_pointer();
-    const under = listWindows().find(w => {
-        if (w.minimized || !w.showing_on_its_workspace())
-            return false;
-        const f = w.get_frame_rect();
-        return px >= f.x && px < f.x + f.width && py >= f.y && py < f.y + f.height;
-    });
-    if (under)
-        windowKeys(under).forEach(k => keys.add(k));
     return keys;
 }
 
@@ -89,9 +62,7 @@ export class SessionState {
 
     _reset() {
         this._authored = new Set(); // explicitly returned by our ops
-        this._candidates = new Map(); // id -> Set of target keys active at its creation
-        this._attribution = []; // [{inFlight, until, targets: Set}]
-        this._launched = new Set(); // target keys of apps the session launched/opened
+        this._launched = new Set(); // keys (app:/pid:) of applications the session started
         this._spawnedInWrapup = new Set();
         this._attempted = new Set();
         this._journal = new Map(); // id -> Map(prop -> value we last applied)
@@ -126,53 +97,26 @@ export class SessionState {
     }
 
     _onCreated(w) {
-        if (!this._snap)
-            return;
-        const id = w.get_id();
-        if (this._wrapping) {
-            this._spawnedInWrapup.add(id); // a reaction to our close request: protected
-            return;
-        }
-        const now = nowMs();
-        this._attribution = this._attribution.filter(e => e.inFlight || now <= e.until);
-        if (this._attribution.length === 0)
-            return;
-        // The window's app is often unknown this early; remember the targets and match
-        // lazily (isAuthored).
-        const targets = new Set(this._launched);
-        for (const e of this._attribution)
-            e.targets.forEach(k => targets.add(k));
-        this._candidates.set(id, targets);
+        // Only to protect windows born during a wrapup (e.g. "save changes?"); creation
+        // time never makes a window the AI's.
+        if (this._snap && this._wrapping)
+            this._spawnedInWrapup.add(w.get_id());
     }
 
-    // AI-driven ops (input, launch, window actions) bracket themselves with these.
-    beginAiOp() {
-        const entry = {inFlight: true, until: 0, targets: targetKeys()};
-        this._attribution.push(entry);
-        return entry;
-    }
-
-    endAiOp(entry) {
-        if (!entry)
+    // app.launch/open_uri returned this new window. family: the session started its
+    // application (it was not running), so the app's later windows are the AI's too.
+    author(w, {family = false} = {}) {
+        if (!this._snap || !this.isNew(w))
             return;
-        targetKeys().forEach(k => entry.targets.add(k)); // e.g. what a click landed on
-        entry.inFlight = false;
-        entry.until = nowMs() + ATTRIBUTION_MS;
-    }
-
-    // An op returned this window as its result (e.g. app.launch): it is the AI's, and so
-    // is its application from now on.
-    author(w) {
-        if (this._snap && this.isNew(w)) {
-            this._authored.add(w.get_id());
+        this._authored.add(w.get_id());
+        if (family)
             windowKeys(w).forEach(k => this._launched.add(k));
-        }
     }
 
-    // The session launched/opened this application (app.launch, open_uri's handler).
-    launchedApp(appId) {
-        if (this._snap && appId)
-            this._launched.add(`app:${appId}`);
+    // The session spawned this process (app.launch/open_uri of an app not running).
+    launchedPid(pid) {
+        if (this._snap && pid > 0)
+            this._launched.add(`pid:${pid}`);
     }
 
     setWrapping(on) {
@@ -186,10 +130,7 @@ export class SessionState {
     isAuthored(w) {
         if (!this.isNew(w))
             return false;
-        if (this._authored.has(w.get_id()))
-            return true;
-        const targets = this._candidates.get(w.get_id());
-        return targets !== undefined && windowKeys(w).some(k => targets.has(k));
+        return this._authored.has(w.get_id()) || windowKeys(w).some(k => this._launched.has(k));
     }
 
     spawnedInWrapup(w) {

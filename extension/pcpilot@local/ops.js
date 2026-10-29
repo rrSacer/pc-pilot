@@ -27,10 +27,10 @@ Gio._promisify(Gio.File.prototype, 'delete_async');
 Gio._promisify(Gio.File.prototype, 'make_directory_async');
 Gio._promisify(Gio.File.prototype, 'query_info_async');
 Gio._promisify(Gio.File.prototype, 'set_attributes_async');
-Gio._promisify(Gio.AppInfo.prototype, 'launch_uris_async');
 Gio._promisify(Gio.InputStream.prototype, 'read_bytes_async');
 Gio._promisify(Gio.OutputStream.prototype, 'close_async');
 Gio._promisify(Gio.AppInfo, 'launch_default_for_uri_async');
+Gio._promisify(Gio.File.prototype, 'query_default_handler_async');
 
 const KEEP_SCREENSHOTS = 10;
 const MAX_TEXT = 20000;
@@ -231,13 +231,7 @@ export class Ops {
             throw new OpError(E_UNKNOWN_OP, `unknown op: ${op}`);
         if (args === null || typeof args !== 'object' || Array.isArray(args))
             throw new OpError(E_BAD_ARGS, 'args must be an object');
-        if (!AI_DRIVEN.has(op))
-            return h.call(this, args, token);
-        // Windows of the target app created while this runs (or shortly after) are the
-        // AI's doing.
-        const attribution = this.session.beginAiOp();
-        return Promise.resolve().then(() => h.call(this, args, token))
-            .finally(() => this.session.endAiOp(attribution));
+        return h.call(this, args, token);
     }
 
     // ---- screen ----
@@ -774,83 +768,122 @@ export class Ops {
         return app;
     }
 
+    // Spawn an app (optionally with URIs) and collect the pids we started, so its windows
+    // can be matched without guessing (the tracker may not map them to the .desktop).
+    _spawn(info, uris) {
+        const pids = [];
+        const ctx = global.create_app_launch_context(0, -1);
+        if (info instanceof Gio.DesktopAppInfo) {
+            info.launch_uris_as_manager(uris, ctx, GLib.SpawnFlags.SEARCH_PATH, null,
+                (_info, pid) => pids.push(pid));
+        } else {
+            info.launch_uris(uris, ctx);
+        }
+        for (const pid of pids)
+            this.session.launchedPid(pid);
+        return pids;
+    }
+
+    // Wait for a new window of `app` (tracker match) or of a process we spawned.
+    async _waitNewWindow(app, pids, allBefore, waitMs, token) {
+        const deadline = GLib.get_monotonic_time() + waitMs * 1000;
+        const ready = x => x.get_compositor_private() && x.get_frame_rect().width > 0;
+        const ours = x => (app && app.get_windows().includes(x)) || pids.includes(x.get_pid());
+        while (GLib.get_monotonic_time() < deadline) {
+            await token.sleep(100);
+            const w = listWindows().find(x => !allBefore.has(x.get_id()) && ready(x) && ours(x));
+            if (w)
+                return w;
+        }
+        return null;
+    }
+
     async _appLaunch(args, token) {
         const app = this._resolveApp(str(args.app, 'app'));
         const uris = args.uris ?? [];
         if (!Array.isArray(uris) || uris.some(u => typeof u !== 'string'))
             throw new OpError(E_BAD_ARGS, 'uris must be an array of strings');
         const waitMs = num(args.wait_ms, 'wait_ms', {min: 0, max: MAX_LAUNCH_WAIT_MS, def: 8000});
-        const before = new Set(app.get_windows().map(w => w.get_id()));
+        const running = app.get_windows().length > 0;
         const allBefore = new Set(listWindows().map(w => w.get_id()));
         const result = {app_id: app.get_id(), name: app.get_name()};
-        this.session.launchedApp(app.get_id());
 
+        if (running && uris.length === 0) {
+            // Already running: bring it forward rather than spawning another window.
+            const [w] = app.get_windows();
+            await this._activateRecorded(w, token);
+            await token.sleep(100);
+            result.window = this._info(w);
+            return result;
+        }
+        let pids;
         try {
-            if (uris.length > 0) {
-                await app.get_app_info().launch_uris_async(uris,
-                    global.create_app_launch_context(0, -1), token.cancellable);
-            } else if (before.size > 0) {
-                // Already running: bring it forward rather than spawning another window.
-                const [w] = app.get_windows();
-                await this._activateRecorded(w, token);
-                await token.sleep(100);
-                result.window = this._info(w);
-                return result;
-            } else {
-                app.launch(0, -1, Shell.AppLaunchGpu.APP_PREF);
-            }
+            pids = this._spawn(app.get_app_info(), uris);
         } catch (e) {
-            if (e instanceof OpError)
-                throw e;
             throw new OpError(E_FAILED, `launch failed: ${e.message}`);
         }
-
         // Opening URIs in a running app often reuses an existing window: don't wait long.
-        const wait = before.size > 0 ? Math.min(waitMs, 1500) : waitMs;
-        const deadline = GLib.get_monotonic_time() + wait * 1000;
-        while (GLib.get_monotonic_time() < deadline) {
+        const w = await this._waitNewWindow(app, pids, allBefore,
+            running ? Math.min(waitMs, 1500) : waitMs, token);
+        if (w) {
+            // Returned by our op: the AI's. If the session started the app, so is the
+            // rest of its family; a running app's other windows are the user's.
+            this.session.author(w, {family: !running});
+            // Focus-stealing prevention can leave a freshly launched window unfocused;
+            // the agent launched it to use it.
+            await this._activate(w, token);
             await token.sleep(100);
-            const ready = x => x.get_compositor_private() && x.get_frame_rect().width > 0;
-            // Prefer windows the tracker matched to this app; else a brand-new window it
-            // could not match to any .desktop file (app_id/StartupWMClass mismatch).
-            const w = app.get_windows().find(x => !before.has(x.get_id()) && ready(x)) ??
-                listWindows().find(x => !allBefore.has(x.get_id()) && ready(x) &&
-                    (Shell.WindowTracker.get_default().get_window_app(x)?.get_id() ?? 'window:')
-                        .startsWith('window:'));
-            if (w) {
-                this.session.author(w); // our op returned it: the AI's window
-                // Focus-stealing prevention can leave a freshly launched window unfocused;
-                // the agent launched it to use it.
-                await this._activate(w, token);
-                await token.sleep(100);
-                result.window = this._info(w);
-                break;
-            }
-        }
-        if (!result.window && before.size > 0) {
-            const w = global.display.focus_window;
-            const mine = w && app.get_windows().includes(w) ? w : app.get_windows()[0];
+            result.window = this._info(w);
+        } else if (running) {
+            const f = global.display.focus_window;
+            const mine = f && app.get_windows().includes(f) ? f : app.get_windows()[0];
             if (mine)
                 result.window = this._info(mine);
         }
         return result;
     }
 
-    async _openUri(args) {
+    async _defaultHandler(uri) {
+        if (GLib.uri_peek_scheme(uri) !== 'file')
+            return Gio.AppInfo.get_default_for_uri_scheme(GLib.uri_peek_scheme(uri));
+        try {
+            return await Gio.File.new_for_uri(uri).query_default_handler_async(GLib.PRIORITY_DEFAULT, null);
+        } catch {
+            return null;
+        }
+    }
+
+    async _openUri(args, token) {
         const uri = str(args.uri, 'uri');
         if (!GLib.uri_peek_scheme(uri))
             throw new OpError(E_BAD_ARGS, 'uri needs a scheme (https://, file://, ...)');
-        // The handler's windows during/after this op are the AI's (session.js).
-        const scheme = GLib.uri_peek_scheme(uri);
-        const handler = scheme === 'file'
-            ? null : Gio.AppInfo.get_default_for_uri_scheme(scheme);
-        this.session.launchedApp(handler?.get_id());
+        const waitMs = num(args.wait_ms, 'wait_ms', {min: 0, max: MAX_LAUNCH_WAIT_MS, def: 8000});
+        const handler = await this._defaultHandler(uri);
+        const app = handler ? Shell.AppSystem.get_default().lookup_app(handler.get_id()) : null;
+        if (!handler || (app && app.get_windows().length > 0)) {
+            // The handler is already running (its new tab/window is not attributable to
+            // us), or unknown: just open it.
+            try {
+                await Gio.AppInfo.launch_default_for_uri_async(uri, global.create_app_launch_context(0, -1), null);
+            } catch (e) {
+                throw new OpError(E_FAILED, e.message);
+            }
+            return {};
+        }
+        // The session starts the handler: its window (and family) is the AI's.
+        const allBefore = new Set(listWindows().map(w => w.get_id()));
+        let pids;
         try {
-            await Gio.AppInfo.launch_default_for_uri_async(uri, global.create_app_launch_context(0, -1), null);
+            pids = this._spawn(handler, [uri]);
         } catch (e) {
             throw new OpError(E_FAILED, e.message);
         }
-        return {};
+        const w = await this._waitNewWindow(app, pids, allBefore, waitMs, token);
+        if (!w)
+            return {};
+        this.session.author(w, {family: true});
+        await this._activate(w, token);
+        return {window: this._info(w)};
     }
 
     // Main.activateWindow() hides the overview, but that is a no-op while the overview is
