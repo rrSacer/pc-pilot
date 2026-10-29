@@ -1,0 +1,8 @@
+{
+  "uuid": "pcpilot@local",
+  "name": "PCPilot",
+  "description": "Overlay, screenshot and input injection for the PCPilot daemon (AI desktop control). Client of /run/pcpilot/pcpilot.sock; exposes nothing on D-Bus.",
+  "shell-version": ["51"],
+  "session-modes": ["user"],
+  "version": 1
+}
