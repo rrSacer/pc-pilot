@@ -16,7 +16,7 @@ import {MODIFIER_KEYVALS, charToKeyval, parseChord} from './keys.js';
 import {animate, glide} from './motion.js';
 import {STYLES, minJerk, planPath, scrollAnchor, scrollCadence, typingCadence} from './path.js';
 import {E_BAD_ARGS, E_FAILED, E_INACTIVE, E_NOT_FOUND, E_UNKNOWN_OP, OpError} from './protocol.js';
-import {PROPS, SessionState, restoreWindow, sameProp, windowState} from './session.js';
+import {SessionState, restoreWindow, sameProp, windowState} from './session.js';
 import {clampToMonitors, findWindow, listWindows, rect, windowInfo} from './windows.js';
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot');
@@ -45,22 +45,6 @@ const MAX_LAUNCH_WAIT_MS = 15000;
 const HUMAN_TYPING_EXTRA_MS = 4000;
 const GEOMETRY_MS = {human: 250, fast: 120, instant: 0};
 const WRAPUP_CAP_MS = 8000;
-// Ops that act on the desktop; windows appearing during/after them are attributed to
-// the AI (see session.js). Read-only ops and the wrapup itself are not.
-const AI_DRIVEN = new Set([
-    'pointer.move', 'pointer.click', 'pointer.drag', 'pointer.scroll',
-    'key.press', 'key.type', 'app.launch', 'open_uri', 'window.action',
-]);
-// Which journaled properties each window action changes on a pre-existing window.
-const ACTION_PROPS = {
-    activate: ['minimized'],
-    maximize: ['maximized', 'geometry'],
-    unmaximize: ['maximized', 'geometry'],
-    minimize: ['minimized'],
-    fullscreen: ['fullscreen', 'geometry'],
-    unfullscreen: ['fullscreen', 'geometry'],
-    resize: PROPS, move: PROPS, fit: PROPS,
-};
 const CLOSE_WAIT_MS = 1500;
 const MIN_WINDOW_PX = 80;
 
@@ -912,16 +896,20 @@ export class Ops {
     }
 
     // Leave fullscreen/maximized/minimized so the frame can be moved/resized freely.
-    async _freeGeometry(w, token) {
+    // `mut` collects the properties actually mutated (for the journal).
+    async _freeGeometry(w, token, mut) {
         if (w.minimized) {
+            mut.add('minimized');
             w.unminimize();
             await token.sleep(60);
         }
         if (w.is_fullscreen()) {
+            mut.add('fullscreen');
             w.unmake_fullscreen();
             await token.sleep(150);
         }
         if (w.is_maximized()) {
+            mut.add('maximized');
             w.unmaximize();
             await token.sleep(150);
         }
@@ -929,8 +917,8 @@ export class Ops {
 
     // Interpolate the frame to `target` on the frame clock; in human style the pointer
     // glides to `grip` meanwhile (purely visual: no button is pressed).
-    async _animateGeometry(w, target, grip, style, token) {
-        await this._freeGeometry(w, token);
+    async _animateGeometry(w, target, grip, style, token, mut) {
+        await this._freeGeometry(w, token, mut);
         const f = w.get_frame_rect();
         const from = {x: f.x, y: f.y, width: f.width, height: f.height};
         const to = {
@@ -940,6 +928,7 @@ export class Ops {
             height: w.allows_resize() ? Math.round(target.height) : from.height,
         };
         const dur = GEOMETRY_MS[style];
+        mut.add('geometry');
         const geometry = animate(dur, ms => {
             const k = dur > 0 ? minJerk(ms / dur) : 1;
             w.move_resize_frame(true,
@@ -968,7 +957,8 @@ export class Ops {
         const ws = global.workspace_manager.get_active_workspace_index();
         const before = windowState(w);
         await this._activate(w, token);
-        this.session.record(w, before, ACTION_PROPS.activate);
+        if (before.minimized) // activation only mutates the minimized state
+            this.session.record(w, before, ['minimized']);
         const now = global.workspace_manager.get_active_workspace_index();
         if (now !== ws)
             this.session.recordWorkspace(now);
@@ -992,21 +982,23 @@ export class Ops {
 
     async _windowAction(args, token) {
         const w = findWindow(args.id);
-        const props = args.action !== 'activate' ? ACTION_PROPS[args.action] : null;
-        const before = props ? windowState(w) : null;
+        const before = windowState(w);
+        const mut = new Set(); // properties this call really mutated (no-ops add nothing)
         try {
-            return await this._windowActionImpl(w, args, token);
+            return await this._windowActionImpl(w, args, token, mut);
         } finally {
-            // Journal only what the action actually changed on a pre-existing window (even
-            // if interrupted half-way); the wrapup restores only values still in place.
-            if (props && this.session.baseline(w)) {
-                await this._settled(w, token);
-                this.session.record(w, before, props);
+            // Journal only effective mutations on a pre-existing window, even if the action
+            // was interrupted half-way, and only where the value really moved; the wrapup
+            // restores only values that are still the ones we applied.
+            if (mut.size > 0 && this.session.baseline(w)) {
+                if (mut.has('geometry'))
+                    await this._settled(w, token);
+                this.session.record(w, before, [...mut]);
             }
         }
     }
 
-    async _windowActionImpl(w, args, token) {
+    async _windowActionImpl(w, args, token, mut) {
         const style = styleOf(args);
         const time = global.get_current_time();
         const corner = r => [r.x + r.width - 10, r.y + r.height - 10];
@@ -1018,12 +1010,12 @@ export class Ops {
                 x: num(args.x, 'x', {def: f.x}), y: num(args.y, 'y', {def: f.y}),
                 width: this._size(args.width, 'width'), height: this._size(args.height, 'height'),
             };
-            return this._animateGeometry(w, target, corner, style, token);
+            return this._animateGeometry(w, target, corner, style, token, mut);
         }
         case 'move': {
             const f = w.get_frame_rect();
             const target = {x: num(args.x, 'x'), y: num(args.y, 'y'), width: f.width, height: f.height};
-            return this._animateGeometry(w, target, titlebar, style, token);
+            return this._animateGeometry(w, target, titlebar, style, token, mut);
         }
         case 'fit': {
             // Grow a window that is smaller than min_fraction of the monitor's work area
@@ -1041,7 +1033,7 @@ export class Ops {
                 x: wa.x + Math.round((wa.width - width) / 2), y: wa.y + Math.round((wa.height - height) / 2),
                 width, height,
             };
-            return {changed: true, ...await this._animateGeometry(w, target, corner, style, token)};
+            return {changed: true, ...await this._animateGeometry(w, target, corner, style, token, mut)};
         }
         }
         switch (args.action) {
@@ -1052,19 +1044,34 @@ export class Ops {
             w.delete(time);
             break;
         case 'maximize':
-            w.maximize();
+            if (!w.is_maximized()) {
+                mut.add('maximized').add('geometry');
+                w.maximize();
+            }
             break;
         case 'unmaximize':
-            w.unmaximize();
+            if (w.is_maximized()) {
+                mut.add('maximized').add('geometry');
+                w.unmaximize();
+            }
             break;
         case 'minimize':
-            w.minimize();
+            if (!w.minimized) {
+                mut.add('minimized');
+                w.minimize();
+            }
             break;
         case 'fullscreen':
-            w.make_fullscreen();
+            if (!w.is_fullscreen()) {
+                mut.add('fullscreen').add('geometry');
+                w.make_fullscreen();
+            }
             break;
         case 'unfullscreen':
-            w.unmake_fullscreen();
+            if (w.is_fullscreen()) {
+                mut.add('fullscreen').add('geometry');
+                w.unmake_fullscreen();
+            }
             break;
         default:
             throw new OpError(E_BAD_ARGS,
