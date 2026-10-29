@@ -171,8 +171,20 @@ class MCPServerTests(unittest.TestCase):
         self.initialize()
         self.daemon.width, self.daemon.height = 1366, 768
         self.daemon.windows[0]["new"] = True
+        self.daemon.windows[0]["ai"] = True
         window_text = self.call_tool("windows", {})["content"][0]["text"]
         self.assertIn("42 * org.test.Editor", window_text)
+
+        self.daemon.windows[0]["ai"] = False
+        window_text = self.call_tool("windows", {})["content"][0]["text"]
+        self.assertIn('42 org.test.Editor "Editor"', window_text)
+        self.assertNotIn("42 * org.test.Editor", window_text)
+
+        del self.daemon.windows[0]["ai"]
+        window_text = self.call_tool("windows", {})["content"][0]["text"]
+        self.assertIn('42 org.test.Editor "Editor"', window_text)
+        self.assertNotIn("42 * org.test.Editor", window_text)
+
         self.call_tool("act", {"actions": [
             {"window": [42, "fit"]}, {"window": [42, "resize", 640, 360]},
             {"window": [42, "move", 640, 360]}]})
