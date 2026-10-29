@@ -3,8 +3,12 @@
 // fading trail, a ripple on clicks and a hint on scrolls.
 //
 // Safety: release() always un-hides the real cursor synchronously, before anything else,
-// and is called on every end path (inactive, disable, errors). The inhibit is taken at
+// and is called on every end path (inactive, disable, errors). Each inhibit is taken at
 // most once and released exactly once per engage.
+//
+// Hiding the cursor alone makes Mutter drop the pointer focus of Wayland clients (no
+// motion/clicks reach apps), so, like the shell's magnifier, the seat's unfocus is
+// inhibited for as long as the cursor is hidden.
 //
 // Cost: nothing ticks while the pointer is still. The trail timeline only runs while
 // there are trail points younger than TRAIL_MS, then stops by itself.
@@ -175,7 +179,9 @@ export class AICursor {
         this._layer = layer;
         this._onChange = onChange;
         this._tracker = global.backend.get_cursor_tracker();
+        this._seat = global.stage.context.get_backend().get_default_seat();
         this._inhibited = false;
+        this._unfocusInhibited = false;
         this._engaged = false;
         this._positionId = 0;
         this._scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
@@ -196,6 +202,10 @@ export class AICursor {
         return this._inhibited;
     }
 
+    get unfocusInhibited() {
+        return this._unfocusInhibited;
+    }
+
     // Hide the real cursor and show ours (idempotent).
     engage() {
         if (this._engaged || !this._layer)
@@ -206,6 +216,10 @@ export class AICursor {
         this._arrow.visible = true;
         this._positionId = this._tracker.connect('position-invalidated', () => this.sync());
         this.sync(false);
+        if (!this._unfocusInhibited) {
+            this._seat.inhibit_unfocus(); // first: clients keep pointer focus
+            this._unfocusInhibited = true;
+        }
         if (!this._inhibited) {
             this._tracker.inhibit_cursor_visibility();
             this._inhibited = true;
@@ -223,6 +237,14 @@ export class AICursor {
                 this._tracker.uninhibit_cursor_visibility();
             } catch (e) {
                 console.error(`pcpilot: could not restore the cursor: ${e.message}`);
+            }
+        }
+        if (this._unfocusInhibited) {
+            this._unfocusInhibited = false;
+            try {
+                this._seat.uninhibit_unfocus();
+            } catch (e) {
+                console.error(`pcpilot: could not restore pointer unfocus: ${e.message}`);
             }
         }
         if (this._positionId) {

@@ -201,6 +201,7 @@ export default class PCPilotExtension extends Extension {
                 session: this._session,
                 cursor_inhibited: this._overlay?.cursor?.inhibited ?? false,
                 cursor_engaged: this._overlay?.cursor?.engaged ?? false,
+                unfocus_inhibited: this._overlay?.cursor?.unfocusInhibited ?? false,
                 real_cursor_visible: tracker.get_pointer_visible(),
                 hot_corners_suspended: this._hotCornersId !== 0,
                 time: GLib.get_monotonic_time(),
