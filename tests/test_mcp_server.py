@@ -8,7 +8,6 @@ import threading
 import time
 import unittest
 import pathlib
-import stat
 import struct
 import zlib
 from types import SimpleNamespace
@@ -74,7 +73,16 @@ class MCPServerTests(unittest.TestCase):
         self.assertEqual(self.rpc("ping")["result"], {})
         listed = self.rpc("tools/list")["result"]["tools"]
         self.assertEqual([tool["name"] for tool in listed], ["control", "screenshot", "act", "elements", "windows"])
+        control_schema = listed[0]["inputSchema"]["properties"]
+        self.assertIn("keep", control_schema)
+        self.assertIn("cleanup", control_schema)
         self.assertEqual(self.rpc("initialize", {"protocolVersion": "unknown"})["result"]["protocolVersion"], "2025-06-18")
+
+    def test_tools_list_compact_json_rpc_size_stays_under_budget(self):
+        self.initialize()
+        reply = self.rpc("tools/list")
+        encoded = json.dumps(reply, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+        self.assertLessEqual(len(encoded), 2900)
 
     def test_act_maps_all_action_shapes_and_scales_coordinates(self):
         self.initialize()
@@ -95,6 +103,243 @@ class MCPServerTests(unittest.TestCase):
         self.assertEqual(clicks[0]["y"], 540)
         self.assertEqual(clicks[1]["count"], 2)
         self.assertEqual(clicks[2]["button"], "right")
+        self.assertEqual(clicks[0]["style"], "human")
+
+    def test_act_speed_maps_style_for_pointer_key_and_window_ops(self):
+        self.initialize()
+        self.call_tool("act", {"actions": [{"click": [640, 360]}, {"type": "hello"},
+                                             {"window": [42, "close"]}], "speed": "instant"})
+        calls = {r["op"]: r["args"] for r in self.daemon.requests}
+        self.assertEqual(calls["ui.pointer.click"]["style"], "instant")
+        self.assertEqual(calls["ui.key.type"]["style"], "instant")
+        self.assertEqual(calls["ui.window.action"]["style"], "instant")
+
+        self.call_tool("act", {"actions": [{"move": [10, 10]}], "speed": "fast"})
+        move = [r["args"] for r in self.daemon.requests if r["op"] == "ui.pointer.move"][-1]
+        self.assertEqual(move["style"], "fast")
+
+    def test_human_long_batch_switches_later_actions_to_fast_and_notes_it(self):
+        self.initialize()
+        result = self.call_tool("act", {"actions": [{"type": f"x{i}"} for i in range(13)], "speed": "human"})
+        styles = [r["args"].get("style") for r in self.daemon.requests if r["op"] == "ui.key.type"]
+        self.assertEqual(len(styles), 13)
+        self.assertEqual(styles[-1], "fast")
+        self.assertIn("fast", result["content"][0]["text"].casefold())
+
+    def test_aggregate_act_budget_stops_between_actions_without_closing_owner(self):
+        self.initialize()
+        self.server.daemon.begin()
+        original_action = self.server.action
+        def slow_action(*args, **kwargs):
+            result = original_action(*args, **kwargs)
+            time.sleep(.04)
+            return result
+        self.server.action = slow_action
+        with mock.patch.object(mcp_server, "ACT_BUDGET_S", .07):
+            result = self.call_tool("act", {"actions": [{"move": [1, 1]} for _ in range(3)], "speed": "fast"})
+        self.assertIn("partial: 2/3 done, budget", result["content"][0]["text"])
+        self.assertEqual(sum(r["op"] == "ui.pointer.move" for r in self.daemon.requests), 2)
+        self.assertFalse(self.server.daemon.closed)
+        self.assertTrue(self.server.daemon.active)
+
+    def test_act_rejects_invalid_speed_scroll_and_window_shapes(self):
+        self.initialize()
+        invalid = [
+            {"actions": [{"wait": 0}], "speed": "warp"},
+            {"actions": [{"scroll": []}]},
+            {"actions": [{"scroll": [1, 2]}]},
+            {"actions": [{"window": [42, "resize", 300]}]},
+            {"actions": [{"window": [42, "move", 10]}]},
+        ]
+        for args in invalid:
+            with self.subTest(args=args):
+                reply = self.rpc("tools/call", {"name": "act", "arguments": args})
+                self.assertTrue(reply["result"]["isError"])
+
+    def test_anchor_scroll_has_no_explicit_coordinates(self):
+        self.initialize()
+        self.call_tool("act", {"actions": [{"scroll": [5]}]})
+        args = [r["args"] for r in self.daemon.requests if r["op"] == "ui.pointer.scroll"][-1]
+        self.assertEqual(args["dy"], 5)
+        self.assertNotIn("x", args)
+        self.assertNotIn("y", args)
+        self.call_tool("act", {"actions": [{"scroll": [640, 360, -2]}]})
+        args = [r["args"] for r in self.daemon.requests if r["op"] == "ui.pointer.scroll"][-1]
+        self.assertEqual((args["x"], args["y"], args["dy"], args["style"]), (960, 540, -2, "human"))
+
+    def test_window_fit_resize_move_and_new_window_marker(self):
+        self.initialize()
+        self.daemon.width, self.daemon.height = 1366, 768
+        self.daemon.windows[0]["new"] = True
+        window_text = self.call_tool("windows", {})["content"][0]["text"]
+        self.assertIn("42 * org.test.Editor", window_text)
+        self.call_tool("act", {"actions": [
+            {"window": [42, "fit"]}, {"window": [42, "resize", 640, 360]},
+            {"window": [42, "move", 640, 360]}]})
+        actions = [r["args"] for r in self.daemon.requests if r["op"] == "ui.window.action"]
+        self.assertEqual(actions[0]["action"], "fit")
+        self.assertEqual(actions[1]["action"], "resize")
+        self.assertEqual((actions[1]["width"], actions[1]["height"]), (683, 384))
+        self.assertEqual(actions[2]["action"], "move")
+        self.assertEqual((actions[2]["x"], actions[2]["y"]), (683, 384))
+
+    def test_control_stop_wrapup_precedes_end_and_returns_compact_summary(self):
+        self.initialize()
+        self.server.daemon.begin()
+        result = self.call_tool("control", {"action": "stop", "keep": [42], "cleanup": False})
+        ops = [r["op"] for r in self.daemon.requests]
+        self.assertLess(ops.index("ui.session.wrapup"), ops.index("session.end"))
+        wrapup = next(r for r in self.daemon.requests if r["op"] == "ui.session.wrapup")
+        self.assertEqual(wrapup["args"], {"keep": [42], "close_new": False, "return_to": "origin"})
+        self.assertEqual(len(result["content"]), 1)
+        summary = result["content"][0]["text"]
+        self.assertNotIn("\n", summary)
+        self.assertIn("closed 2", summary)
+        self.assertIn("restored 1", summary)
+        self.assertIn('"Firefox — Docs"', summary)
+        self.assertIn("+1", summary)
+        self.assertIn("Traycer", summary)
+
+    def test_control_stop_without_session_is_idempotent_without_wrapup(self):
+        self.initialize()
+        result = self.call_tool("control", {"action": "stop"})
+        self.assertIn("stopped", result["content"][0]["text"])
+        self.assertFalse(any(r["op"] in {"ui.session.wrapup", "session.end"} for r in self.daemon.requests))
+
+    def test_control_stop_unknown_wrapup_op_falls_back_to_session_end(self):
+        self.initialize()
+        self.server.daemon.begin()
+        self.daemon.wrapup_error = ("unknown_op", "unsupported")
+        result = self.call_tool("control", {"action": "stop"})
+        ops = [r["op"] for r in self.daemon.requests]
+        self.assertLess(ops.index("ui.session.wrapup"), ops.index("session.end"))
+        self.assertIn("stopped", result["content"][0]["text"])
+
+    def test_control_stop_generic_wrapup_error_still_ends_session_with_warning(self):
+        self.initialize()
+        self.server.daemon.begin()
+        self.daemon.wrapup_error = ("failed", "cleanup failed")
+        result = self.call_tool("control", {"action": "stop"})
+        ops = [r["op"] for r in self.daemon.requests]
+        self.assertLess(ops.index("ui.session.wrapup"), ops.index("session.end"))
+        self.assertIn("cleanup failed", result["content"][0]["text"])
+
+    def test_control_stop_hotkey_event_during_wrapup_sends_no_session_end(self):
+        self.initialize()
+        self.server.daemon.begin()
+        self.daemon.wrapup_event_before_reply = {"event": "session_ended", "reason": "user_hotkey"}
+        result = self.call_tool("control", {"action": "stop"})
+        self.assertTrue(result["isError"])
+        self.assertIn("USER_TOOK_CONTROL", result["content"][0]["text"])
+        self.assertFalse(any(r["op"] == "session.end" for r in self.daemon.requests))
+
+    def test_control_stop_wrapup_user_aborted_error_sends_no_session_end(self):
+        self.initialize()
+        self.server.daemon.begin()
+        self.daemon.wrapup_error = ("user_aborted", "user took control")
+        result = self.call_tool("control", {"action": "stop"})
+        self.assertTrue(result["isError"])
+        self.assertIn("USER_TOOK_CONTROL", result["content"][0]["text"])
+        self.assertFalse(any(r["op"] == "session.end" for r in self.daemon.requests))
+
+    def test_control_stop_wrapup_timeout_closes_owner_without_session_end(self):
+        self.initialize()
+        self.server.daemon.begin()
+        self.assertEqual(mcp_server.WRAPUP_TIMEOUT_S, 10)
+        self.daemon.wrapup_gate = threading.Event()
+        release = threading.Timer(.2, self.daemon.wrapup_gate.set)
+        release.start()
+        try:
+            with mock.patch.object(mcp_server, "WRAPUP_TIMEOUT_S", .05):
+                result = self.call_tool("control", {"action": "stop"})
+        finally:
+            release.cancel()
+            self.daemon.wrapup_gate.set()
+            release.join(timeout=1)
+        self.assertTrue(result["isError"])
+        self.assertIn("timeout", result["content"][0]["text"].lower())
+        self.assertTrue(self.server.daemon.closed)
+        self.assertFalse(any(r["op"] == "session.end" for r in self.daemon.requests))
+
+    def test_control_stop_cleanup_defaults_to_true(self):
+        self.initialize()
+        self.server.daemon.begin()
+        self.call_tool("control", {"action": "stop"})
+        wrapup = next(r for r in self.daemon.requests if r["op"] == "ui.session.wrapup")
+        self.assertTrue(wrapup["args"]["close_new"])
+
+    def test_control_stop_rejects_invalid_keep_and_cleanup_without_sends(self):
+        self.initialize()
+        self.server.daemon.begin()
+        self.daemon.requests.clear()
+        for args in ({"action": "stop", "keep": "42"},
+                     {"action": "stop", "keep": [True]},
+                     {"action": "stop", "cleanup": "yes"}):
+            with self.subTest(args=args):
+                reply = self.rpc("tools/call", {"name": "control", "arguments": args})
+                self.assertTrue(reply["result"]["isError"])
+        self.assertFalse(self.daemon.requests)
+
+    def test_control_stop_after_observed_abort_sends_nothing(self):
+        self.initialize()
+        self.server.daemon.aborted = True
+        self.server.daemon.active = False
+        self.daemon.requests.clear()
+        result = self.call_tool("control", {"action": "stop"})
+        self.assertTrue(result["isError"])
+        self.assertIn("USER_TOOK_CONTROL", result["content"][0]["text"])
+        self.assertFalse(self.daemon.requests)
+
+    def test_notifications_cancelled_during_wrapup_skips_session_end(self):
+        fake = self.daemon
+        fake.wrapup_gate = threading.Event()
+        env = dict(os.environ, PCPILOT_SOCKET=fake.path, PCPILOT_DESKTOP_USER=str(os.getuid()),
+                   PCPILOT_A11Y_RUNTIME_DIR=fake.runtime_dir)
+        proc = subprocess.Popen([sys.executable, "-m", "pcpilot.mcp_server"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, bufsize=1)
+        self.addCleanup(cleanup_process, proc)
+        proc.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n')
+        proc.stdin.flush(); proc.stdout.readline()
+        proc.stdin.write('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"control","arguments":{"action":"start"}}}\n')
+        proc.stdin.flush(); proc.stdout.readline()
+        proc.stdin.write('{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"control","arguments":{"action":"stop"}}}\n')
+        proc.stdin.flush()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not any(r["op"] == "ui.session.wrapup" for r in fake.requests):
+            time.sleep(.01)
+        self.assertTrue(any(r["op"] == "ui.session.wrapup" for r in fake.requests))
+        proc.stdin.write('{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3}}\n')
+        proc.stdin.flush()
+        cancelled = json.loads(proc.stdout.readline())
+        self.assertEqual(cancelled["id"], 3)
+        self.assertTrue(cancelled["result"]["isError"])
+        fake.wrapup_gate.set()
+        proc.stdin.close()
+        self.assertEqual(proc.wait(timeout=5), 0, proc.stderr.read())
+        self.assertFalse(any(r["op"] == "session.end" for r in fake.requests))
+
+    def test_eof_during_wrapup_skips_session_end(self):
+        fake = self.daemon
+        fake.wrapup_gate = threading.Event()
+        env = dict(os.environ, PCPILOT_SOCKET=fake.path, PCPILOT_DESKTOP_USER=str(os.getuid()),
+                   PCPILOT_A11Y_RUNTIME_DIR=fake.runtime_dir)
+        proc = subprocess.Popen([sys.executable, "-m", "pcpilot.mcp_server"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, bufsize=1)
+        self.addCleanup(cleanup_process, proc)
+        proc.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n')
+        proc.stdin.flush(); proc.stdout.readline()
+        proc.stdin.write('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"control","arguments":{"action":"start"}}}\n')
+        proc.stdin.flush(); proc.stdout.readline()
+        proc.stdin.write('{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"control","arguments":{"action":"stop"}}}\n')
+        proc.stdin.flush()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not any(r["op"] == "ui.session.wrapup" for r in fake.requests):
+            time.sleep(.01)
+        self.assertTrue(any(r["op"] == "ui.session.wrapup" for r in fake.requests))
+        proc.stdin.close()
+        self.assertEqual(proc.wait(timeout=5), 0, proc.stderr.read())
+        fake.wrapup_gate.set()
+        self.assertFalse(any(r["op"] == "session.end" for r in fake.requests))
 
     def test_bad_batch_preflight_performs_no_action(self):
         self.initialize()

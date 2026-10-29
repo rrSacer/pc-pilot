@@ -77,6 +77,7 @@ class MCPClient:
         self.proc.stdin.flush()
         tools, size = self.rpc("tools/list")
         assert [t["name"] for t in tools["tools"]] == ["control", "screenshot", "act", "elements", "windows"], tools
+        assert size <= 2900, f"tools/list response exceeds wire budget: {size} bytes"
         self.sizes["tools/list"] = size
 
     def call(self, name, args=None, error=False):
@@ -130,6 +131,12 @@ class RealStackTests(unittest.TestCase):
             '[Desktop Entry]\nType=Application\nName=PCPilot E2E Probe\n'
             f'Exec=/usr/bin/env PROBE_LOG={cls.probe_log} /usr/bin/python3 {SUPPORT / "gtk_probe.py"}\n'
             'Terminal=false\nStartupWMClass=pcpilot-e2e-probe\n')
+        cls.second_probe_title = "PCPilot E2E Probe Second"
+        (applications / "pcpilot-e2e-probe-second.desktop").write_text(
+            '[Desktop Entry]\nType=Application\nName=PCPilot E2E Probe Second\n'
+            f'Exec=/usr/bin/env PROBE_LOG={cls.probe_log} PROBE_TITLE={cls.second_probe_title} '
+            f'/usr/bin/python3 {SUPPORT / "gtk_probe.py"}\n'
+            'Terminal=false\nStartupWMClass=pcpilot-e2e-probe-second\n')
         cls.wrapper_log = open(cls.dir / "wrapper.log", "w+")
         cls.addClassCleanup(cls.wrapper_log.close)
         # Register stop BEFORE start: startup failure may leave partial processes.
@@ -282,6 +289,57 @@ class RealStackTests(unittest.TestCase):
         self.mcp.kill()
         self.assert_inactive()
         self.assertTrue(wait_until(lambda: "agent_disconnected" in self.daemon.log()[mark:]), self.daemon.log())
+
+    def test_04_v2_window_speed_scroll_and_stop_cleanup(self):
+        self.mcp.call("act", {"actions": [{"launch": "pcpilot-e2e-probe.desktop"}],
+                              "observe": "none", "speed": "fast"})
+        first_text = self.mcp.call("windows")["content"][0]["text"]
+        first = next(line for line in first_text.splitlines() if '"PCPilot Ext Probe"' in line)
+        first_id = int(first.split()[0])
+        self.assertEqual(first.split()[1], "*")
+
+        self.mcp.call("act", {"actions": [
+            {"window": [first_id, "resize", 720, 480]},
+            {"window": [first_id, "move", 80, 60]},
+        ], "observe": "none", "speed": "fast"})
+        self.mcp.call("act", {"actions": [
+            {"window": [first_id, "fit"]}, {"scroll": [160]},
+        ], "observe": "none", "speed": "instant"})
+
+        stopped = self.mcp.call("control", {"action": "stop", "keep": [first_id]})
+        summary = stopped["content"][0]["text"]
+        self.assertIn("left open:", summary, summary)
+        self.assertIn("PCPilot Ext Probe", summary, summary)
+        self.assertFalse(self.status()["active"])
+
+        # Listing windows starts a fresh owner session. The kept window is old
+        # in this session and therefore has no new-window marker.
+        fresh_text = self.mcp.call("windows")["content"][0]["text"]
+        first_row = next(line for line in fresh_text.splitlines() if line.startswith(f"{first_id} "))
+        self.assertNotEqual(first_row.split()[1], "*")
+        self.assertTrue(self.status()["active"])
+
+        self.mcp.call("act", {"actions": [{"launch": "pcpilot-e2e-probe-second.desktop"}],
+                              "observe": "none", "speed": "fast"})
+        both_text = self.mcp.call("windows")["content"][0]["text"]
+        second = next(line for line in both_text.splitlines() if f'"{self.second_probe_title}"' in line)
+        second_id = int(second.split()[0])
+        self.assertEqual(second.split()[1], "*")
+        self.assertNotEqual(second_id, first_id)
+
+        stopped = self.mcp.call("control", {"action": "stop"})
+        summary = stopped["content"][0]["text"]
+        self.assertIn("closed 1", summary, summary)
+        self.assertFalse(self.status()["active"])
+        remaining = self.mcp.call("windows")["content"][0]["text"]
+        self.assertTrue(any(line.startswith(f"{first_id} ") for line in remaining.splitlines()), remaining)
+        self.assertFalse(any(line.startswith(f"{second_id} ") for line in remaining.splitlines()), remaining)
+
+        # Finish the preserved probe explicitly, then close the fresh session.
+        self.mcp.call("act", {"actions": [{"window": [first_id, "close"]}],
+                              "observe": "none", "speed": "instant"})
+        self.mcp.call("control", {"action": "stop"})
+        self.assert_inactive()
 
 
 if __name__ == "__main__":

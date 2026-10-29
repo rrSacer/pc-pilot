@@ -4,7 +4,6 @@ import os
 import socket
 import tempfile
 import threading
-import re
 from pathlib import Path
 
 
@@ -31,6 +30,14 @@ class FakeDaemon:
         self.shot_paths = []
         self.event_after_op = {}
         self.screenshot_file_bytes = None
+        self.wrapup_error = None
+        self.wrapup_result = {"closed": ["closed-a", "closed-b"],
+                              "restored": ["clipboard"],
+                              "left_open": [{"title": name, "app_id": "firefox"}
+                                            for name in ("Firefox — Docs", "Terminal — build", "Editor — notes", "Browser — search")],
+                              "focused": {"title": "Traycer - Codex", "app_id": "Traycer"}}
+        self.wrapup_gate = None
+        self.wrapup_event_before_reply = None
         self.thread.start()
 
     def _serve(self):
@@ -43,6 +50,12 @@ class FakeDaemon:
             threading.Thread(target=self._client, args=(conn,), daemon=True).start()
 
     def _client(self, conn):
+        try:
+            self._client_stream(conn)
+        except OSError:
+            pass
+
+    def _client_stream(self, conn):
         with conn, conn.makefile("rwb") as stream:
             for raw in stream:
                 try:
@@ -54,12 +67,22 @@ class FakeDaemon:
                 except Exception as exc:
                     response = {"id": req.get("id"), "ok": False,
                                 "error": {"code": getattr(exc, "code", "failed"), "message": str(exc)}}
-                stream.write(json.dumps(response, separators=(",", ":")).encode() + b"\n")
-                stream.flush()
-                event = self.event_after_op.pop(op, None)
+                event = self.wrapup_event_before_reply if op == "ui.session.wrapup" else None
                 if event:
                     stream.write(json.dumps(event, separators=(",", ":")).encode() + b"\n")
                     stream.flush()
+                try:
+                    stream.write(json.dumps(response, separators=(",", ":")).encode() + b"\n")
+                    stream.flush()
+                except OSError:
+                    return
+                event = self.event_after_op.pop(op, None)
+                if event:
+                    try:
+                        stream.write(json.dumps(event, separators=(",", ":")).encode() + b"\n")
+                        stream.flush()
+                    except OSError:
+                        return
 
     def handle(self, op, args):
         if op == "hello":
@@ -80,6 +103,14 @@ class FakeDaemon:
                                   "scale": 1, "primary": True}]}
         if op == "ui.window.list":
             return {"windows": self.windows}
+        if op == "ui.session.wrapup":
+            if self.wrapup_gate is not None:
+                self.wrapup_gate.wait(timeout=15)
+            if self.wrapup_error:
+                class FakeError(Exception):
+                    code = self.wrapup_error[0]
+                raise FakeError(self.wrapup_error[1])
+            return self.wrapup_result
         if op == "ui.screenshot":
             from PIL import Image
             region = args.get("region")
