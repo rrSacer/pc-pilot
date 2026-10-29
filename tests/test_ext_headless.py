@@ -36,7 +36,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         cls.extra_logs={}
         for app,title,envs in (("pcpilot-wrapup","WrapupProbe",{}),
                                ("pcpilot-family","Family",{"PROBE_DIALOG":"1"}),
-                               ("pcpilot-confirm","Confirm",{"PROBE_CONFIRM_CLOSE":"1"})):
+                               ("pcpilot-confirm","Confirm",{"PROBE_CONFIRM_CLOSE":"1","PROBE_CONFIRM_DELAY_MS":"2000"})):
             log=cls.dir/f"{app}.jsonl";log.touch();log.chmod(0o666);cls.extra_logs[app]=log
             env=" ".join([f"PROBE_LOG={log}",f"PROBE_TITLE={title}",*(f"{k}={v}" for k,v in envs.items())])
             (apps/f"{app}.desktop").write_text(f'[Desktop Entry]\nType=Application\nName={title}\n'
@@ -403,6 +403,29 @@ class ExtensionHeadlessTests(unittest.TestCase):
         a.call("session.begin",{"label":"authorship and journal"})
         calc=next(w for w in a.call("ui.window.list")["windows"] if w["id"]==calc["id"])
         original=(calc["x"],calc["y"],calc["width"],calc["height"])
+        # A different process born while a human motion request is active has no
+        # authorship claim, even though the request is still in flight.
+        during_log=self.dir/"external-during.jsonl";during_log.touch();during_log.chmod(0o666)
+        move_started=threading.Event()
+        def long_move():
+            mover=self._agent()
+            try:
+                move_started.set()
+                mover.call("ui.pointer.move",{"x":1700,"y":900,"style":"human"},timeout=10)
+            finally:mover.close()
+        mover=threading.Thread(target=long_move,daemon=True);mover.start();self.assertTrue(move_started.wait(2))
+        time.sleep(.1)
+        subprocess.run([str(ROOT/"dev/headless-shell.sh"),"run",str(self.dir),"--","sh","-lc",
+            f"env PROBE_LOG={during_log} PROBE_TITLE=ExternalDuring /usr/bin/python3 {SUPPORT / 'gtk_probe.py'} >/dev/null 2>&1 &"],
+            cwd=ROOT,check=True,timeout=15)
+        deadline=time.monotonic()+8;external_during=None
+        while time.monotonic()<deadline:
+            external_during=next((w for w in a.call("ui.window.list")["windows"] if w["title"]=="ExternalDuring"),None)
+            if external_during:break
+            time.sleep(.05)
+        self.assertIsNotNone(external_during)
+        mover.join(timeout=12);self.assertFalse(mover.is_alive(),"pointer move did not settle")
+        self.assertFalse(next(w for w in a.call("ui.window.list")["windows"] if w["id"]==external_during["id"])["ai"])
         launch_reply=a.call("ui.app.launch",{"app":"pcpilot-wrapup.desktop","wait_ms":8000})
         launched=launch_reply.get("window")
         if not launched:
@@ -414,7 +437,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         self.assertIsNotNone(launched,launch_reply)
         tracked=next(w for w in a.call("ui.window.list")["windows"] if w["id"]==launched["id"])
         self.assertTrue(tracked["ai"])
-        time.sleep(3.5)  # external launch is outside the post-op authorship window
+        time.sleep(3.5)  # External windows remain un-authored regardless of when they appear.
         extlog=self.dir/"external.jsonl";extlog.touch();extlog.chmod(0o666)
         subprocess.run([str(ROOT/"dev/headless-shell.sh"),"run",str(self.dir),"--","sh","-lc",
             f"env PROBE_LOG={extlog} PROBE_TITLE=External /usr/bin/python3 {SUPPORT / 'gtk_probe.py'} >/dev/null 2>&1 &"],
@@ -427,13 +450,48 @@ class ExtensionHeadlessTests(unittest.TestCase):
         self.assertIsNotNone(external)
         self.assertTrue(external["new"]);self.assertFalse(external["ai"])
         a.call("ui.window.action",{"id":calc["id"],"action":"move","x":40,"y":50,"style":"fast"})
+        # A second unrelated app is started just before wrapup as well.
+        right_before_log=self.dir/"external-before-wrapup.jsonl";right_before_log.touch();right_before_log.chmod(0o666)
+        subprocess.run([str(ROOT/"dev/headless-shell.sh"),"run",str(self.dir),"--","sh","-lc",
+            f"env PROBE_LOG={right_before_log} PROBE_TITLE=ExternalBeforeWrapup /usr/bin/python3 {SUPPORT / 'gtk_probe.py'} >/dev/null 2>&1 &"],
+            cwd=ROOT,check=True,timeout=15)
+        deadline=time.monotonic()+8;external_before=None
+        while time.monotonic()<deadline:
+            external_before=next((w for w in a.call("ui.window.list")["windows"] if w["title"]=="ExternalBeforeWrapup"),None)
+            if external_before:break
+            time.sleep(.05)
+        self.assertIsNotNone(external_before)
         result=a.call("ui.session.wrapup")
         self.assertIn(launched["id"],[w["id"] for w in result["closed"]])
         self.assertEqual(next(w for w in result["left_open"] if w["id"]==external["id"])["reason"],"not_authored")
+        self.assertEqual(next(w for w in result["left_open"] if w["id"]==external_during["id"])["reason"],"not_authored")
+        self.assertEqual(next(w for w in result["left_open"] if w["id"]==external_before["id"])["reason"],"not_authored")
         self.assertIn(calc["id"],result["restored"]);self.assertEqual(result["focused"]["id"],calc["id"])
         after=next(w for w in a.call("ui.window.list")["windows"] if w["id"]==calc["id"])
         self.assertEqual((after["x"],after["y"],after["width"],after["height"]),original)
         self.assertTrue(any(w["id"]==external["id"] and not w["ai"] for w in a.call("ui.window.list")["windows"]))
+
+    def test_v2_spawned_text_editor_family_is_closed(self):
+        a=self._agent();self.addCleanup(self._end_client,a)
+        a.call("session.begin",{"label":"spawned app family"})
+        existing=[w for w in a.call("ui.window.list")["windows"] if w.get("app_id")=="org.gnome.TextEditor.desktop"]
+        self.assertFalse(existing,"Text Editor must not already be running in the isolated shell")
+        first=a.call("ui.app.launch",{"app":"org.gnome.TextEditor.desktop","wait_ms":10000})["window"]
+        self.assertTrue(first.get("focused"),first)
+        a.call("ui.window.action",{"id":first["id"],"action":"activate","style":"instant"})
+        a.call("ui.key.press",{"keys":"ctrl+n"})
+        deadline=time.monotonic()+8;second=None
+        while time.monotonic()<deadline:
+            matches=[w for w in a.call("ui.window.list")["windows"]
+                     if w.get("app_id")=="org.gnome.TextEditor.desktop" and w["id"]!=first["id"]]
+            if matches:second=matches[0];break
+            time.sleep(.05)
+        self.assertIsNotNone(second,"Ctrl+N did not create a second Text Editor window")
+        by_id={w["id"]:w for w in a.call("ui.window.list")["windows"]}
+        self.assertTrue(by_id[first["id"]]["ai"]);self.assertTrue(by_id[second["id"]]["ai"])
+        result=a.call("ui.session.wrapup")
+        closed={w["id"] for w in result["closed"]}
+        self.assertIn(first["id"],closed);self.assertIn(second["id"],closed)
 
     def test_v2_keep_dialog_family_and_confirm_close_is_idempotent(self):
         a=self._agent();self.addCleanup(self._end_client,a)
@@ -458,14 +516,21 @@ class ExtensionHeadlessTests(unittest.TestCase):
         confirm=a.call("ui.app.launch",{"app":"pcpilot-confirm.desktop","wait_ms":8000})["window"]
         result=a.call("ui.session.wrapup")
         log=self._read_jsonl(self.extra_logs["pcpilot-confirm"])
-        dialogs=[w for w in a.call("ui.window.list")["windows"] if w["title"]=="Confirm Save?"]
+        deadline=time.monotonic()+4;dialogs=[]
+        while time.monotonic()<deadline:
+            dialogs=[w for w in a.call("ui.window.list")["windows"] if w["title"]=="Confirm Save?"]
+            if dialogs:break
+            time.sleep(.05)
         self.assertTrue(dialogs)
         self.assertEqual(next(w for w in result["left_open"] if w["id"]==confirm["id"])["reason"],"not_closed")
-        self.assertEqual(next(w for w in result["left_open"] if w["id"]==dialogs[0]["id"])["reason"],"not_closed")
         close_count=sum(r.get("ev")=="close_request" for r in log);self.assertEqual(close_count,1)
+        dialog_close_count=sum(r.get("ev")=="dialog_close" for r in log)
         again=a.call("ui.session.wrapup")
         log2=self._read_jsonl(self.extra_logs["pcpilot-confirm"])
+        self.assertIn(dialogs[0]["id"],[w["id"] for w in again["left_open"]],
+            f"late dialog should be family-protected; dialog={dialogs[0]}, left_open={again['left_open']}, windows={a.call('ui.window.list')['windows']}")
         self.assertEqual(sum(r.get("ev")=="close_request" for r in log2),close_count)
+        self.assertEqual(sum(r.get("ev")=="dialog_close" for r in log2),dialog_close_count)
         self.assertFalse(again["closed"])
 
     @staticmethod

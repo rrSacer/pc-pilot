@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import GLib, {setTimeoutScale} from 'gi://GLib';
+import Gio from 'gi://Gio';
+import Shell from 'gi://Shell';
 import Clutter from 'gi://Clutter';
 import {Ops} from '../../../extension/pcpilot@local/ops.js';
 import {Token} from '../../../extension/pcpilot@local/input.js';
@@ -13,6 +15,7 @@ export async function runV2Scenarios() {
  const display={focus_window:null,sort_windows_by_stacking:a=>a,
   connect(_sig,cb){createdCb=cb;return nextSignal++},disconnect(){createdCb=null}};
  global.display=display;
+ global.create_app_launch_context=()=>({});
  global.get_window_actors=()=>wins.map(meta_window=>({meta_window}));
  global.get_pointer=()=>pointer;
  global.get_current_time=()=>1;
@@ -23,10 +26,11 @@ export async function runV2Scenarios() {
  const resetWorld=(initial=[])=>{wins=[...initial];winEvents=[];display.focus_window=initial.find(w=>w.focused)??initial[0]??null;pointer=[100,100];workspace=0;};
  const add=w=>{wins.push(w);createdCb?.(display,w)};
  class FakeWindow {
-  constructor(id,{x=100,y=100,width=400,height=300,title=`Window ${id}`,parent=null,focused=false,appId=`app.${id}`,workspaceIndex=0}={}){
-   Object.assign(this,{id,x,y,width,height,title,parent,focused,minimized:false,maximized:false,fullscreen:false,deleted:false,appId,onDelete:null,workspaceIndex});
+  constructor(id,{x=100,y=100,width=400,height=300,title=`Window ${id}`,parent=null,focused=false,appId=`app.${id}`,pid=id,minimized=false,maximized=false,fullscreen=false,workspaceIndex=0}={}){
+   Object.assign(this,{id,x,y,width,height,title,parent,focused,minimized,maximized,fullscreen,deleted:false,appId,pid,onDelete:null,workspaceIndex});
   }
-  get_id(){return this.id} get_title(){return this.title} get_gtk_application_id(){return this.appId} get_wm_class(){return ''} get_pid(){return this.id}
+  get_id(){return this.id} get_title(){return this.title} get_gtk_application_id(){return this.appId} get_wm_class(){return ''} get_pid(){return this.pid}
+  get_compositor_private(){return this}
   get_frame_rect(){return {x:this.x,y:this.y,width:this.width,height:this.height}} get_buffer_rect(){return this.get_frame_rect()}
   has_focus(){return display.focus_window===this} is_override_redirect(){return false} get_window_type(){return 0}
   is_on_all_workspaces(){return false} get_workspace(){return {index:()=>this.workspaceIndex}} is_maximized(){return this.maximized} is_fullscreen(){return this.fullscreen}
@@ -48,26 +52,78 @@ export async function runV2Scenarios() {
   return {ops,input};
  };
  const createSession=(initial=[])=>{resetWorld(initial);const env=makeOps();env.ops.session.snapshot();return env};
- const attachHandler=(ops,key,fn)=>{ops._handlers[key]=fn};
- const authoredDuring=async(ops,fn)=>{attachHandler(ops,'pointer.click',fn);await ops.run('pointer.click',{},new Token())};
  const created=(id,options)=>new FakeWindow(id,options);
  const runSteps=async(ops,args={})=>{const result={closed:[],restored:[],left_open:[],focused:null};await ops._wrapupSteps(new Set((args.keep??[]).map(Number)),args.close_new!==false,args.return_to??'origin',new Token(),result);return result};
 
- // R1: temporal newness and AI authorship are distinct; run() brackets actual AI ops.
+ // RR1: time and an overlapping AI operation never authorize a window.
  {
-  const {ops}=createSession([created(1,{focused:true})]);add(created(2));
-  await authoredDuring(ops,()=>{add(created(3));return {}});
-  GLib.advanceClock(2900);add(created(4));GLib.advanceClock(200);add(created(5));add(created(6));
+  const {ops}=createSession([created(1,{focused:true,appId:'app.focus',pid:100})]);
+  let finishMove;ops._glideTo=()=>new Promise(r=>finishMove=r);
+  const moving=ops.run('pointer.move',{x:700,y:500,style:'human'},new Token());
+  while(!finishMove)await new Promise(r=>setTimeout(r,1));
+  add(created(2,{appId:'app.other',pid:200})); // unrelated app during a real pointer op
+  finishMove();await moving;ops._glideTo=async(x,y,_style,token)=>{token.check();pointer=[x,y]};
+  add(created(3,{appId:'window:3',pid:100})); // same pid as focus, but not spawned by us
+  let appWindows=[];
+  const app={get_id:()=> 'app.launched',get_name:()=> 'Launched',get_windows:()=>appWindows,
+   get_app_info:()=>new Gio.DesktopAppInfo(500)};
+  const appWindow=created(4,{appId:'window:4',pid:500});
+  ops._resolveApp=()=>app;
+  const productionSpawn=Ops.prototype._spawn;
+  ops._spawn=(info,uris)=>{const pids=productionSpawn.call(ops,info,uris);add(appWindow);return pids};
+  const launch=await ops._appLaunch({app:'launched',wait_ms:1000},new Token());
+  assert.equal(launch.window.id,4); // matched by the DesktopAppInfo pid callback
+  const family=created(5,{appId:'window:5',pid:500});add(family); // spawned app family
   const result=await runSteps(ops);
-  assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]).sort((a,b)=>a-b),[3,4]);
-  for(const id of [2,5,6])assert.equal(result.left_open.find(w=>w.id===id)?.reason,'not_authored');
+  assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]).sort((a,b)=>a-b),[4,5]);
+  for(const id of [2,3])assert.equal(result.left_open.find(w=>w.id===id)?.reason,'not_authored');
   const listed=ops._windowList().windows;
-  assert.equal(listed.find(w=>w.id===2).ai,false);assert.equal(listed.find(w=>w.id===3),undefined);
+  assert.equal(listed.find(w=>w.id===3).ai,false);assert.equal(listed.find(w=>w.id===5),undefined);
+ }
+ // A running app's URI launch authors only its returned window; a mismatched
+ // window that appears while app.launch waits is not a fallback candidate.
+ {
+  const existing=created(20,{appId:'app.running',pid:700});const {ops}=createSession([existing]);
+  const appWindows=[existing];let returned,other;
+  const app={get_id:()=> 'app.running',get_name:()=> 'Running',get_windows:()=>appWindows,
+   get_app_info:()=>new Gio.DesktopAppInfo(701)};
+  ops._resolveApp=()=>app;
+  ops._spawn=(info,uris)=>{const pids=Ops.prototype._spawn.call(ops,info,uris);
+   returned=created(21,{appId:'app.running',pid:701});other=created(22,{appId:'app.foreign',pid:702});
+   appWindows.push(returned);add(returned);add(other);return pids};
+  const reply=await ops._appLaunch({app:'running',uris:['file:///tmp/document.txt'],wait_ms:500},new Token());
+  assert.equal(reply.window.id,21);assert.equal(ops.session.isAuthored(returned),true);
+  assert.equal(ops.session.isAuthored(other),false);
+  const r=await runSteps(ops);assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]),[21]);
+  assert.equal(r.left_open.find(w=>w.id===22)?.reason,'not_authored');
+ }
+ {
+  const {ops}=createSession([]);let stray;
+  ops._resolveApp=()=>({get_id:()=> 'app.expected',get_name:()=> 'Expected',get_windows:()=>[],get_app_info:()=>new Gio.DesktopAppInfo(801)});
+  ops._spawn=(info,uris)=>{const pids=Ops.prototype._spawn.call(ops,info,uris);stray=created(23,{appId:'app.unrelated',pid:802});add(stray);return pids};
+  const reply=await ops._appLaunch({app:'expected',wait_ms:250},new Token());
+  assert.equal(reply.window,undefined);assert.equal(ops.session.isAuthored(stray),false);
+ }
+ // open_uri authors the handler window only when it starts that handler.
+ {
+  const {ops}=createSession([]);const handler=new Gio.DesktopAppInfo(901);
+  handler.get_id=()=> 'app.uri-handler';const handlerApp={get_windows:()=>[]};
+  Shell.AppSystem.get_default=()=>({lookup_app:()=>handlerApp});ops._defaultHandler=async()=>handler;
+  let opened;ops._spawn=(info,uris)=>{const pids=Ops.prototype._spawn.call(ops,info,uris);opened=created(24,{appId:'window:24',pid:901});add(opened);return pids};
+  const reply=await ops._openUri({uri:'https://example.invalid'},new Token());
+  assert.equal(reply.window.id,24);assert.equal(ops.session.isAuthored(opened),true);
+ }
+ {
+  const existing=created(25,{appId:'app.running-uri',pid:902});const {ops}=createSession([existing]);
+  const handler=new Gio.DesktopAppInfo(903);handler.get_id=()=> 'app.running-uri';
+  Shell.AppSystem.get_default=()=>({lookup_app:()=>({get_windows:()=>[existing]})});
+  ops._defaultHandler=async()=>handler;let spawned=false;ops._spawn=()=>{spawned=true;return []};
+  assert.deepEqual(await ops._openUri({uri:'https://example.invalid'},new Token()),{});assert.equal(spawned,false);
  }
  // R2: keep and pre-existing roots protect every transient in that family.
  {
   const base=created(8,{focused:true});const parent=created(6),dialog=created(7,{parent,title:'Dialog'}),preDialog=created(9,{parent:base,title:'Preexisting dialog'});
-  const {ops}=createSession([base]);await authoredDuring(ops,()=>{add(parent);add(dialog);add(preDialog);return {}});
+  const {ops}=createSession([base]);for(const w of [parent,dialog,preDialog]){add(w);ops.session.author(w)}
   let plan=ops._closePlan(new Set([7]),true);
   assert.equal(plan.find(([w])=>w.id===7)[1],'kept');assert.equal(plan.find(([w])=>w.id===6)[1],'family_protected');
   assert.equal(plan.find(([w])=>w.id===9)[1],'family_protected');
@@ -77,22 +133,28 @@ export async function runV2Scenarios() {
  // R3: refusing windows and wrapup-born dialogs are marked before delete and never retried.
  {
   const {ops}=createSession([created(1,{focused:true})]);const refusing=created(4);let dialog;
-  refusing.onDelete=()=>{if(!dialog){dialog=created(5,{title:'Save?'});add(dialog)}};
-  await authoredDuring(ops,()=>{add(refusing);return {}});
+  refusing.onDelete=()=>{};
+  add(refusing);ops.session.author(refusing);
   const one=await runSteps(ops);assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]),[4]);
-  assert.equal(one.left_open.find(w=>w.id===4)?.reason,'not_closed');assert.equal(one.left_open.find(w=>w.id===5)?.reason,'not_closed');
+  assert.equal(one.left_open.find(w=>w.id===4)?.reason,'not_closed');
+  // A slow "save?" dialog appears after the original close wait has expired.
+  dialog=created(5,{title:'Save?',parent:refusing});add(dialog);
   winEvents=[];const two=await runSteps(ops);assert.deepEqual(winEvents.filter(e=>e[0]==='delete'),[]);
   assert.equal(two.left_open.find(w=>w.id===4)?.reason,'not_closed');assert.equal(two.left_open.find(w=>w.id===5)?.reason,'not_closed');
  }
  // R4: journal only restores still-current AI-applied properties.
  {
-  const w3=created(3,{x:100}),w8=created(8,{x:100,focused:true}),w9=created(9,{x:100});
-  const {ops}=createSession([w3,w8,w9]);w3.x=777;
+  const w3=created(3,{x:100,maximized:true}),w8=created(8,{x:100,focused:true}),w9=created(9,{x:100}),w10=created(10,{maximized:true}),w11=created(11);
+  const {ops}=createSession([w3,w8,w9,w10,w11]);w3.x=777;w10.x=333;
+  assert.deepEqual(await ops._windowAction({id:3,action:'fit'},new Token()),{changed:false,x:777,y:100,width:400,height:300});
+  await ops._windowAction({id:10,action:'maximize'},new Token()); // already maximized: no mutation recorded
+  await assert.rejects(ops._windowAction({id:10,action:'resize',width:10},new Token()),e=>e.code==='bad_args');
+  await ops._windowAction({id:11,action:'unmaximize'},new Token()); // already unmaximized: no mutation recorded
   const token=new Token();await ops._windowAction({id:8,action:'move',x:300,y:150,style:'instant'},token);
   await ops._windowAction({id:9,action:'move',x:300,y:150,style:'instant'},token);w9.x=777;
   const rest=ops.session.restorable();assert.deepEqual(rest.map(([w])=>w.id),[8]);
   winEvents=[];const r=await runSteps(ops);assert.deepEqual(r.restored,[8]);
-  assert.equal(w8.x,100);assert.equal(w3.x,777);assert.equal(w9.x,777);
+  assert.equal(w8.x,100);assert.equal(w3.x,777);assert.equal(w9.x,777);assert.equal(w10.x,333);
   assert.deepEqual(winEvents.filter(e=>e[0]==='move_resize_frame').map(e=>e[1]),[8]);
   const env2=createSession([created(11,{focused:true}),created(10,{workspaceIndex:1})]);
   await env2.ops._windowAction({id:10,action:'activate'},new Token());assert.equal(workspace,1);
@@ -140,7 +202,7 @@ export async function runV2Scenarios() {
  // R7: real _wrapupSteps aborts while waiting for close and during its return glide.
  {
   const {ops,input}=createSession([created(50,{focused:true})]);const refusing=created(51);refusing.onDelete=()=>{};
-  await authoredDuring(ops,()=>{add(refusing);return {}});const token=new Token();
+  add(refusing);ops.session.author(refusing);const token=new Token();
   const p=ops._wrapupSteps(new Set(),true,'origin',token,{closed:[],restored:[],left_open:[],focused:null}).catch(e=>e.code);
   while(!winEvents.some(e=>e[0]==='delete'))await new Promise(r=>setTimeout(r,2));
   token.cancel();assert.equal(await p,'inactive');const n=winEvents.length;await new Promise(r=>setTimeout(r,40));assert.equal(winEvents.length,n);
@@ -158,7 +220,7 @@ export async function runV2Scenarios() {
  // Cap behavior also traverses real close/focus/return steps, rather than a substituted sleep.
  {
   const {ops}=createSession([created(60,{focused:true})]);ops.session.clear();pointer=[100,100];ops.session.snapshot();pointer=[1700,700];
-  const refusing=created(61);refusing.onDelete=()=>{};ops.session.beginAiOp();add(refusing);ops.session.endAiOp();
+  const refusing=created(61);refusing.onDelete=()=>{};add(refusing);ops.session.author(refusing);
   const token=new Token();ops._overlay.cursor={release(){winEvents.push(['release'])}};
   setTimeoutScale(0.001);const result=await ops._wrapup({},token);setTimeoutScale(0.1);assert.equal(result.incomplete,true);
   assert.ok(winEvents.some(e=>e[0]==='delete'&&e[1]===61));assert.ok(winEvents.some(e=>e[0]==='release'));
