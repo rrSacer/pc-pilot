@@ -134,18 +134,7 @@ const safetyChecks=['cursor-inactive-reasons','cursor-connection-loss','cursor-d
  e._setInactive('user_hotkey');e.disable();
 }
 
-// Abort wrapup in close and glide phases: no later window actions occur.
-for(const phase of ['mid-close','mid-glide']){
- const e=await liveExtension(42),events=[];
- e._ops._wrapupSteps=async(_keep,_close,_return,token)=>{
-  if(phase==='mid-close')events.push('delete');
-  await glide(e._input,planPath([200,200],[1000,700],'human',{duration:700,rand}),token);
-  events.push('move_resize_frame','activate');
- };
- const p=e._ops._wrapup({},e._token).catch(err=>err.code);
- await new Promise(r=>setTimeout(r,40));e._setInactive('user_hotkey');assertCursorReleased(e);
- assert.equal(await p,'inactive');assert.deepEqual(events,phase==='mid-close'?['delete']:[]);e.disable();
-}
+// Wrapup aborts mid-close / mid-glide run the real _wrapupSteps: see v2-scenarios.mjs.
 
 // The 8s wrapup hard cap returns incomplete, restores the real cursor and fades its arrow.
 {
@@ -155,7 +144,7 @@ for(const phase of ['mid-close','mid-glide']){
  assert.equal(e._overlay.cursor.engaged,false);assert.equal(seatUnfocus.n,0);e._setInactive('user_hotkey');e.disable();
 }
 
-safetyChecks.push('balanced-cursor-inhibit','trail-idle','wrapup-abort-mid-close','wrapup-abort-mid-glide','wrapup-cap');
+safetyChecks.push('balanced-cursor-inhibit','trail-idle','wrapup-cap');
 
 // A real paint is the only success path; a timeout from a stage that never paints fails closed.
 const overlay = new Overlay();
