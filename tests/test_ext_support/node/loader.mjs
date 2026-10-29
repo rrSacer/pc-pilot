@@ -22,11 +22,13 @@ class Label extends Actor{} class Widget extends Actor{} class BoxLayout extends
 class DrawingArea extends Actor{constructor(...a){super();this._init(...a)} _init(p={}){Object.assign(this,p)}};
 `;
 const sources = {
- glib: `let clockOffset=0, timeoutScale=0.1; const procStats={}; export function advanceClock(ms){clockOffset+=ms*1000} export function setTimeoutScale(v){timeoutScale=v}
+ glib: `let clockOffset=0, timeoutScale=0.1; const procStats={}, childWatches=[], closedPids=[]; export function advanceClock(ms){clockOffset+=ms*1000} export function setTimeoutScale(v){timeoutScale=v}
  export default {
- PRIORITY_DEFAULT:0,PRIORITY_LOW:1,SOURCE_REMOVE:false,SOURCE_CONTINUE:true,SpawnFlags:{SEARCH_PATH:1},
+ PRIORITY_DEFAULT:0,PRIORITY_LOW:1,SOURCE_REMOVE:false,SOURCE_CONTINUE:true,SpawnFlags:{SEARCH_PATH:1,DO_NOT_REAP_CHILD:2},
  getenv:()=>null,build_filenamev:a=>a.join('/'),get_real_time:()=>Date.now()*1000,
- advanceClock, setTimeoutScale,procStats,
+ advanceClock, setTimeoutScale,procStats,childWatches,closedPids,
+ child_watch_add(priority,pid,callback){childWatches.push({priority,pid,callback});return childWatches.length},
+ spawn_close_pid(pid){closedPids.push(pid)},
  file_get_contents(path){const pid=Number(path.match(/\\/(\\d+)\\/stat$/)?.[1]);if(!(pid in procStats))return [false,new Uint8Array()];return [true,new TextEncoder().encode(procStats[pid])]},
  markup_escape_text:s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;'),uri_peek_scheme:s=>String(s).split(':',1)[0]||null,
  timeout_add(_p,ms,cb){let id=setTimeout(()=>cb(),Math.max(1,Math.ceil(ms*timeoutScale))); timers.set(id,id);return id},

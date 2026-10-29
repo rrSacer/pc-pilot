@@ -59,6 +59,58 @@ export async function runV2Scenarios() {
  };
  const runSteps=async(ops,args={})=>{const result={closed:[],restored:[],left_open:[],focused:null};await ops._wrapupSteps(new Set((args.keep??[]).map(Number)),args.close_new!==false,args.return_to??'origin',new Token(),result);return result};
 
+ // The pid callback must read the spawned child's identity before a reused pid
+ // can appear, and every callback path must install a watcher that reaps it.
+ {
+  const {ops}=createSession([]);const info=new Gio.DesktopAppInfo(501,true);
+  let callback=null,passedFlags=null;
+  info.launch_uris_as_manager=(_uris,_ctx,flags,_childSetup,cb)=>{
+   passedFlags=flags;
+   // Model the reviewer's launcher: without DO_NOT_REAP_CHILD, exit and PID
+   // reuse happen before the callback; with it, the zombie reserves the PID.
+   GLib.procStats[501]=procStat(501,'spawned zombie',1,1000);
+   if(!(flags&GLib.SpawnFlags.DO_NOT_REAP_CHILD))
+    GLib.procStats[501]=procStat(501,'reused stranger',1,2000);
+   callback=cb;
+  };
+  ops._spawn(info,[]);
+  assert.equal(passedFlags&GLib.SpawnFlags.SEARCH_PATH,GLib.SpawnFlags.SEARCH_PATH);
+  assert.equal(passedFlags&GLib.SpawnFlags.DO_NOT_REAP_CHILD,GLib.SpawnFlags.DO_NOT_REAP_CHILD);
+  callback(info,501);
+  assert.ok(ops.session._spawned.has('501:1000'));
+  assert.equal(ops.session._spawned.has('501:2000'),false);
+  const watch=GLib.childWatches.at(-1);assert.equal(watch.pid,501);
+  assert.equal(GLib.childWatches.filter(w=>w.pid===501).length,1);
+  watch.callback(501,0);assert.equal(GLib.closedPids.at(-1),501);
+  // Once that process is gone, the stranger reusing its PID is never ours.
+  GLib.procStats[501]=procStat(501,'reused stranger',1,2000);
+  const stranger=created(44,{appId:'app.stranger',pid:501});add(stranger);
+  assert.equal(ops.session.isAuthored(stranger),false);
+  const result=await runSteps(ops);assert.deepEqual(winEvents.filter(e=>e[0]==='delete'),[]);
+  assert.equal(result.left_open.find(w=>w.id===44)?.reason,'not_authored');
+
+  // Even if identity reading fails, or the session has already been cleared,
+  // the child watcher is still installed exactly once for that spawned PID.
+  const priorWatches=GLib.childWatches.length,priorCloses=GLib.closedPids.length;
+  const unreadable=new Gio.DesktopAppInfo(502,true);let unreadableCallback;
+  unreadable.launch_uris_as_manager=(_u,_c,flags,_x,cb)=>{assert.ok(flags&GLib.SpawnFlags.DO_NOT_REAP_CHILD);unreadableCallback=cb};
+  ops._spawn(unreadable,[]);unreadableCallback(unreadable,502);
+  assert.equal(GLib.childWatches.length,priorWatches+1);assert.equal(GLib.childWatches.at(-1).pid,502);
+  assert.equal(GLib.childWatches.filter(w=>w.pid===502).length,1);
+  GLib.childWatches.at(-1).callback(502,0);assert.equal(GLib.closedPids.length,priorCloses+1);
+  assert.equal(ops.session._spawned.has('502:0'),false);
+
+  let clearedCallback;const cleared=new Gio.DesktopAppInfo(503,true);
+  cleared.launch_uris_as_manager=(_u,_c,flags,_x,cb)=>{assert.ok(flags&GLib.SpawnFlags.DO_NOT_REAP_CHILD);clearedCallback=cb};
+  ops._spawn(cleared,[]);ops.session.clear();
+  const beforeClearWatch=GLib.childWatches.length;clearedCallback(cleared,503);
+  assert.equal(GLib.childWatches.length,beforeClearWatch+1);assert.equal(GLib.childWatches.at(-1).pid,503);
+  assert.equal(GLib.childWatches.filter(w=>w.pid===503).length,1);
+  GLib.childWatches.at(-1).callback(503,0);assert.equal(GLib.closedPids.at(-1),503);
+  assert.equal(ops.session._spawned.size,0);
+  delete GLib.procStats[501];
+ }
+
  // RR1: time and an overlapping AI operation never authorize a window.
  {
   const {ops}=createSession([created(1,{focused:true,appId:'app.focus',pid:100})]);
@@ -376,5 +428,5 @@ export async function runV2Scenarios() {
   assert.ok(deviation(planPath(a,b,'fast'))<1e-8);
   assert.ok(deviation(planPath(a,b,'human',{rand:()=>0.75}))>1);
  }
- return ['r1-authorship','rr-spawned-pid-ancestry','rr-cancelled-launches','r2-transient-families','r3-idempotent-refusal','r4-journal-conflicts','r5-drag-hold','r6-cadence-budget','monitor-clamp','r7-real-wrapup-aborts','r7-real-cap','path-perpendicular'];
+ return ['r1-authorship','rr-spawned-pid-ancestry','rr-cancelled-launches','r2-transient-families','r3-idempotent-refusal','r4-journal-conflicts','r5-drag-hold','r6-cadence-budget','monitor-clamp','r7-real-wrapup-aborts','r7-real-cap','path-perpendicular','spawn-reserved-pid-reaped'];
 }
