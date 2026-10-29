@@ -471,7 +471,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         self.assertEqual((after["x"],after["y"],after["width"],after["height"]),original)
         self.assertTrue(any(w["id"]==external["id"] and not w["ai"] for w in a.call("ui.window.list")["windows"]))
 
-    def test_v2_spawned_text_editor_family_is_closed(self):
+    def test_v2_dbus_text_editor_windows_survive_wrapup(self):
         a=self._agent();self.addCleanup(self._end_client,a)
         a.call("session.begin",{"label":"spawned app family"})
         existing=[w for w in a.call("ui.window.list")["windows"] if w.get("app_id")=="org.gnome.TextEditor.desktop"]
@@ -488,10 +488,12 @@ class ExtensionHeadlessTests(unittest.TestCase):
             time.sleep(.05)
         self.assertIsNotNone(second,"Ctrl+N did not create a second Text Editor window")
         by_id={w["id"]:w for w in a.call("ui.window.list")["windows"]}
-        self.assertTrue(by_id[first["id"]]["ai"]);self.assertTrue(by_id[second["id"]]["ai"])
+        self.assertFalse(by_id[first["id"]]["ai"]);self.assertFalse(by_id[second["id"]]["ai"])
         result=a.call("ui.session.wrapup")
-        closed={w["id"] for w in result["closed"]}
-        self.assertIn(first["id"],closed);self.assertIn(second["id"],closed)
+        left={w["id"]:w["reason"] for w in result["left_open"]}
+        self.assertEqual(left[first["id"]],"not_authored");self.assertEqual(left[second["id"]],"not_authored")
+        remaining={w["id"] for w in a.call("ui.window.list")["windows"]}
+        self.assertIn(first["id"],remaining);self.assertIn(second["id"],remaining)
 
     def test_v2_keep_dialog_family_and_confirm_close_is_idempotent(self):
         a=self._agent();self.addCleanup(self._end_client,a)

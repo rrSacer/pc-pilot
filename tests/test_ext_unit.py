@@ -23,6 +23,7 @@ class ExtensionUnitRegressionTests(unittest.TestCase):
             "path-curve", "typing-cadence-cap", "glide-cancel", "cursor-inactive-reasons",
             "cursor-connection-loss", "cursor-disable", "cursor-cleanup-exception",
             "cursor-overlay-failures", "balanced-cursor-inhibit", "wrapup-cap", "r1-authorship", "r2-transient-families",
+            "rr-spawned-pid-ancestry", "rr-cancelled-launches",
             "r3-idempotent-refusal", "r4-journal-conflicts", "r5-drag-hold", "r6-cadence-budget",
             "monitor-clamp", "r7-real-wrapup-aborts", "r7-real-cap", "path-perpendicular"}.issubset(result["checks"]))
         self.assertEqual(result.get("bugs", []), [], "extension defect observed by the regression shim")

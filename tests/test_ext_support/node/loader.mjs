@@ -22,24 +22,29 @@ class Label extends Actor{} class Widget extends Actor{} class BoxLayout extends
 class DrawingArea extends Actor{constructor(...a){super();this._init(...a)} _init(p={}){Object.assign(this,p)}};
 `;
 const sources = {
- glib: `let clockOffset=0, timeoutScale=0.1; export function advanceClock(ms){clockOffset+=ms*1000} export function setTimeoutScale(v){timeoutScale=v}
+ glib: `let clockOffset=0, timeoutScale=0.1; const procStats={}; export function advanceClock(ms){clockOffset+=ms*1000} export function setTimeoutScale(v){timeoutScale=v}
  export default {
  PRIORITY_DEFAULT:0,PRIORITY_LOW:1,SOURCE_REMOVE:false,SOURCE_CONTINUE:true,SpawnFlags:{SEARCH_PATH:1},
  getenv:()=>null,build_filenamev:a=>a.join('/'),get_real_time:()=>Date.now()*1000,
- advanceClock, setTimeoutScale,
+ advanceClock, setTimeoutScale,procStats,
+ file_get_contents(path){const pid=Number(path.match(/\\/(\\d+)\\/stat$/)?.[1]);if(!(pid in procStats))return [false,new Uint8Array()];return [true,new TextEncoder().encode(procStats[pid])]},
  markup_escape_text:s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;'),uri_peek_scheme:s=>String(s).split(':',1)[0]||null,
  timeout_add(_p,ms,cb){let id=setTimeout(()=>cb(),Math.max(1,Math.ceil(ms*timeoutScale))); timers.set(id,id);return id},
  idle_add(_p,cb){let id=setTimeout(cb,1);timers.set(id,id);return id},source_remove(id){clearTimeout(id)},
  get_monotonic_time:()=>Date.now()*1000+clockOffset}; export const timers=new Map();`,
- gio:`class Cancellable{cancel(){this.cancelled=true}is_cancelled(){return !!this.cancelled}}
- class File{static records=[]; constructor(path){this.path=path;this.deleted=false;File.records.push(this)}
+ gio:`class Cancellable{constructor(){this.cancelled=false;this.handlers=[]}cancel(){this.cancelled=true;this.handlers.forEach(f=>f())}is_cancelled(){return !!this.cancelled}connect(_s,cb){this.handlers.push(cb);return this.handlers.length}}
+ class File{static records=[];static handlerLookup=null; constructor(path){this.path=path;this.deleted=false;File.records.push(this)}
+  async query_default_handler_async(_priority,cancellable){if(File.handlerLookup)return File.handlerLookup(this.path,cancellable);return null}
   async replace_async(){await new Promise(r=>setTimeout(r,10));return {close_async:async()=>{},read_async:async()=>({read_bytes_async:async()=>({toArray:()=>Array(24).fill(0)}),close(){}})}}
   async delete_async(){this.deleted=true}}
- class SocketClient{} class DataInputStream{} class OutputStream{} class InputStream{} class AppInfo{static async launch_default_for_uri_async(){}}
- class DesktopAppInfo extends AppInfo{constructor(pid=0){super();this.pid=pid} launch_uris_as_manager(_u,_c,_f,_x,cb){cb(this,this.pid)}}
+ class SocketClient{} class DataInputStream{} class OutputStream{} class InputStream{} class AppInfo{static defaultCalls=[];static schemeHandler=null;
+  static async get_default_for_uri_scheme(s){return AppInfo.schemeHandler?.(s)??null}
+  static async launch_default_for_uri_async(uri,_ctx,cancellable){AppInfo.defaultCalls.push({uri,cancellable})}}
+ class DesktopAppInfo extends AppInfo{constructor(pid=0,emitPid=true){super();this.pid=pid;this.emitPid=emitPid}
+  launch_uris_as_manager(_u,_c,_f,_x,cb){if(this.emitPid)cb(this,this.pid)} launch_uris(){}}
  const Gio={Cancellable,File,SocketClient,DataInputStream,OutputStream,InputStream,AppInfo,DesktopAppInfo,
  SpawnFlags:{SEARCH_PATH:1},_promisify(){},FileCreateFlags:{PRIVATE:0},IOErrorEnum:{CANCELLED:1}};
- Gio.File.new_for_path=p=>new File(p); export {Gio}; export default Gio;`,
+ Gio.File.new_for_path=p=>new File(p);Gio.File.new_for_uri=u=>new File(u); export {Gio}; export default Gio;`,
  clutter:`const timelines=[]; const C={BUTTON_PRIMARY:1,BUTTON_MIDDLE:2,BUTTON_SECONDARY:3,ButtonState:{PRESSED:1,RELEASED:0},
  InputDeviceType:{POINTER_DEVICE:1,KEYBOARD_DEVICE:2},KeyState:{PRESSED:1,RELEASED:0},ScrollSource:{WHEEL:0},
  Orientation:{VERTICAL:1},ActorAlign:{CENTER:1,START:2},AnimationMode:{EASE_IN_OUT_SINE:0,EASE_OUT_QUAD:1},BinLayout:class {},

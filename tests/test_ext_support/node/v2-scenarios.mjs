@@ -67,16 +67,19 @@ export async function runV2Scenarios() {
   let appWindows=[];
   const app={get_id:()=> 'app.launched',get_name:()=> 'Launched',get_windows:()=>appWindows,
    get_app_info:()=>new Gio.DesktopAppInfo(500)};
-  const appWindow=created(4,{appId:'window:4',pid:500});
+  const appWindow=created(4,{appId:'app.launched',pid:500});
   ops._resolveApp=()=>app;
   const productionSpawn=Ops.prototype._spawn;
   ops._spawn=(info,uris)=>{const pids=productionSpawn.call(ops,info,uris);add(appWindow);return pids};
   const launch=await ops._appLaunch({app:'launched',wait_ms:1000},new Token());
   assert.equal(launch.window.id,4); // matched by the DesktopAppInfo pid callback
   const family=created(5,{appId:'window:5',pid:500});add(family); // spawned app family
+  const sameIdIndependent=created(6,{appId:'app.launched',pid:999});add(sameIdIndependent);
   const result=await runSteps(ops);
   assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]).sort((a,b)=>a-b),[4,5]);
   for(const id of [2,3])assert.equal(result.left_open.find(w=>w.id===id)?.reason,'not_authored');
+  assert.equal(result.left_open.find(w=>w.id===6)?.reason,'not_authored');
+  assert.equal(ops.session.isAuthored(sameIdIndependent),false);
   const listed=ops._windowList().windows;
   assert.equal(listed.find(w=>w.id===3).ai,false);assert.equal(listed.find(w=>w.id===5),undefined);
  }
@@ -84,23 +87,47 @@ export async function runV2Scenarios() {
  // window that appears while app.launch waits is not a fallback candidate.
  {
   const existing=created(20,{appId:'app.running',pid:700});const {ops}=createSession([existing]);
-  const appWindows=[existing];let returned,other;
+  const appWindows=[existing];let returned,other,sameTracker;
   const app={get_id:()=> 'app.running',get_name:()=> 'Running',get_windows:()=>appWindows,
    get_app_info:()=>new Gio.DesktopAppInfo(701)};
   ops._resolveApp=()=>app;
   ops._spawn=(info,uris)=>{const pids=Ops.prototype._spawn.call(ops,info,uris);
-   returned=created(21,{appId:'app.running',pid:701});other=created(22,{appId:'app.foreign',pid:702});
-   appWindows.push(returned);add(returned);add(other);return pids};
+   sameTracker=created(26,{appId:'app.running',pid:700});returned=created(21,{appId:'app.running',pid:701});other=created(22,{appId:'app.foreign',pid:702});
+   appWindows.push(sameTracker,returned);add(sameTracker);add(returned);add(other);return pids};
   const reply=await ops._appLaunch({app:'running',uris:['file:///tmp/document.txt'],wait_ms:500},new Token());
   assert.equal(reply.window.id,21);assert.equal(ops.session.isAuthored(returned),true);
-  assert.equal(ops.session.isAuthored(other),false);
+  assert.equal(ops.session.isAuthored(other),false);assert.equal(ops.session.isAuthored(sameTracker),false);
   const r=await runSteps(ops);assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]),[21]);
   assert.equal(r.left_open.find(w=>w.id===22)?.reason,'not_authored');
+  assert.equal(r.left_open.find(w=>w.id===26)?.reason,'not_authored');
  }
  {
   const {ops}=createSession([]);let stray;
-  ops._resolveApp=()=>({get_id:()=> 'app.expected',get_name:()=> 'Expected',get_windows:()=>[],get_app_info:()=>new Gio.DesktopAppInfo(801)});
-  ops._spawn=(info,uris)=>{const pids=Ops.prototype._spawn.call(ops,info,uris);stray=created(23,{appId:'app.unrelated',pid:802});add(stray);return pids};
+  const appWindows=[];const app={get_id:()=> 'app.dbus',get_name:()=> 'D-Bus app',get_windows:()=>appWindows,
+   get_app_info:()=>new Gio.DesktopAppInfo(0,false)};
+  ops._resolveApp=()=>app;
+  ops._spawn=(info,uris)=>{const pids=Ops.prototype._spawn.call(ops,info,uris);stray=created(23,{appId:'app.dbus',pid:0});appWindows.push(stray);add(stray);return pids};
+  const reply=await ops._appLaunch({app:'dbus',wait_ms:250},new Token());
+  assert.equal(reply.window.id,23);assert.equal(ops.session.isAuthored(stray),false);
+  const r=await runSteps(ops);assert.deepEqual(winEvents.filter(e=>e[0]==='delete'),[]);
+  assert.equal(r.left_open.find(w=>w.id===23)?.reason,'not_authored');
+ }
+ // Tracker matching can return a window, but a spawned pid is the only authority.
+ {
+  const {ops}=createSession([]);let tracked;
+  const appWindows=[];const app={get_id:()=> 'app.expected',get_name:()=> 'Expected',get_windows:()=>appWindows,
+   get_app_info:()=>new Gio.DesktopAppInfo(801)};
+  ops._resolveApp=()=>app;
+  ops._spawn=(info,uris)=>{const pids=Ops.prototype._spawn.call(ops,info,uris);tracked=created(27,{appId:'app.expected',pid:802});appWindows.push(tracked);add(tracked);return pids};
+  const reply=await ops._appLaunch({app:'expected',wait_ms:250},new Token());
+  assert.equal(reply.window.id,27);assert.equal(ops.session.isAuthored(tracked),false);
+  const r=await runSteps(ops);assert.deepEqual(winEvents.filter(e=>e[0]==='delete'),[]);
+  assert.equal(r.left_open.find(w=>w.id===27)?.reason,'not_authored');
+ }
+ {
+  const {ops}=createSession([]);let stray;
+  ops._resolveApp=()=>({get_id:()=> 'app.expected',get_name:()=> 'Expected',get_windows:()=>[],get_app_info:()=>new Gio.DesktopAppInfo(810)});
+  ops._spawn=(info,uris)=>{const pids=Ops.prototype._spawn.call(ops,info,uris);stray=created(28,{appId:'app.unrelated',pid:811});add(stray);return pids};
   const reply=await ops._appLaunch({app:'expected',wait_ms:250},new Token());
   assert.equal(reply.window,undefined);assert.equal(ops.session.isAuthored(stray),false);
  }
@@ -119,6 +146,51 @@ export async function runV2Scenarios() {
   Shell.AppSystem.get_default=()=>({lookup_app:()=>({get_windows:()=>[existing]})});
   ops._defaultHandler=async()=>handler;let spawned=false;ops._spawn=()=>{spawned=true;return []};
   assert.deepEqual(await ops._openUri({uri:'https://example.invalid'},new Token()),{});assert.equal(spawned,false);
+ }
+ // A child of a spawned process inherits authorship; matching app ids alone do not.
+ {
+  const {ops}=createSession([created(29,{focused:true})]);ops.session.launchedPid(600);
+  GLib.procStats[650]='650 (comm with ) parens) S 640 0 0 0';
+  GLib.procStats[640]='640 (middle process) S 600 0 0 0';
+  GLib.procStats[651]='651 (unrelated) S 777 0 0 0';
+  const child=created(30,{appId:'same.application',pid:650});const unrelated=created(31,{appId:'same.application',pid:651});
+  add(child);add(unrelated);
+  assert.equal(ops.session.spawnedByUs(650),true);assert.equal(ops.session.isAuthored(child),true);
+  assert.equal(ops.session.isAuthored(unrelated),false);
+  const result=await runSteps(ops);
+  assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]),[30]);
+  assert.equal(result.left_open.find(w=>w.id===31)?.reason,'not_authored');
+  for(const pid of [640,650,651])delete GLib.procStats[pid];
+ }
+ // Cancellation during handler lookup or just before a launch must have no side effect.
+ {
+  const {ops}=createSession([]);let lookupStarted=false,lookupCancelled=false,spawns=0;
+  Gio.AppInfo.defaultCalls=[];
+  Gio.File.handlerLookup=(_uri,cancellable)=>new Promise((_resolve,reject)=>{
+   lookupStarted=true;
+   cancellable.connect('cancelled',()=>{lookupCancelled=true;reject(new Error('cancelled'))})});
+  ops._spawn=()=>{spawns++;return []};
+  const token=new Token();const call=ops._openUri({uri:'file:///tmp/x'},token).catch(e=>e.code);
+  while(!lookupStarted)await new Promise(r=>setTimeout(r,1));token.cancel();
+  assert.equal(await call,'inactive');assert.equal(lookupCancelled,true);assert.equal(spawns,0);assert.equal(Gio.AppInfo.defaultCalls.length,0);
+  Gio.File.handlerLookup=null;
+ }
+ {
+  const {ops}=createSession([]);let resolveHandler,spawns=0;
+  Gio.AppInfo.schemeHandler=()=>new Promise(r=>resolveHandler=r);Gio.AppInfo.defaultCalls=[];
+  const token=new Token();const call=ops._openUri({uri:'https://example.invalid'},token).catch(e=>e.code);
+  while(!resolveHandler)await new Promise(r=>setTimeout(r,1));token.cancel();resolveHandler(null);
+  assert.equal(await call,'inactive');assert.equal(spawns,0);assert.equal(Gio.AppInfo.defaultCalls.length,0);
+  Gio.AppInfo.schemeHandler=null;
+ }
+ {
+  const {ops}=createSession([]);let launches=0;
+  ops._resolveApp=()=>({get_id:()=> 'app.cancel',get_name:()=> 'Cancel',get_windows:()=>[],get_app_info:()=>new Gio.DesktopAppInfo(1001)});
+  ops._spawn=(info,uris)=>{launches++;return Ops.prototype._spawn.call(ops,info,uris)};const before=new Token();before.cancel();
+  await assert.rejects(ops._appLaunch({app:'cancel'},before),e=>e.code==='inactive');assert.equal(launches,0);
+  const waiting=new Token();const p=ops._appLaunch({app:'cancel',wait_ms:1000},waiting).catch(e=>e.code);
+  while(launches===0)await new Promise(r=>setTimeout(r,1));waiting.cancel();assert.equal(await p,'inactive');
+  assert.equal(ops.session._authored.size,0);
  }
  // R2: keep and pre-existing roots protect every transient in that family.
  {
@@ -232,5 +304,5 @@ export async function runV2Scenarios() {
   assert.ok(deviation(planPath(a,b,'fast'))<1e-8);
   assert.ok(deviation(planPath(a,b,'human',{rand:()=>0.75}))>1);
  }
- return ['r1-authorship','r2-transient-families','r3-idempotent-refusal','r4-journal-conflicts','r5-drag-hold','r6-cadence-budget','monitor-clamp','r7-real-wrapup-aborts','r7-real-cap','path-perpendicular'];
+ return ['r1-authorship','rr-spawned-pid-ancestry','rr-cancelled-launches','r2-transient-families','r3-idempotent-refusal','r4-journal-conflicts','r5-drag-hold','r6-cadence-budget','monitor-clamp','r7-real-wrapup-aborts','r7-real-cap','path-perpendicular'];
 }
