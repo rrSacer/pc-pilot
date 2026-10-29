@@ -1,0 +1,276 @@
+// Red border on every monitor + "X está controlando seu PC" pill + end-of-session toast.
+// Everything is non-reactive (clicks fall through to the windows below) and lives in
+// top chrome, above all windows including fullscreen ones.
+
+import Clutter from 'gi://Clutter';
+import GLib from 'gi://GLib';
+import St from 'gi://St';
+
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+
+const RED = '#ff453a';
+const PULSE_MS = 1400;
+const TOAST_MS = 2500;
+const PAINT_TIMEOUT_MS = 1500; // the daemon waits 2s for the ack
+
+function esc(s) {
+    return GLib.markup_escape_text(String(s), -1);
+}
+
+export class Overlay {
+    constructor() {
+        this._active = false;
+        this._label = 'IA';
+        this._hotkey = 'Ctrl+Alt+Esc';
+        this._status = '';
+        this._captureHidden = 0;
+        this._pulseId = 0;
+        this._toastId = 0;
+        this._pulseHigh = true;
+
+        this._group = new St.Widget({name: 'pcpilotOverlay', reactive: false, visible: false});
+        Main.layoutManager.addTopChrome(this._group);
+
+        this._frames = [];
+        this._toast = new St.Label({
+            reactive: false,
+            visible: false,
+            style: `background-color: rgba(20,20,22,0.92); color: #fff; border: 1px solid ${RED};` +
+                'border-radius: 999px; padding: 8px 18px; font-size: 14px;',
+        });
+        this._toastBox = new St.Widget({
+            reactive: false,
+            layout_manager: new Clutter.BinLayout(),
+        });
+        this._toast.set({
+            x_expand: true, y_expand: true,
+            x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.START,
+        });
+        this._toastBox.add_child(this._toast);
+        this._toastBox.set_style('padding-top: 14px;');
+
+        this._pillDot = new St.Label({reactive: false, text: '●', style: `font-size: 14px; color: ${RED};`});
+        this._pillText = new St.Label({reactive: false, style: 'font-size: 14px; color: #fff;'});
+        const pillLine = new St.BoxLayout({reactive: false, style: 'spacing: 6px;'});
+        pillLine.add_child(this._pillDot);
+        pillLine.add_child(this._pillText);
+        this._pillStatus = new St.Label({
+            reactive: false,
+            visible: false,
+            style: 'font-size: 12px; color: rgba(255,255,255,0.7);',
+            x_align: Clutter.ActorAlign.CENTER,
+        });
+        this._pill = new St.BoxLayout({
+            reactive: false,
+            orientation: Clutter.Orientation.VERTICAL,
+            style: `background-color: rgba(20,20,22,0.92); color: #fff; border: 1px solid ${RED};` +
+                'border-radius: 999px; padding: 8px 18px;',
+        });
+        this._pill.add_child(pillLine);
+        this._pill.add_child(this._pillStatus);
+
+        this._monitorsId = Main.layoutManager.connect('monitors-changed', () => this._build());
+        this._build();
+    }
+
+    destroy() {
+        this._stopPulse();
+        if (this._toastId)
+            GLib.source_remove(this._toastId);
+        this._toastId = 0;
+        Main.layoutManager.disconnect(this._monitorsId);
+        this._group.destroy();
+        this._group = null;
+        this._frames = [];
+    }
+
+    // Session overlay is up (true even while hidden for a screenshot capture).
+    get active() {
+        return this._active && this._group !== null;
+    }
+
+    get visible() {
+        return this._group?.visible ?? false;
+    }
+
+    _build() {
+        for (const f of this._frames) {
+            if (this._pill.get_parent() === f.inner)
+                f.inner.remove_child(this._pill);
+            f.frame.destroy();
+        }
+        this._frames = [];
+        if (this._toastBox.get_parent())
+            this._group.remove_child(this._toastBox);
+
+        const monitors = Main.layoutManager.monitors;
+        const primary = Main.layoutManager.primaryMonitor ?? monitors[0];
+        for (const m of monitors) {
+            const frame = new St.Widget({
+                reactive: false,
+                x: m.x, y: m.y, width: m.width, height: m.height,
+                style: `border: 4px solid ${RED};`,
+                layout_manager: new Clutter.BinLayout(),
+            });
+            // Separate glow layer so the pulse only fades the soft inner shadow.
+            const glow = new St.Widget({
+                reactive: false,
+                x_expand: true, y_expand: true,
+                style: 'box-shadow: inset 0 0 18px rgba(255,69,58,0.55);',
+            });
+            const inner = new St.Widget({
+                reactive: false,
+                x_expand: true, y_expand: true,
+                layout_manager: new Clutter.BinLayout(),
+                style: 'padding-top: 6px;',
+            });
+            frame.add_child(glow);
+            frame.add_child(inner);
+            frame.visible = this._active;
+            this._group.add_child(frame);
+            this._frames.push({frame, glow, inner});
+            if (m === primary) {
+                inner.add_child(this._pill);
+                this._pill.set({
+                    x_expand: true, y_expand: true,
+                    x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.START,
+                });
+            }
+        }
+        if (primary) {
+            this._toastBox.set({x: primary.x, y: primary.y, width: primary.width, height: primary.height});
+            this._group.add_child(this._toastBox);
+        }
+        this._sync();
+    }
+
+    _sync() {
+        if (!this._group)
+            return; // destroyed (e.g. a capture finishing after disable)
+        const name = esc(this._label);
+        this._pillText.clutter_text.set_markup(
+            `<b>${name} está controlando seu PC</b>` +
+            ` · <span alpha="80%">${esc(this._hotkey)} para retomar</span>`);
+        this._pillStatus.text = this._status;
+        this._pillStatus.visible = this._status !== '';
+        for (const f of this._frames)
+            f.frame.visible = this._active;
+        this._group.visible = this._captureHidden === 0 && (this._active || this._toast.visible);
+    }
+
+    // Shows the overlay; resolves once a frame containing it has been painted.
+    show(label, hotkey) {
+        if (this._toastId) {
+            GLib.source_remove(this._toastId);
+            this._toastId = 0;
+        }
+        this._toast.visible = false;
+        this._active = true;
+        this._label = label || 'IA';
+        this._hotkey = hotkey || 'Ctrl+Alt+Esc';
+        this._status = '';
+        this._captureHidden = 0;
+        this._sync();
+        this._raise();
+        this._startPulse();
+        return this._waitPainted();
+    }
+
+    hide(toastText = null) {
+        if (!this._group)
+            return;
+        this._active = false;
+        this._status = '';
+        this._stopPulse();
+        if (toastText) {
+            this._toast.text = toastText;
+            this._toast.visible = true;
+            if (this._toastId)
+                GLib.source_remove(this._toastId);
+            this._toastId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, TOAST_MS, () => {
+                this._toastId = 0;
+                this._toast.visible = false;
+                this._sync();
+                return GLib.SOURCE_REMOVE;
+            });
+            this._raise();
+        }
+        this._sync();
+    }
+
+    setStatus(text) {
+        this._status = String(text ?? '').slice(0, 200);
+        this._sync();
+    }
+
+    // Screenshot support: hide for the duration of a capture (nestable).
+    async withHidden(fn) {
+        this._captureHidden++;
+        this._sync();
+        try {
+            return await fn();
+        } finally {
+            this._captureHidden--;
+            this._sync();
+        }
+    }
+
+    _raise() {
+        const parent = this._group?.get_parent();
+        parent?.set_child_above_sibling(this._group, null);
+    }
+
+    _startPulse() {
+        if (this._pulseId)
+            return;
+        this._pulseId = GLib.timeout_add(GLib.PRIORITY_LOW, PULSE_MS, () => {
+            this._pulseHigh = !this._pulseHigh;
+            for (const f of this._frames) {
+                f.glow.ease({
+                    opacity: this._pulseHigh ? 255 : 110,
+                    duration: PULSE_MS - 100,
+                    mode: Clutter.AnimationMode.EASE_IN_OUT_SINE,
+                });
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _stopPulse() {
+        if (this._pulseId)
+            GLib.source_remove(this._pulseId);
+        this._pulseId = 0;
+        for (const f of this._frames) {
+            f.glow.remove_all_transitions();
+            f.glow.opacity = 255;
+        }
+    }
+
+    // Resolves after the next stage paint (or a short timeout).
+    async waitPaint() {
+        await this._waitPainted();
+    }
+
+    _waitPainted() {
+        return new Promise(resolve => {
+            let paintId = 0, timeoutId = 0;
+            // Only an actual paint confirms; a timeout means "not shown".
+            const finish = painted => {
+                if (paintId)
+                    global.stage.disconnect(paintId);
+                if (timeoutId)
+                    GLib.source_remove(timeoutId);
+                paintId = timeoutId = 0;
+                resolve(painted && this._group?.visible === true && this._group.is_mapped() &&
+                    this._frames.length > 0 && this._frames.every(f => f.frame.is_mapped()));
+            };
+            paintId = global.stage.connect('after-paint', () => finish(true));
+            timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, PAINT_TIMEOUT_MS, () => {
+                timeoutId = 0;
+                finish(false);
+                return GLib.SOURCE_REMOVE;
+            });
+            global.stage.queue_redraw();
+        });
+    }
+}
