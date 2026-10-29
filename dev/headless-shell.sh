@@ -159,7 +159,7 @@ EOF
 
     # Ready = env written + wayland socket present + org.gnome.Shell owned on the bus.
     local i
-    for i in $(seq 1 150); do
+    for i in $(seq 1 "${PCPILOT_HEADLESS_START_TIMEOUT_TICKS:-300}"); do  # 0.2s ticks
         if ! kill -0 "$(cat "$dir/shell.pid")" 2>/dev/null; then
             tail -n 30 "$dir/shell.log" >&2
             die "gnome-shell exited during startup (log: $dir/shell.log)"
