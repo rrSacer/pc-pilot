@@ -11,6 +11,11 @@ from pathlib import Path
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
+# Polling ceilings: generous so a loaded machine does not flake; every wait returns as
+# soon as its condition holds. Cursor-restore checks keep a tighter (still loose) bound.
+WAIT_S = 40
+CURSOR_WAIT_S = 10
+LAUNCH_WAIT_MS = 15000  # the extension's cap for app.launch
 SUPPORT = ROOT / "tests/test_ext_support"
 
 
@@ -126,7 +131,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         except (OSError,ValueError): return None
 
     @classmethod
-    def _wait_test_state(cls,pred,timeout=3):
+    def _wait_test_state(cls,pred,timeout=CURSOR_WAIT_S):
         end=time.monotonic()+timeout
         while time.monotonic()<end:
             state=cls._test_state()
@@ -135,7 +140,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         raise AssertionError(f"test-state condition timed out: {cls._test_state()}")
 
     @classmethod
-    def _wait_probe(cls, pred, timeout=5):
+    def _wait_probe(cls, pred, timeout=WAIT_S):
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             rows = cls._rows()
@@ -315,7 +320,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         self.assertGreater(red_pixels(decorated["path"],box),0)
         result={}
         def long_move():
-            try: result["move"]=a.call("ui.pointer.move",{"x":1700,"y":800,"style":"human"},timeout=10)
+            try: result["move"]=a.call("ui.pointer.move",{"x":1700,"y":800,"style":"human"},timeout=30)
             except Exception as e: result["error"]=e
         worker=threading.Thread(target=long_move,daemon=True);worker.start();time.sleep(.35)
         mid=self._raw("trail-mid.png");worker.join(4);self.assertFalse(worker.is_alive());self.assertNotIn("error",result,str(result))
@@ -331,7 +336,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         self._wait_test_state(lambda s:s["active"] and s.get("unfocus_inhibited"))
         subprocess.run([str(ROOT/"dev/headless-shell.sh"),"run",str(self.dir),"--",
             "gnome-extensions","disable","pcpilot@local"],cwd=ROOT,check=True,timeout=20)
-        deadline=time.monotonic()+3
+        deadline=time.monotonic()+CURSOR_WAIT_S
         while time.monotonic()<deadline:
             state=self._test_state()
             if state and state.get("real_cursor_visible") and not state.get("unfocus_inhibited"):break
@@ -340,7 +345,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         subprocess.run([str(ROOT/"dev/headless-shell.sh"),"run",str(self.dir),"--",
             "gnome-extensions","enable","pcpilot@local"],cwd=ROOT,check=True,timeout=20)
         waiter=self._agent()
-        try:waiter.call("fake.wait_ui",{"timeout":8},timeout=10)
+        try:waiter.call("fake.wait_ui",{"timeout":30},timeout=35)
         finally:waiter.close()
 
     def test_wrapup_restores_snapshot_closes_new_and_honors_keep(self):
@@ -350,9 +355,13 @@ class ExtensionHeadlessTests(unittest.TestCase):
             layout=next(r for r in reversed(self._wait_probe(lambda rs:any(x.get("ev")=="layout" for x in rs))) if r.get("ev")=="layout")
             subprocess.run([str(ROOT/"dev/headless-shell.sh"),"run",str(self.dir),"--",
                 "gtk-launch","org.gnome.Calculator"],cwd=ROOT,check=True,timeout=15)
-            time.sleep(.5)
             a.call("session.begin",{"label":"Focus Calculator"})
-            origin=next(w for w in a.call("ui.window.list")["windows"] if w.get("app_id")=="org.gnome.Calculator.desktop")
+            deadline=time.monotonic()+WAIT_S;origin=None
+            while origin is None and time.monotonic()<deadline:
+                origin=next((w for w in a.call("ui.window.list")["windows"]
+                    if w.get("app_id")=="org.gnome.Calculator.desktop"),None)
+                if origin is None:time.sleep(.1)
+            self.assertIsNotNone(origin,"Calculator did not appear")
             a.call("ui.window.action",{"id":origin["id"],"action":"activate","style":"instant"})
             self._wait_probe(lambda _:any(w["id"]==origin["id"] and w["focused"] for w in a.call("ui.window.list")["windows"]))
             a.call("ui.pointer.move",{"x":origin["x"]+origin["width"]//2,"y":origin["y"]+origin["height"]//2,"style":"instant"})
@@ -364,8 +373,8 @@ class ExtensionHeadlessTests(unittest.TestCase):
             self._wait_probe(lambda _:any(w["id"]==origin["id"] and w["focused"] for w in a.call("ui.window.list")["windows"]))
             start=a.call("ui.pointer.position")
             original=next(w for w in a.call("ui.window.list")["windows"] if w["id"]==origin["id"])
-            first=a.call("ui.app.launch",{"app":"pcpilot-wrapup.desktop","wait_ms":8000})["window"]
-            second=a.call("ui.app.launch",{"app":"pcpilot-wrapup.desktop","wait_ms":8000})["window"]
+            first=a.call("ui.app.launch",{"app":"pcpilot-wrapup.desktop","wait_ms":LAUNCH_WAIT_MS})["window"]
+            second=a.call("ui.app.launch",{"app":"pcpilot-wrapup.desktop","wait_ms":LAUNCH_WAIT_MS})["window"]
             self.assertNotEqual(first["id"],second["id"])
             live={w["id"]:w for w in a.call("ui.window.list")["windows"]}
             self.assertTrue(live[first["id"]]["new"]);self.assertTrue(live[second["id"]]["new"])
@@ -386,7 +395,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
             again=a.call("ui.session.wrapup",{"keep":[second["id"]]})
             self.assertEqual(again["closed"],[]);self.assertEqual(again["restored"],[])
             # Exercise close_new=false on a new window while preserving the wrapup session.
-            third=a.call("ui.app.launch",{"app":"pcpilot-wrapup.desktop","wait_ms":8000})["window"]
+            third=a.call("ui.app.launch",{"app":"pcpilot-wrapup.desktop","wait_ms":LAUNCH_WAIT_MS})["window"]
             no_close=a.call("ui.session.wrapup",{"close_new":False})
             left=next(w for w in no_close["left_open"] if w["id"]==third["id"])
             self.assertEqual(left["reason"],"close_new=false")
@@ -396,7 +405,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         a=self._agent();self.addCleanup(self._end_client,a)
         # Focus Calculator and put the pointer inside it before the tested snapshot.
         a.call("session.begin",{"label":"focus baseline"})
-        calc=a.call("ui.app.launch",{"app":"org.gnome.Calculator.desktop","wait_ms":8000})["window"]
+        calc=a.call("ui.app.launch",{"app":"org.gnome.Calculator.desktop","wait_ms":LAUNCH_WAIT_MS})["window"]
         a.call("ui.window.action",{"id":calc["id"],"action":"activate","style":"instant"})
         a.call("ui.pointer.move",{"x":calc["x"]+calc["width"]//2,"y":calc["y"]+calc["height"]//2,"style":"instant"})
         a.call("session.end",{"reason":"agent_request"})
@@ -411,25 +420,25 @@ class ExtensionHeadlessTests(unittest.TestCase):
             mover=self._agent()
             try:
                 move_started.set()
-                mover.call("ui.pointer.move",{"x":1700,"y":900,"style":"human"},timeout=10)
+                mover.call("ui.pointer.move",{"x":1700,"y":900,"style":"human"},timeout=30)
             finally:mover.close()
         mover=threading.Thread(target=long_move,daemon=True);mover.start();self.assertTrue(move_started.wait(2))
         time.sleep(.1)
         subprocess.run([str(ROOT/"dev/headless-shell.sh"),"run",str(self.dir),"--","sh","-lc",
             f"env PROBE_LOG={during_log} PROBE_TITLE=ExternalDuring /usr/bin/python3 {SUPPORT / 'gtk_probe.py'} >/dev/null 2>&1 &"],
             cwd=ROOT,check=True,timeout=15)
-        deadline=time.monotonic()+8;external_during=None
+        deadline=time.monotonic()+WAIT_S;external_during=None
         while time.monotonic()<deadline:
             external_during=next((w for w in a.call("ui.window.list")["windows"] if w["title"]=="ExternalDuring"),None)
             if external_during:break
             time.sleep(.05)
         self.assertIsNotNone(external_during)
-        mover.join(timeout=12);self.assertFalse(mover.is_alive(),"pointer move did not settle")
+        mover.join(timeout=WAIT_S);self.assertFalse(mover.is_alive(),"pointer move did not settle")
         self.assertFalse(next(w for w in a.call("ui.window.list")["windows"] if w["id"]==external_during["id"])["ai"])
-        launch_reply=a.call("ui.app.launch",{"app":"pcpilot-wrapup.desktop","wait_ms":8000})
+        launch_reply=a.call("ui.app.launch",{"app":"pcpilot-wrapup.desktop","wait_ms":LAUNCH_WAIT_MS})
         launched=launch_reply.get("window")
         if not launched:
-            deadline=time.monotonic()+5
+            deadline=time.monotonic()+WAIT_S
             while time.monotonic()<deadline:
                 launched=next((w for w in a.call("ui.window.list")["windows"] if w["title"]=="WrapupProbe" and w["new"]),None)
                 if launched:break
@@ -442,7 +451,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         subprocess.run([str(ROOT/"dev/headless-shell.sh"),"run",str(self.dir),"--","sh","-lc",
             f"env PROBE_LOG={extlog} PROBE_TITLE=External /usr/bin/python3 {SUPPORT / 'gtk_probe.py'} >/dev/null 2>&1 &"],
             cwd=ROOT,check=True,timeout=15)
-        deadline=time.monotonic()+8;external=None
+        deadline=time.monotonic()+WAIT_S;external=None
         while time.monotonic()<deadline:
             external=next((w for w in a.call("ui.window.list")["windows"] if w["title"]=="External"),None)
             if external:break
@@ -455,7 +464,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         subprocess.run([str(ROOT/"dev/headless-shell.sh"),"run",str(self.dir),"--","sh","-lc",
             f"env PROBE_LOG={right_before_log} PROBE_TITLE=ExternalBeforeWrapup /usr/bin/python3 {SUPPORT / 'gtk_probe.py'} >/dev/null 2>&1 &"],
             cwd=ROOT,check=True,timeout=15)
-        deadline=time.monotonic()+8;external_before=None
+        deadline=time.monotonic()+WAIT_S;external_before=None
         while time.monotonic()<deadline:
             external_before=next((w for w in a.call("ui.window.list")["windows"] if w["title"]=="ExternalBeforeWrapup"),None)
             if external_before:break
@@ -476,11 +485,11 @@ class ExtensionHeadlessTests(unittest.TestCase):
         a.call("session.begin",{"label":"spawned app family"})
         existing=[w for w in a.call("ui.window.list")["windows"] if w.get("app_id")=="org.gnome.TextEditor.desktop"]
         self.assertFalse(existing,"Text Editor must not already be running in the isolated shell")
-        first=a.call("ui.app.launch",{"app":"org.gnome.TextEditor.desktop","wait_ms":10000})["window"]
+        first=a.call("ui.app.launch",{"app":"org.gnome.TextEditor.desktop","wait_ms":LAUNCH_WAIT_MS})["window"]
         self.assertTrue(first.get("focused"),first)
         a.call("ui.window.action",{"id":first["id"],"action":"activate","style":"instant"})
         a.call("ui.key.press",{"keys":"ctrl+n"})
-        deadline=time.monotonic()+8;second=None
+        deadline=time.monotonic()+WAIT_S;second=None
         while time.monotonic()<deadline:
             matches=[w for w in a.call("ui.window.list")["windows"]
                      if w.get("app_id")=="org.gnome.TextEditor.desktop" and w["id"]!=first["id"]]
@@ -498,8 +507,8 @@ class ExtensionHeadlessTests(unittest.TestCase):
     def test_v2_keep_dialog_family_and_confirm_close_is_idempotent(self):
         a=self._agent();self.addCleanup(self._end_client,a)
         a.call("session.begin",{"label":"transient families"})
-        family=a.call("ui.app.launch",{"app":"pcpilot-family.desktop","wait_ms":8000})["window"]
-        deadline=time.monotonic()+5;dialog=None
+        family=a.call("ui.app.launch",{"app":"pcpilot-family.desktop","wait_ms":LAUNCH_WAIT_MS})["window"]
+        deadline=time.monotonic()+WAIT_S;dialog=None
         while time.monotonic()<deadline:
             dialog=next((w for w in a.call("ui.window.list")["windows"] if w["title"]=="Family Dialog"),None)
             if dialog:break
@@ -515,10 +524,10 @@ class ExtensionHeadlessTests(unittest.TestCase):
         # A separate session avoids the family's still-open authored windows changing
         # what the refusing-close mode reports.
         a.call("session.end",{"reason":"agent_request"});a.call("session.begin",{"label":"refusing close"})
-        confirm=a.call("ui.app.launch",{"app":"pcpilot-confirm.desktop","wait_ms":8000})["window"]
+        confirm=a.call("ui.app.launch",{"app":"pcpilot-confirm.desktop","wait_ms":LAUNCH_WAIT_MS})["window"]
         result=a.call("ui.session.wrapup")
         log=self._read_jsonl(self.extra_logs["pcpilot-confirm"])
-        deadline=time.monotonic()+4;dialogs=[]
+        deadline=time.monotonic()+WAIT_S;dialogs=[]
         while time.monotonic()<deadline:
             dialogs=[w for w in a.call("ui.window.list")["windows"] if w["title"]=="Confirm Save?"]
             if dialogs:break
@@ -613,18 +622,18 @@ class ExtensionHeadlessTests(unittest.TestCase):
         a.call("ui.pointer.click",{"x":w["x"]+entry[0]+30,"y":w["y"]+entry[1]+10})
         outcome={}
         def type_long():
-            try: outcome["result"]=a.call("ui.key.type",{"text":"x"*100,"delay_ms":100},timeout=15)
+            try: outcome["result"]=a.call("ui.key.type",{"text":"x"*100,"delay_ms":100},timeout=30)
             except Exception as e: outcome["error"]=e
         worker=threading.Thread(target=type_long,daemon=True); worker.start()
         session=monitor.call("fake.lease")["session"]
-        deadline=time.monotonic()+11
+        deadline=time.monotonic()+30
         while worker.is_alive() and time.monotonic()<deadline:
             lease=monitor.call("fake.lease")
             self.assertLess(lease["since_pong_s"],3,lease)
             events=monitor.call("fake.events")["events"]
             self.assertTrue(any(e.get("event")=="pong" and e.get("session")==session for e in events),events[-8:])
             time.sleep(.5)
-        worker.join(1)
+        worker.join(WAIT_S)
         self.assertFalse(worker.is_alive())
         self.assertNotIn("error",outcome,str(outcome))
 
@@ -632,7 +641,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         a = self._begin(); self.addCleanup(self._end_client, a)
         before = self._raw("before-daemon-loss.png")
         self._stop_daemon()
-        deadline = time.monotonic()+5
+        deadline = time.monotonic()+WAIT_S
         while time.monotonic()<deadline:
             lost = self._raw("daemon-loss.png")
             p = lost.getpixel((1,540))
@@ -642,7 +651,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         self.assertNotEqual(lost.crop((700,0,1220,130)).tobytes(), before.crop((700,0,1220,130)).tobytes())
         self._start_daemon()
         waiter = self._agent()
-        try: waiter.call("fake.wait_ui", {"timeout":8}, timeout=10)
+        try: waiter.call("fake.wait_ui", {"timeout":30}, timeout=35)
         finally: waiter.close()
         a2 = self._agent()
         try: self.assertTrue(a2.call("session.begin", {"label":"Reconnect"})["active"])
@@ -653,7 +662,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         self.addCleanup(self._end_client, a)
         matches = a.call("ui.app.search", {"query":"calc"})["apps"]
         self.assertTrue(any(x["id"] == "org.gnome.Calculator.desktop" for x in matches))
-        launched = a.call("ui.app.launch", {"app":"org.gnome.Calculator.desktop", "wait_ms":8000})
+        launched = a.call("ui.app.launch", {"app":"org.gnome.Calculator.desktop", "wait_ms":LAUNCH_WAIT_MS})
         self.assertIn("window", launched)
         self.assertTrue(launched["window"]["focused"])
         wid = launched["window"]["id"]
@@ -678,7 +687,7 @@ class FreshHotCornerRegression(unittest.TestCase):
     """A separate compositor guarantees the initial pointer is at the hot corner."""
     @classmethod
     def _wait_socket(cls):
-        deadline=time.monotonic()+10
+        deadline=time.monotonic()+WAIT_S
         while time.monotonic()<deadline:
             if cls.socket.exists():
                 import socket
@@ -731,7 +740,7 @@ class FreshHotCornerRegression(unittest.TestCase):
         from tests.ui_fake_daemon import AgentClient
         a=AgentClient(str(self.socket),timeout=30); self.addCleanup(a.close)
         a.call("session.begin",{"label":"Fresh test"})
-        started=a.call("ui.app.launch",{"app":"pcpilot-fresh.desktop","wait_ms":8000})
+        started=a.call("ui.app.launch",{"app":"pcpilot-fresh.desktop","wait_ms":LAUNCH_WAIT_MS})
         self.assertIn("window",started)
         self.assertNotEqual(started["window"]["app_id"],"pcpilot-fresh.desktop")
         end=time.monotonic()+10; layout=None
