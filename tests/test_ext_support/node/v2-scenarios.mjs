@@ -53,6 +53,10 @@ export async function runV2Scenarios() {
  };
  const createSession=(initial=[])=>{resetWorld(initial);const env=makeOps();env.ops.session.snapshot();return env};
  const created=(id,options)=>new FakeWindow(id,options);
+ const procStat=(pid,comm,ppid,start)=>{
+  const fields=Array(20).fill('0');fields[0]='S';fields[1]=String(ppid);fields[19]=String(start);
+  return `${pid} (${comm}) ${fields.join(' ')}`;
+ };
  const runSteps=async(ops,args={})=>{const result={closed:[],restored:[],left_open:[],focused:null};await ops._wrapupSteps(new Set((args.keep??[]).map(Number)),args.close_new!==false,args.return_to??'origin',new Token(),result);return result};
 
  // RR1: time and an overlapping AI operation never authorize a window.
@@ -68,20 +72,26 @@ export async function runV2Scenarios() {
   const app={get_id:()=> 'app.launched',get_name:()=> 'Launched',get_windows:()=>appWindows,
    get_app_info:()=>new Gio.DesktopAppInfo(500)};
   const appWindow=created(4,{appId:'app.launched',pid:500});
+  GLib.procStats[500]=procStat(500,'launched app',1,5000);
   ops._resolveApp=()=>app;
   const productionSpawn=Ops.prototype._spawn;
   ops._spawn=(info,uris)=>{const pids=productionSpawn.call(ops,info,uris);add(appWindow);return pids};
   const launch=await ops._appLaunch({app:'launched',wait_ms:1000},new Token());
   assert.equal(launch.window.id,4); // matched by the DesktopAppInfo pid callback
-  const family=created(5,{appId:'window:5',pid:500});add(family); // spawned app family
+  const family=created(5,{appId:'window:5',pid:500});add(family);
+  assert.equal(ops.session.isAuthored(family),true); // live spawned process ancestry
   const sameIdIndependent=created(6,{appId:'app.launched',pid:999});add(sameIdIndependent);
+  delete GLib.procStats[500];
+  assert.equal(ops.session.isAuthored(appWindow),true); // explicit result authoring is keyed by window id
+  assert.equal(ops.session.isAuthored(family),false); // no stale process-tree positive
   const result=await runSteps(ops);
-  assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]).sort((a,b)=>a-b),[4,5]);
+  assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]).sort((a,b)=>a-b),[4]);
   for(const id of [2,3])assert.equal(result.left_open.find(w=>w.id===id)?.reason,'not_authored');
+  assert.equal(result.left_open.find(w=>w.id===5)?.reason,'not_authored');
   assert.equal(result.left_open.find(w=>w.id===6)?.reason,'not_authored');
   assert.equal(ops.session.isAuthored(sameIdIndependent),false);
   const listed=ops._windowList().windows;
-  assert.equal(listed.find(w=>w.id===3).ai,false);assert.equal(listed.find(w=>w.id===5),undefined);
+  assert.equal(listed.find(w=>w.id===3).ai,false);assert.equal(listed.find(w=>w.id===5).ai,false);
  }
  // A running app's URI launch authors only its returned window; a mismatched
  // window that appears while app.launch waits is not a fallback candidate.
@@ -90,6 +100,7 @@ export async function runV2Scenarios() {
   const appWindows=[existing];let returned,other,sameTracker;
   const app={get_id:()=> 'app.running',get_name:()=> 'Running',get_windows:()=>appWindows,
    get_app_info:()=>new Gio.DesktopAppInfo(701)};
+  GLib.procStats[701]=procStat(701,'launched URI process',1,7010);
   ops._resolveApp=()=>app;
   ops._spawn=(info,uris)=>{const pids=Ops.prototype._spawn.call(ops,info,uris);
    sameTracker=created(26,{appId:'app.running',pid:700});returned=created(21,{appId:'app.running',pid:701});other=created(22,{appId:'app.foreign',pid:702});
@@ -100,6 +111,7 @@ export async function runV2Scenarios() {
   const r=await runSteps(ops);assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]),[21]);
   assert.equal(r.left_open.find(w=>w.id===22)?.reason,'not_authored');
   assert.equal(r.left_open.find(w=>w.id===26)?.reason,'not_authored');
+  delete GLib.procStats[701];
  }
  {
   const {ops}=createSession([]);let stray;
@@ -134,11 +146,13 @@ export async function runV2Scenarios() {
  // open_uri authors the handler window only when it starts that handler.
  {
   const {ops}=createSession([]);const handler=new Gio.DesktopAppInfo(901);
+  GLib.procStats[901]=procStat(901,'URI handler',1,9010);
   handler.get_id=()=> 'app.uri-handler';const handlerApp={get_windows:()=>[]};
   Shell.AppSystem.get_default=()=>({lookup_app:()=>handlerApp});ops._defaultHandler=async()=>handler;
   let opened;ops._spawn=(info,uris)=>{const pids=Ops.prototype._spawn.call(ops,info,uris);opened=created(24,{appId:'window:24',pid:901});add(opened);return pids};
   const reply=await ops._openUri({uri:'https://example.invalid'},new Token());
   assert.equal(reply.window.id,24);assert.equal(ops.session.isAuthored(opened),true);
+  delete GLib.procStats[901];
  }
  {
   const existing=created(25,{appId:'app.running-uri',pid:902});const {ops}=createSession([existing]);
@@ -147,20 +161,78 @@ export async function runV2Scenarios() {
   ops._defaultHandler=async()=>handler;let spawned=false;ops._spawn=()=>{spawned=true;return []};
   assert.deepEqual(await ops._openUri({uri:'https://example.invalid'},new Token()),{});assert.equal(spawned,false);
  }
- // A child of a spawned process inherits authorship; matching app ids alone do not.
+ // Process identity is PID + start time; reuse, reparenting, or an orphan cannot
+ // inherit authorship from a process that is no longer its live ancestor.
  {
-  const {ops}=createSession([created(29,{focused:true})]);ops.session.launchedPid(600);
-  GLib.procStats[650]='650 (comm with ) parens) S 640 0 0 0';
-  GLib.procStats[640]='640 (middle process) S 600 0 0 0';
-  GLib.procStats[651]='651 (unrelated) S 777 0 0 0';
-  const child=created(30,{appId:'same.application',pid:650});const unrelated=created(31,{appId:'same.application',pid:651});
-  add(child);add(unrelated);
-  assert.equal(ops.session.spawnedByUs(650),true);assert.equal(ops.session.isAuthored(child),true);
-  assert.equal(ops.session.isAuthored(unrelated),false);
-  const result=await runSteps(ops);
-  assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]),[30]);
-  assert.equal(result.left_open.find(w=>w.id===31)?.reason,'not_authored');
-  for(const pid of [640,650,651])delete GLib.procStats[pid];
+  // A recycled pid is a different process, even if its new child uses that pid.
+  {
+   const {ops}=createSession([created(29,{focused:true})]);
+   GLib.procStats[500]=procStat(500,'spawned root',1,1000);ops.session.launchedPid(500);
+   delete GLib.procStats[500];GLib.procStats[500]=procStat(500,'reused root',1,2000);
+   GLib.procStats[750]=procStat(750,'child of reused root',500,3000);
+   const reused=created(32,{appId:'app.reused',pid:500}),child=created(33,{appId:'app.reused',pid:750});add(reused);add(child);
+   assert.equal(ops.session.spawnedByUs(500),false);assert.equal(ops.session.isAuthored(reused),false);
+   assert.equal(ops.session.isAuthored(child),false);
+   const result=await runSteps(ops);assert.deepEqual(winEvents.filter(e=>e[0]==='delete'),[]);
+   assert.equal(result.left_open.find(w=>w.id===32)?.reason,'not_authored');
+   assert.equal(result.left_open.find(w=>w.id===33)?.reason,'not_authored');
+   for(const pid of [500,750])delete GLib.procStats[pid];
+  }
+  // A once-authored descendant stops being ours as soon as it leaves the chain.
+  {
+   const {ops}=createSession([created(34,{focused:true})]);
+   GLib.procStats[500]=procStat(500,'spawned root',1,1000);ops.session.launchedPid(500);
+   GLib.procStats[650]=procStat(650,'comm with ) (parens',500,2000);
+   GLib.procStats[999]=procStat(999,'other parent',1,1800);
+   const moved=created(35,{appId:'same.application',pid:650});add(moved);
+   assert.equal(ops.session.isAuthored(moved),true);
+   GLib.procStats[650]=procStat(650,'comm with ) (parens',999,2000);
+   assert.equal(ops.session.isAuthored(moved),false);
+   const result=await runSteps(ops);assert.deepEqual(winEvents.filter(e=>e[0]==='delete'),[]);
+   assert.equal(result.left_open.find(w=>w.id===35)?.reason,'not_authored');
+   for(const pid of [500,650,999])delete GLib.procStats[pid];
+  }
+  // An orphaned child no longer belongs to an exited spawned root.
+  {
+   const {ops}=createSession([created(36,{focused:true})]);
+   GLib.procStats[500]=procStat(500,'spawned root',1,1000);ops.session.launchedPid(500);
+   GLib.procStats[650]=procStat(650,'orphan child',500,2000);
+   const orphan=created(37,{appId:'same.application',pid:650});add(orphan);
+   assert.equal(ops.session.isAuthored(orphan),true);
+   delete GLib.procStats[500];GLib.procStats[650]=procStat(650,'orphan child',1,2000);
+   assert.equal(ops.session.isAuthored(orphan),false);
+   const result=await runSteps(ops);assert.deepEqual(winEvents.filter(e=>e[0]==='delete'),[]);
+   assert.equal(result.left_open.find(w=>w.id===37)?.reason,'not_authored');
+   delete GLib.procStats[650];
+  }
+  // Live root and descendant work, while unreadable processes are never captured.
+  {
+   const {ops}=createSession([created(38,{focused:true})]);
+   GLib.procStats[600]=procStat(600,'root',1,1100);ops.session.launchedPid(600);
+   GLib.procStats[640]=procStat(640,'middle',600,1200);
+   GLib.procStats[650]=procStat(650,'comm containing ) ( characters',640,1300);
+   GLib.procStats[651]=procStat(651,'unrelated',777,1400);
+   const child=created(39,{appId:'same.application',pid:650}),unrelated=created(40,{appId:'same.application',pid:651});
+   add(child);add(unrelated);
+   assert.equal(ops.session.spawnedByUs(650),true);assert.equal(ops.session.isAuthored(child),true);
+   assert.equal(ops.session.isAuthored(unrelated),false);
+   ops.session.launchedPid(700);assert.equal(ops.session._spawned.size,1);
+   const unreadable=created(41,{appId:'same.application',pid:700});add(unreadable);
+   assert.equal(ops.session.isAuthored(unreadable),false);
+   const result=await runSteps(ops);
+   assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]),[39]);
+   assert.equal(result.left_open.find(w=>w.id===40)?.reason,'not_authored');
+   assert.equal(result.left_open.find(w=>w.id===41)?.reason,'not_authored');
+   for(const pid of [600,640,650,651])delete GLib.procStats[pid];
+  }
+  // Explicit authoring is by window id and remains valid if its process exits.
+  {
+   const {ops}=createSession([created(42,{focused:true})]);
+   GLib.procStats[850]=procStat(850,'returned app',1,1500);ops.session.launchedPid(850);
+   const returned=created(43,{appId:'window:43',pid:850});add(returned);ops.session.author(returned);
+   delete GLib.procStats[850];assert.equal(ops.session.isAuthored(returned),true);
+   const result=await runSteps(ops);assert.deepEqual(result.closed.map(w=>w.id),[43]);
+  }
  }
  // Cancellation during handler lookup or just before a launch must have no side effect.
  {
