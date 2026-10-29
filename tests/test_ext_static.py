@@ -45,7 +45,7 @@ class ExtensionStaticTests(unittest.TestCase):
         expected = {"screen.info", "screenshot", "pointer.move", "pointer.click",
                     "pointer.drag", "pointer.scroll", "pointer.position", "key.press",
                     "key.type", "app.search", "app.launch", "open_uri", "window.list",
-                    "window.action", "clipboard.get", "clipboard.set", "status"}
+                    "window.action", "clipboard.get", "clipboard.set", "status", "session.wrapup"}
         text = (EXT / "ops.js").read_text()
         body = text.split("this._handlers = {", 1)[1].split("};", 1)[0]
         actual = set(re.findall(r"'([^']+)'\s*:", body))

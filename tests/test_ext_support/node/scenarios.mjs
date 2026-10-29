@@ -6,17 +6,149 @@ import {Token} from '../../../extension/pcpilot@local/input.js';
 import {clipboard} from 'gi://St';
 import Shell from 'gi://Shell';
 import {Gio} from 'gi://Gio';
+import {planPath, fittsDuration, typingCadence} from '../../../extension/pcpilot@local/path.js';
+import {glide} from '../../../extension/pcpilot@local/motion.js';
+import Clutter, {timelines} from 'gi://Clutter';
 
 let afterPaint = null;
+const virtualEvents=[];
+let pointerPos=[0,0];
 export const cursorTracker={inhibits:0,visible:true,inhibit_cursor_visibility(){this.inhibits++},
  uninhibit_cursor_visibility(){this.inhibits--},get_pointer_visible(){return this.inhibits===0},connect:()=>1,disconnect(){}};
 globalThis.global = {
  backend:{get_cursor_tracker:()=>cursorTracker},
  screen_width:1920,screen_height:1080,display:{focus_window:null,sort_windows_by_stacking:x=>x},
- get_window_actors:()=>[],get_pointer:()=>[0,0],
- stage:{key_focus:null,context:{get_backend:()=>({get_default_seat:()=>({create_virtual_device:()=>({notify_keyval(){},notify_button(){},notify_absolute_motion(){},notify_discrete_scroll(){}})})})},
+ get_window_actors:()=>[],get_pointer:()=>pointerPos,workspace_manager:{get_active_workspace_index:()=>0},
+ stage:{key_focus:null,context:{get_backend:()=>({get_default_seat:()=>({create_virtual_device:()=>({notify_keyval:(...x)=>virtualEvents.push(['key',...x]),notify_button:(...x)=>virtualEvents.push(['button',...x]),notify_absolute_motion:(...x)=>virtualEvents.push(['move',...x]),notify_discrete_scroll(){}})})})},
   connect:(sig,cb)=>{afterPaint=cb;return 1},disconnect(){},queue_redraw(){},set_key_focus(){}}
 };
+
+// Pure path invariants: exact endpoints, bounded durations and a genuinely curved path.
+const rand=()=>0.75;
+const from=[100,100],to=[1400,800];
+const human=planPath(from,to,'human',{rand});
+assert.deepEqual(human.at(0),from); assert.deepEqual(human.at(human.duration),to);
+assert.ok(human.duration>=180 && human.duration<=900);
+let maxDeviation=0;
+for(let i=1;i<10;i++){
+ const p=human.at(human.duration*i/10),s=i/10;
+ maxDeviation=Math.max(maxDeviation,Math.abs(p[1]-(from[1]+(to[1]-from[1])*s)));
+}
+assert.ok(maxDeviation>0.5);
+const fast=planPath(from,to,'fast',{rand}); assert.ok(fast.duration>=100&&fast.duration<=180);
+assert.equal(planPath(from,to,'instant').duration,0);
+assert.ok(fittsDuration(500,rand)>=180&&fittsDuration(500,rand)<=900);
+assert.ok(typingCadence([...('a '.repeat(100))],4000,rand).reduce((a,b)=>a+b,0)<=4000);
+
+// A cancelled glide stops its compositor timeline and emits no later pointer moves.
+const glideToken=new Token();let moves=0;
+const gp=glide({move(){moves++}},human,glideToken).catch(e=>e.code);
+await new Promise(r=>setTimeout(r,45)); glideToken.cancel();
+assert.equal(await gp,'inactive');const stoppedMoves=moves;
+await new Promise(r=>setTimeout(r,35));assert.equal(moves,stoppedMoves);
+assert.ok(timelines.at(-1).stopped);
+const pathChecks=['path-endpoints','path-duration','path-curve','typing-cadence-cap','glide-cancel'];
+
+async function liveExtension(session=1){
+ const e=new PCPilotExtension();e.enable();const originalClient=e._client;e._client.stop();
+ e._client={epoch:session,send(){},reconnect(){this.reconnected=true},stop(){}};
+ e._triggerDisconnect=()=>originalClient._onDisconnected();
+ e._overlay.show=async()=>{e._overlay.cursor.engage();return true};
+ await e._setActive({active:true,session},session);
+ assert.equal(e._active,true);assert.equal(e._overlay.cursor.engaged,true);
+ return e;
+}
+function assertCursorReleased(e){
+ const c=e._overlay.cursor;assert.equal(cursorTracker.inhibits,0);assert.equal(cursorTracker.get_pointer_visible(),true);
+ assert.equal(c.engaged,false);assert.deepEqual(c._trail._points,[]);assert.equal(c._trail._timeline,null);
+ assert.equal(e._input._keys.length,0);assert.equal(e._input._buttons.size,0);
+}
+async function prepareVisibleMotion(e){
+ const c=e._overlay.cursor;pointerPos=[100,100];c.sync();pointerPos=[150,150];c.sync();
+ assert.ok(c._trail._points.length>=2);
+ e._input.key(97,true);e._input.button(1,true);
+ let count=0;const notify=e._input._pointer.notify_absolute_motion.bind(e._input._pointer);
+ e._input._pointer.notify_absolute_motion=(...args)=>{count++;notify(...args)};
+ const work=glide(e._input,planPath([100,100],[900,700],'human',{duration:700,rand}),e._token).catch(err=>err.code);
+ await new Promise(r=>setTimeout(r,40));
+ return {work,count:()=>count,timeline:timelines.at(-1)};
+}
+
+// All state-inactive reasons synchronously restore real cursor, clear trail and release input.
+const endReasons=['user_hotkey','user_release','idle_timeout','ui_disconnected'];
+for(const reason of endReasons){
+ const e=await liveExtension();const motion=await prepareVisibleMotion(e);const before=motion.count();
+ e._setInactive(reason);assertCursorReleased(e);assert.ok(motion.timeline.stopped);
+ await new Promise(r=>setTimeout(r,35));assert.equal(motion.count(),before);
+ await motion.work; e.disable();
+}
+const safetyChecks=['cursor-inactive-reasons','cursor-connection-loss','cursor-disable','cursor-cleanup-exception','cursor-overlay-failures'];
+
+// Connection loss and explicit disable share the same synchronous cursor-first cleanup.
+{
+ const e=await liveExtension(20);await prepareVisibleMotion(e);e._triggerDisconnect();assertCursorReleased(e);e.disable();
+}
+{
+ const e=await liveExtension(21);await prepareVisibleMotion(e);e.disable();assert.equal(cursorTracker.get_pointer_visible(),true);
+}
+
+// Cleanup continues even when an earlier step throws; cursor release remains first.
+{
+ const e=await liveExtension(22);e._hotCornersId=1;e._restoreHotCorners=()=>{throw new Error('cleanup injected')};
+ const old=console.error;console.error=()=>{};e._setInactive('user_hotkey');console.error=old;assertCursorReleased(e);e._restoreHotCorners=()=>{};e.disable();
+}
+
+// Overlay errors after acquiring cursor inhibition and paint timeout both roll back.
+{
+ const e=new PCPilotExtension();e.enable();e._client.stop();e._client={epoch:30,send(){},stop(){}};
+ e._overlay.show=async()=>{e._overlay.cursor.engage();throw new Error('post-show failure')};
+ e._onMessage({event:'state',active:true,session:30},30);await new Promise(r=>setTimeout(r,5));assertCursorReleased(e);e.disable();
+}
+{
+ const e=new PCPilotExtension();e.enable();e._client.stop();e._client={epoch:31,send(){},stop(){}};
+ e._overlay.show=async()=>{e._overlay.cursor.engage();return false};
+ await e._setActive({active:true,session:31},31);assertCursorReleased(e);e.disable();
+}
+
+// Balanced inhibit is idempotent, including repeated release calls.
+{
+ const e=await liveExtension(40),c=e._overlay.cursor;const base=cursorTracker.inhibits;
+ c.release();assert.equal(cursorTracker.inhibits,base-1);c.engage();c.engage();assert.equal(cursorTracker.inhibits,base);
+ c.release();assert.equal(cursorTracker.inhibits,base-1);c.release();assert.equal(cursorTracker.inhibits,base-1);
+ e._setInactive('user_hotkey');e.disable();
+}
+
+// The trail keeps ticking after its first point, accumulates points, and self-stops after fade.
+{
+ const e=await liveExtension(41),c=e._overlay.cursor;pointerPos=[300,300];c.sync();
+ assert.ok(c._trail._timeline);assert.equal(c._trail._points.length,1);
+ pointerPos=[340,320];c.sync();assert.equal(c._trail._points.length,2);
+ await new Promise(r=>setTimeout(r,470));assert.equal(c._trail._timeline,null);assert.equal(c._trail._points.length,0);
+ e._setInactive('user_hotkey');e.disable();
+}
+
+// Abort wrapup in close and glide phases: no later window actions occur.
+for(const phase of ['mid-close','mid-glide']){
+ const e=await liveExtension(42),events=[];
+ e._ops._wrapupSteps=async(_keep,_close,_return,token)=>{
+  if(phase==='mid-close')events.push('delete');
+  await glide(e._input,planPath([200,200],[1000,700],'human',{duration:700,rand}),token);
+  events.push('move_resize_frame','activate');
+ };
+ const p=e._ops._wrapup({},e._token).catch(err=>err.code);
+ await new Promise(r=>setTimeout(r,40));e._setInactive('user_hotkey');assertCursorReleased(e);
+ assert.equal(await p,'inactive');assert.deepEqual(events,phase==='mid-close'?['delete']:[]);e.disable();
+}
+
+// The 8s wrapup hard cap returns incomplete, restores the real cursor and fades its arrow.
+{
+ const e=await liveExtension(43);e._ops._wrapupSteps=async(_a,_b,_c,token)=>token.sleep(12000);
+ const result=await e._ops._wrapup({},e._token);
+ assert.equal(result.incomplete,true);assert.equal(cursorTracker.get_pointer_visible(),true);
+ assert.equal(e._overlay.cursor.engaged,false);e._setInactive('user_hotkey');e.disable();
+}
+
+safetyChecks.push('balanced-cursor-inhibit','trail-idle','wrapup-abort-mid-close','wrapup-abort-mid-glide','wrapup-cap');
 
 // A real paint is the only success path; a timeout from a stage that never paints fails closed.
 const overlay = new Overlay();
@@ -149,4 +281,4 @@ await new Promise(r=>setTimeout(r,10));
 assert.equal(sessRan,1); assert.equal(sw.find(m=>m.id===1).error.code,'inactive'); assert.equal(sw.find(m=>m.id===2).ok,true);
 sess.disable();
 
-console.log(JSON.stringify({ok:true,checks:['op-session','paint-timeout','screenshot-cancel','typing-estimate','paste-cancel','clipboard-ownership','timeout-queue','timeout-fail-closed','stale-generation','overlay-exception','session-ack','session-ping-pong'],bugs:pasteCancelBug?[pasteCancelBug]:[]}));
+console.log(JSON.stringify({ok:true,checks:['op-session','paint-timeout','screenshot-cancel','typing-estimate','paste-cancel','clipboard-ownership','timeout-queue','timeout-fail-closed','stale-generation','overlay-exception','session-ack','session-ping-pong',...pathChecks,...safetyChecks],bugs:pasteCancelBug?[pasteCancelBug]:[]}));

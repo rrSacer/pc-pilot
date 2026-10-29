@@ -111,6 +111,21 @@ class ExtensionHeadlessTests(unittest.TestCase):
         return out
 
     @classmethod
+    def _test_state(cls):
+        path=cls.dir/"runtime/pcpilot/test-state.json"
+        try: return __import__("json").loads(path.read_text())
+        except (OSError,ValueError): return None
+
+    @classmethod
+    def _wait_test_state(cls,pred,timeout=3):
+        end=time.monotonic()+timeout
+        while time.monotonic()<end:
+            state=cls._test_state()
+            if state and pred(state): return state
+            time.sleep(.05)
+        raise AssertionError(f"test-state condition timed out: {cls._test_state()}")
+
+    @classmethod
     def _wait_probe(cls, pred, timeout=5):
         end = time.monotonic() + timeout
         while time.monotonic() < end:
@@ -162,11 +177,16 @@ class ExtensionHeadlessTests(unittest.TestCase):
         self.assertLess(ack["ack_ms"], 2000)
         self.assertIsInstance(ack.get("session"), int)
         self.assertTrue(any(e.get("event") == "state_ack" and e.get("active") and e.get("session")==ack["session"] for e in a.call("fake.events")["events"]))
+        self._wait_test_state(lambda s:s["active"] and s["cursor_inhibited"] and s["cursor_engaged"] and not s["real_cursor_visible"])
         normal = self._shot(); with_overlay = self._shot(overlay=True)
         with Image.open(normal["path"]) as opened: im = opened.convert("RGB")
         self.assertEqual(im.size, (1920, 1080)); self.assertEqual((normal["width"], normal["height"]), im.size)
-        with Image.open(with_overlay["path"]) as opened: px = opened.convert("RGB").getpixel((1, 540))
+        with Image.open(with_overlay["path"]) as opened:
+            over = opened.convert("RGB")
+            px = over.getpixel((1, 540))
         self.assertTrue(all(abs(x-y) <= 10 for x, y in zip(px, (255, 69, 58))), px)
+        self.assertTrue(all(abs(x-y) <= 10 for x, y in zip(over.getpixel((7, 540)), (255, 69, 58))))
+        self.assertFalse(all(abs(x-y) <= 10 for x, y in zip(over.getpixel((8, 540)), (255, 69, 58))))
         self.assertNotEqual(im.getpixel((1, 540)), px)
         region = self._shot({"region": {"x": 100, "y": 100, "width": 300, "height": 200}})
         with Image.open(region["path"]) as opened: self.assertEqual(opened.size, (300, 200))
@@ -192,11 +212,11 @@ class ExtensionHeadlessTests(unittest.TestCase):
         x, y = ox + area[0] + 40, oy + area[1] + 40
         # Mutter may report a stale pointer position just after a new session starts;
         # the extension's first move must wait for the compositor to settle.
-        a.call("ui.pointer.move", {"x":x,"y":y})
+        a.call("ui.pointer.move", {"x":x,"y":y,"style":"instant"})
         pos = a.call("ui.pointer.position")
         self.assertLessEqual(abs(pos["x"]-x),1); self.assertLessEqual(abs(pos["y"]-y),1)
         for count in (1,2,3):
-            a.call("ui.pointer.click", {"x":x,"y":y,"count":count})
+            a.call("ui.pointer.click", {"x":x,"y":y,"count":count,"style":"instant"})
             self._wait_probe(lambda rs, n=count: any(r.get("ev")=="area_click" and r.get("n")==n for r in rs))
         a.call("ui.pointer.click", {"x":x,"y":y,"button":"right"})
         self._wait_probe(lambda rs: any(r.get("ev")=="area_click" and r.get("button")==3 for r in rs))
@@ -229,6 +249,40 @@ class ExtensionHeadlessTests(unittest.TestCase):
         a.call("ui.clipboard.set", {"text":"ORIGINAL"}); a.call("ui.key.type", {"text":"ação é", "method":"clipboard"})
         self.assertEqual(a.call("ui.clipboard.get")["text"], "ORIGINAL")
         self.assertEqual(a.call("ui.status", {"text":"Test status"}), {})
+
+    def test_humanized_motion_and_scroll_anchor(self):
+        a=self._begin(); self.addCleanup(self._end_client,a)
+        layout=next(r for r in reversed(self._wait_probe(lambda rs:any(x.get("ev")=="layout" for x in rs))) if r.get("ev")=="layout")
+        w=next(x for x in a.call("ui.window.list")["windows"] if x["title"]==layout["title"])
+        a.call("ui.window.action",{"id":w["id"],"action":"activate"})
+        self._wait_probe(lambda _:any(x["id"]==w["id"] and x["focused"] for x in a.call("ui.window.list")["windows"]))
+        area=layout["widgets"]["area"]
+        p1=(w["x"]+area[0]+20,w["y"]+area[1]+20)
+        p2=(w["x"]+area[0]+area[2]-30,w["y"]+area[1]+area[3]-30)
+        a.call("ui.pointer.move",{"x":p1[0],"y":p1[1],"style":"instant"})
+        # Move to the starting point first so GTK has entered the DrawingArea before
+        # measuring the human trajectory.
+        a.call("ui.pointer.move",{"x":p1[0],"y":p1[1],"style":"instant"})
+        time.sleep(.05)
+        before=len([r for r in self._rows() if r.get("ev")=="motion"])
+        start=time.monotonic(); a.call("ui.pointer.move",{"x":p2[0],"y":p2[1],"style":"human"}); human_s=time.monotonic()-start
+        rows=[r for r in self._rows() if r.get("ev")=="motion"][before:]
+        self.assertGreaterEqual(len(rows),5,rows)
+        self.assertGreaterEqual(human_s,.15)
+        x0,y0=rows[0]["x"],rows[0]["y"]; x1,y1=rows[-1]["x"],rows[-1]["y"]
+        dx,dy=x1-x0,y1-y0; length=max(1,(dx*dx+dy*dy)**.5)
+        deviation=max(abs((r["x"]-x0)*dy-(r["y"]-y0)*dx)/length for r in rows)
+        self.assertGreater(deviation,1.0,rows)
+        start=time.monotonic(); a.call("ui.pointer.move",{"x":p1[0],"y":p1[1],"style":"fast"}); fast_s=time.monotonic()-start
+        self.assertLess(fast_s,human_s)
+        start=time.monotonic(); a.call("ui.pointer.move",{"x":p2[0],"y":p2[1],"style":"instant"}); instant_s=time.monotonic()-start
+        self.assertLess(instant_s,.15)
+        a.call("ui.pointer.scroll",{"dy":1,"style":"instant"})
+        # The default anchor is chosen inside the focused window, away from its edges.
+        result=a.call("ui.pointer.scroll",{"dy":1,"style":"instant"})
+        anchor=result.get("anchor",{})
+        self.assertTrue(w["x"]+w["width"]*.55 <= anchor.get("x",-1) <= w["x"]+w["width"]*.65,anchor)
+        self.assertTrue(w["y"]+w["height"]*.50 <= anchor.get("y",-1) <= w["y"]+w["height"]*.60,anchor)
 
     def test_cancellation_ends_long_key_type(self):
         from pcpilot.protocol import ProtocolError

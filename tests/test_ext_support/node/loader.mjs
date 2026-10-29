@@ -36,17 +36,17 @@ const sources = {
  class SocketClient{} class DataInputStream{} class OutputStream{} class InputStream{} class AppInfo{}
  const Gio={Cancellable,File,SocketClient,DataInputStream,OutputStream,InputStream,AppInfo,_promisify(){},
  FileCreateFlags:{PRIVATE:0},IOErrorEnum:{CANCELLED:1}}; Gio.File.new_for_path=p=>new File(p); export {Gio}; export default Gio;`,
- clutter:`const C={BUTTON_PRIMARY:1,BUTTON_MIDDLE:2,BUTTON_SECONDARY:3,ButtonState:{PRESSED:1,RELEASED:0},
+ clutter:`const timelines=[]; const C={BUTTON_PRIMARY:1,BUTTON_MIDDLE:2,BUTTON_SECONDARY:3,ButtonState:{PRESSED:1,RELEASED:0},
  InputDeviceType:{POINTER_DEVICE:1,KEYBOARD_DEVICE:2},KeyState:{PRESSED:1,RELEASED:0},ScrollSource:{WHEEL:0},
  Orientation:{VERTICAL:1},ActorAlign:{CENTER:1,START:2},AnimationMode:{EASE_IN_OUT_SINE:0,EASE_OUT_QUAD:1},BinLayout:class {},
  ScrollDirection:{UP:0,DOWN:1,LEFT:2,RIGHT:3},
- Timeline:class {constructor(p={}){this.duration=p.duration??0;this.handlers={};this.t0=0;this.id=0}
+ Timeline:class {constructor(p={}){this.duration=p.duration??0;this.handlers={};this.t0=0;this.id=0;this.stopped=false;timelines.push(this)}
   connect(sig,cb){(this.handlers[sig]??=[]).push(cb);return 1} get_elapsed_time(){return Date.now()-this.t0}
   start(){this.t0=Date.now();this.id=setInterval(()=>{(this.handlers['new-frame']??[]).forEach(f=>f());
    if(this.duration>0&&Date.now()-this.t0>=this.duration){this.stop();(this.handlers.completed??[]).forEach(f=>f())}},16)}
-  stop(){clearInterval(this.id);this.id=0}},
+  stop(){clearInterval(this.id);this.id=0;this.stopped=true}},
  KEY_Control_L:0xffe3,KEY_Shift_L:0xffe1,KEY_v:118,KEY_Return:13};
- export default C;`,
+ export {timelines}; export default C;`,
  st:`${actor} const St={Widget,Label,BoxLayout,Icon,DrawingArea,ClipboardType:{CLIPBOARD:0},
  ThemeContext:{get_for_stage:()=>({scale_factor:1})},Clipboard:{get_default:()=>clipboard}};
  const clipboard={text:'ORIGINAL',writes:[],slow:false,userCopy:null,get_text(_t,cb){setTimeout(()=>cb(null,this.text),this.slow?100:0)},

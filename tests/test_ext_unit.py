@@ -17,9 +17,13 @@ class ExtensionUnitRegressionTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, f"Node scenario failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
         result = json.loads(proc.stdout.strip().splitlines()[-1])
         self.assertEqual(result["ok"], True)
-        self.assertTrue({"paint-timeout", "screenshot-cancel", "typing-estimate", "paste-cancel",
+        self.assertTrue({"op-session", "paint-timeout", "screenshot-cancel", "typing-estimate", "paste-cancel",
             "clipboard-ownership", "timeout-queue", "timeout-fail-closed", "stale-generation",
-            "overlay-exception", "session-ack", "session-ping-pong"}.issubset(result["checks"]))
+            "overlay-exception", "session-ack", "session-ping-pong", "trail-idle", "path-endpoints", "path-duration",
+            "path-curve", "typing-cadence-cap", "glide-cancel", "cursor-inactive-reasons",
+            "cursor-connection-loss", "cursor-disable", "cursor-cleanup-exception",
+            "cursor-overlay-failures", "balanced-cursor-inhibit", "wrapup-abort-mid-close",
+            "wrapup-abort-mid-glide", "wrapup-cap"}.issubset(result["checks"]))
         self.assertEqual(result.get("bugs", []), [], "extension defect observed by the regression shim")
 
 
