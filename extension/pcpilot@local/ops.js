@@ -233,10 +233,11 @@ export class Ops {
             throw new OpError(E_BAD_ARGS, 'args must be an object');
         if (!AI_DRIVEN.has(op))
             return h.call(this, args, token);
-        // Windows created while this runs (or shortly after) are the AI's doing.
-        this.session.beginAiOp();
+        // Windows of the target app created while this runs (or shortly after) are the
+        // AI's doing.
+        const attribution = this.session.beginAiOp();
         return Promise.resolve().then(() => h.call(this, args, token))
-            .finally(() => this.session.endAiOp());
+            .finally(() => this.session.endAiOp(attribution));
     }
 
     // ---- screen ----
@@ -782,6 +783,7 @@ export class Ops {
         const before = new Set(app.get_windows().map(w => w.get_id()));
         const allBefore = new Set(listWindows().map(w => w.get_id()));
         const result = {app_id: app.get_id(), name: app.get_name()};
+        this.session.launchedApp(app.get_id());
 
         try {
             if (uris.length > 0) {
@@ -838,6 +840,11 @@ export class Ops {
         const uri = str(args.uri, 'uri');
         if (!GLib.uri_peek_scheme(uri))
             throw new OpError(E_BAD_ARGS, 'uri needs a scheme (https://, file://, ...)');
+        // The handler's windows during/after this op are the AI's (session.js).
+        const scheme = GLib.uri_peek_scheme(uri);
+        const handler = scheme === 'file'
+            ? null : Gio.AppInfo.get_default_for_uri_scheme(scheme);
+        this.session.launchedApp(handler?.get_id());
         try {
             await Gio.AppInfo.launch_default_for_uri_async(uri, global.create_app_launch_context(0, -1), null);
         } catch (e) {
