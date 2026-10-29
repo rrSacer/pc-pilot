@@ -752,20 +752,17 @@ export class Ops {
         return app;
     }
 
-    // Spawn an app (optionally with URIs) and collect the pids we started, so its windows
-    // can be matched without guessing (the tracker may not map them to the .desktop).
+    // Spawn an app (optionally with URIs), recording each spawned process's identity in
+    // the session from the pid callback itself (right after the fork), so its windows can
+    // be matched without guessing (the tracker may not map them to the .desktop).
     _spawn(info, uris) {
-        const pids = [];
         const ctx = global.create_app_launch_context(0, -1);
         if (info instanceof Gio.DesktopAppInfo) {
             info.launch_uris_as_manager(uris, ctx, GLib.SpawnFlags.SEARCH_PATH, null,
-                (_info, pid) => pids.push(pid));
+                (_info, pid) => this.session.launchedPid(pid));
         } else {
             info.launch_uris(uris, ctx);
         }
-        for (const pid of pids)
-            this.session.launchedPid(pid);
-        return pids;
     }
 
     // Wait for a new window of a process we spawned (or a descendant), else of `app` per

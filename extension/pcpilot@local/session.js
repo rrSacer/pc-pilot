@@ -25,18 +25,27 @@ function workspaceOf(w) {
     return w.is_on_all_workspaces() ? -1 : (w.get_workspace()?.index() ?? -1);
 }
 
-// Parent pid from /proc (an in-memory read), or 0.
-function parentPid(pid) {
+// A process's identity and parent from /proc/<pid>/stat (an in-memory read): the pid
+// alone is not an identity (pids are reused), the pair (pid, starttime) is. Returns
+// {key: "pid:starttime", ppid} or null if the process is gone or unreadable.
+export function procIdentity(pid) {
+    if (!(pid > 0))
+        return null;
     try {
         const [ok, bytes] = GLib.file_get_contents(`/proc/${pid}/stat`);
         if (!ok)
-            return 0;
+            return null;
         const stat = new TextDecoder().decode(bytes);
-        // "pid (comm) state ppid ...": comm may contain spaces/parens, so split after it.
-        const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-        return Number(rest[1]) || 0;
+        // "pid (comm) state ppid ... starttime ...": comm may contain spaces/parens, so
+        // split after its last ')'. Fields from there: state=3, ppid=4, starttime=22.
+        const rest = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+        const ppid = Number(rest[1]);
+        const start = rest[19];
+        if (!Number.isInteger(ppid) || !/^\d+$/.test(start ?? ''))
+            return null;
+        return {key: `${pid}:${start}`, ppid};
     } catch {
-        return 0;
+        return null;
     }
 }
 
@@ -67,8 +76,7 @@ export class SessionState {
 
     _reset() {
         this._authored = new Set(); // explicitly returned by our ops
-        this._spawned = new Set(); // pids the session spawned
-        this._pidVerdict = new Map(); // pid -> descends from a spawned pid (cache)
+        this._spawned = new Set(); // identities ("pid:starttime") of processes we spawned
         this._spawnedInWrapup = new Set();
         this._attempted = new Set();
         this._journal = new Map(); // id -> Map(prop -> value we last applied)
@@ -115,29 +123,32 @@ export class SessionState {
             this._authored.add(w.get_id());
     }
 
-    // The session spawned this process (app.launch/open_uri).
+    // The session spawned this process (app.launch/open_uri): called from the launch's pid
+    // callback, right after the fork, to capture its identity before the pid can be reused.
+    // A process already gone or unreadable is not recorded (its windows stay the user's).
     launchedPid(pid) {
-        if (this._snap && pid > 0) {
-            this._spawned.add(pid);
-            this._pidVerdict.clear();
-        }
+        if (!this._snap)
+            return;
+        const id = procIdentity(pid);
+        if (id)
+            this._spawned.add(id.key);
     }
 
-    // Is pid one we spawned, or a descendant of one?
+    // Is this pid, right now, a process we spawned or a live descendant of one? The
+    // identity chain is re-read every time (no cached positives: a pid may be reused or
+    // re-parented at any moment); anything unknown, exited or unreadable is not ours.
     spawnedByUs(pid) {
-        if (pid <= 0 || this._spawned.size === 0)
+        if (this._spawned.size === 0)
             return false;
-        if (this._pidVerdict.has(pid))
-            return this._pidVerdict.get(pid);
-        let verdict = false;
-        for (let p = pid, depth = 0; p > 1 && depth < 32; p = parentPid(p), depth++) {
-            if (this._spawned.has(p)) {
-                verdict = true;
-                break;
-            }
+        for (let p = pid, depth = 0; p > 1 && depth < 32; depth++) {
+            const id = procIdentity(p);
+            if (!id)
+                return false;
+            if (this._spawned.has(id.key))
+                return true;
+            p = id.ppid;
         }
-        this._pidVerdict.set(pid, verdict);
-        return verdict;
+        return false;
     }
 
     setWrapping(on) {
