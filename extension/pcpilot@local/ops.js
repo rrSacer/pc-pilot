@@ -802,6 +802,7 @@ export class Ops {
             result.window = this._info(w);
             return result;
         }
+        token.check(); // never launch for a session that is over
         let pids;
         try {
             pids = this._spawn(app.get_app_info(), uris);
@@ -813,6 +814,7 @@ export class Ops {
         // of the app's existing process may well be the user's.
         const w = await this._waitNewWindow(app, pids, allBefore,
             running ? Math.min(waitMs, 1500) : waitMs, token, !running);
+        token.check();
         if (w) {
             // Returned by our op: the AI's. If the session started the app, so is the
             // rest of its family; a running app's other windows are the user's.
@@ -831,12 +833,14 @@ export class Ops {
         return result;
     }
 
-    async _defaultHandler(uri) {
+    async _defaultHandler(uri, token) {
         if (GLib.uri_peek_scheme(uri) !== 'file')
             return Gio.AppInfo.get_default_for_uri_scheme(GLib.uri_peek_scheme(uri));
         try {
-            return await Gio.File.new_for_uri(uri).query_default_handler_async(GLib.PRIORITY_DEFAULT, null);
+            return await Gio.File.new_for_uri(uri).query_default_handler_async(
+                GLib.PRIORITY_DEFAULT, token.cancellable);
         } catch {
+            token.check(); // a cancelled lookup means the session ended: launch nothing
             return null;
         }
     }
@@ -846,20 +850,26 @@ export class Ops {
         if (!GLib.uri_peek_scheme(uri))
             throw new OpError(E_BAD_ARGS, 'uri needs a scheme (https://, file://, ...)');
         const waitMs = num(args.wait_ms, 'wait_ms', {min: 0, max: MAX_LAUNCH_WAIT_MS, def: 8000});
-        const handler = await this._defaultHandler(uri);
+        const handler = await this._defaultHandler(uri, token);
+        token.check();
         const app = handler ? Shell.AppSystem.get_default().lookup_app(handler.get_id()) : null;
         if (!handler || (app && app.get_windows().length > 0)) {
             // The handler is already running (its new tab/window is not attributable to
             // us), or unknown: just open it.
+            token.check(); // immediately before launching
             try {
-                await Gio.AppInfo.launch_default_for_uri_async(uri, global.create_app_launch_context(0, -1), null);
+                await Gio.AppInfo.launch_default_for_uri_async(uri,
+                    global.create_app_launch_context(0, -1), token.cancellable);
             } catch (e) {
+                token.check();
                 throw new OpError(E_FAILED, e.message);
             }
+            token.check();
             return {};
         }
         // The session starts the handler: its window (and family) is the AI's.
         const allBefore = new Set(listWindows().map(w => w.get_id()));
+        token.check(); // immediately before launching
         let pids;
         try {
             pids = this._spawn(handler, [uri]);
@@ -867,6 +877,7 @@ export class Ops {
             throw new OpError(E_FAILED, e.message);
         }
         const w = await this._waitNewWindow(app, pids, allBefore, waitMs, token, true);
+        token.check();
         if (!w)
             return {};
         this.session.author(w, {family: true});
