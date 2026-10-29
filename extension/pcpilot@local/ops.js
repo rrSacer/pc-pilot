@@ -13,11 +13,11 @@ import * as Keyboard from 'resource:///org/gnome/shell/ui/status/keyboard.js';
 
 import {BUTTONS, Input} from './input.js';
 import {MODIFIER_KEYVALS, charToKeyval, parseChord} from './keys.js';
-import {glide} from './motion.js';
-import {SessionState} from './session.js';
-import {findWindow, listWindows, windowInfo} from './windows.js';
-import {STYLES, planPath, scrollAnchor, scrollCadence, typingCadence} from './path.js';
+import {animate, glide} from './motion.js';
+import {STYLES, minJerk, planPath, scrollAnchor, scrollCadence, typingCadence} from './path.js';
 import {E_BAD_ARGS, E_FAILED, E_INACTIVE, E_NOT_FOUND, E_UNKNOWN_OP, OpError} from './protocol.js';
+import {SessionState} from './session.js';
+import {findWindow, listWindows, rect, windowInfo} from './windows.js';
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot');
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
@@ -43,6 +43,8 @@ const CLIPBOARD_READ_MS = 2000;
 const MAX_TYPE_MS = 15000;
 const MAX_LAUNCH_WAIT_MS = 15000;
 const HUMAN_TYPING_EXTRA_MS = 4000;
+const GEOMETRY_MS = {human: 250, fast: 120, instant: 0};
+const MIN_WINDOW_PX = 80;
 
 // Layouts whose current group types plain ASCII through keyvals (the virtual keyboard
 // can only press keyvals present in the active layout; there is no keymap query API).
@@ -841,9 +843,99 @@ export class Ops {
         return {windows: listWindows().map(w => this._info(w))};
     }
 
+    // Leave fullscreen/maximized/minimized so the frame can be moved/resized freely.
+    async _freeGeometry(w, token) {
+        if (w.minimized) {
+            w.unminimize();
+            await token.sleep(60);
+        }
+        if (w.is_fullscreen()) {
+            w.unmake_fullscreen();
+            await token.sleep(150);
+        }
+        if (w.is_maximized()) {
+            w.unmaximize();
+            await token.sleep(150);
+        }
+    }
+
+    // Interpolate the frame to `target` on the frame clock; in human style the pointer
+    // glides to `grip` meanwhile (purely visual: no button is pressed).
+    async _animateGeometry(w, target, grip, style, token) {
+        await this._freeGeometry(w, token);
+        const f = w.get_frame_rect();
+        const from = {x: f.x, y: f.y, width: f.width, height: f.height};
+        const to = {
+            x: w.allows_move() ? Math.round(target.x) : from.x,
+            y: w.allows_move() ? Math.round(target.y) : from.y,
+            width: w.allows_resize() ? Math.round(target.width) : from.width,
+            height: w.allows_resize() ? Math.round(target.height) : from.height,
+        };
+        const dur = GEOMETRY_MS[style];
+        const geometry = animate(dur, ms => {
+            const k = dur > 0 ? minJerk(ms / dur) : 1;
+            w.move_resize_frame(true,
+                Math.round(from.x + (to.x - from.x) * k), Math.round(from.y + (to.y - from.y) * k),
+                Math.round(from.width + (to.width - from.width) * k),
+                Math.round(from.height + (to.height - from.height) * k));
+        }, token);
+        const jobs = [geometry];
+        if (style === 'human' && grip) {
+            const [px, py] = grip(to);
+            jobs.push(this._glideTo(Math.min(Math.max(px, 0), global.screen_width - 1),
+                Math.min(Math.max(py, 0), global.screen_height - 1), style, token));
+        }
+        const results = await Promise.allSettled(jobs);
+        const failed = results.find(r => r.status === 'rejected');
+        if (failed)
+            throw failed.reason;
+        await token.sleep(60); // let the client commit the new size
+        return rect(w.get_frame_rect());
+    }
+
+    _size(v, name) {
+        return num(v, name, {min: MIN_WINDOW_PX, max: 32767});
+    }
+
     async _windowAction(args, token) {
         const w = findWindow(args.id);
+        const style = styleOf(args);
         const time = global.get_current_time();
+        const corner = r => [r.x + r.width - 10, r.y + r.height - 10];
+        const titlebar = r => [r.x + r.width / 2, r.y + 14];
+        switch (args.action) {
+        case 'resize': {
+            const f = w.get_frame_rect();
+            const target = {
+                x: num(args.x, 'x', {def: f.x}), y: num(args.y, 'y', {def: f.y}),
+                width: this._size(args.width, 'width'), height: this._size(args.height, 'height'),
+            };
+            return this._animateGeometry(w, target, corner, style, token);
+        }
+        case 'move': {
+            const f = w.get_frame_rect();
+            const target = {x: num(args.x, 'x'), y: num(args.y, 'y'), width: f.width, height: f.height};
+            return this._animateGeometry(w, target, titlebar, style, token);
+        }
+        case 'fit': {
+            // Grow a window that is smaller than min_fraction of the monitor's work area
+            // and centre it; leave bigger (or maximized/fullscreen) windows alone.
+            const frac = num(args.min_fraction, 'min_fraction', {min: 0.3, max: 1, def: 0.7});
+            const wa = w.get_work_area_current_monitor();
+            const f = w.get_frame_rect();
+            const small = !w.is_maximized() && !w.is_fullscreen() &&
+                (f.width < frac * wa.width || f.height < frac * wa.height);
+            if (!small)
+                return {changed: false, ...rect(f)};
+            const width = Math.min(Math.max(f.width, Math.round(frac * wa.width)), wa.width);
+            const height = Math.min(Math.max(f.height, Math.round(frac * wa.height)), wa.height);
+            const target = {
+                x: wa.x + Math.round((wa.width - width) / 2), y: wa.y + Math.round((wa.height - height) / 2),
+                width, height,
+            };
+            return {changed: true, ...await this._animateGeometry(w, target, corner, style, token)};
+        }
+        }
         switch (args.action) {
         case 'activate':
             await this._activate(w, token);
@@ -868,7 +960,8 @@ export class Ops {
             break;
         default:
             throw new OpError(E_BAD_ARGS,
-                'action must be activate, close, maximize, unmaximize, minimize or fullscreen');
+                'action must be activate, close, maximize, unmaximize, minimize, fullscreen, ' +
+                'unfullscreen, resize, move or fit');
         }
         await token.sleep(50);
         return {};
