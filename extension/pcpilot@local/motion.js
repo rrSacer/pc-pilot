@@ -6,6 +6,7 @@ import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 
 import {E_INACTIVE, OpError} from './protocol.js';
+import {clampToMonitors} from './windows.js';
 
 // If the frame clock stalls (e.g. nothing gets painted), jump to the end this long after
 // the planned duration instead of hanging until the op timeout.
@@ -65,10 +66,8 @@ export function animate(duration, onFrame, token) {
 // Moves the virtual pointer along a planned path (see path.js).
 export function glide(input, path, token, onPoint = null) {
     return animate(path.duration, ms => {
-        // Overshoot/bow may poke past the screen edge: keep it on screen.
-        let [x, y] = path.at(ms);
-        x = Math.min(Math.max(x, 0), global.screen_width - 1);
-        y = Math.min(Math.max(y, 0), global.screen_height - 1);
+        // Overshoot/bow may poke past a screen edge or into a gap between monitors.
+        const [x, y] = clampToMonitors(...path.at(ms));
         input.move(x, y);
         onPoint?.(x, y);
     }, token);

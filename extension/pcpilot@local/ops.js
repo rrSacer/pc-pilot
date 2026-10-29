@@ -17,7 +17,7 @@ import {animate, glide} from './motion.js';
 import {STYLES, minJerk, planPath, scrollAnchor, scrollCadence, typingCadence} from './path.js';
 import {E_BAD_ARGS, E_FAILED, E_INACTIVE, E_NOT_FOUND, E_UNKNOWN_OP, OpError} from './protocol.js';
 import {SessionState, restoreWindow} from './session.js';
-import {findWindow, listWindows, rect, windowInfo} from './windows.js';
+import {clampToMonitors, findWindow, listWindows, rect, windowInfo} from './windows.js';
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot');
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
@@ -464,11 +464,7 @@ export class Ops {
         if (!w)
             return null;
         const f = w.get_frame_rect();
-        const [x, y] = scrollAnchor(f);
-        return [
-            Math.min(Math.max(x, 0), global.screen_width - 1),
-            Math.min(Math.max(y, 0), global.screen_height - 1),
-        ];
+        return clampToMonitors(...scrollAnchor(f));
     }
 
     async _pointerScroll(args, token) {
@@ -890,9 +886,7 @@ export class Ops {
         }, token);
         const jobs = [geometry];
         if (style === 'human' && grip) {
-            const [px, py] = grip(to);
-            jobs.push(this._glideTo(Math.min(Math.max(px, 0), global.screen_width - 1),
-                Math.min(Math.max(py, 0), global.screen_height - 1), style, token));
+            jobs.push(this._glideTo(...clampToMonitors(...grip(to)), style, token));
         }
         const results = await Promise.allSettled(jobs);
         const failed = results.find(r => r.status === 'rejected');
@@ -1096,8 +1090,7 @@ export class Ops {
                 home = [f.x + Math.round(f.width / 2), f.y + Math.round(f.height / 2)];
         }
         if (home) {
-            await this._glideTo(Math.min(Math.max(home[0], 0), global.screen_width - 1),
-                Math.min(Math.max(home[1], 0), global.screen_height - 1), 'human', token);
+            await this._glideTo(...clampToMonitors(...home), 'human', token);
         }
     }
 

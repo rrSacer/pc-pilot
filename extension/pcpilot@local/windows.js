@@ -3,7 +3,30 @@
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+
 import {E_BAD_ARGS, E_NOT_FOUND, OpError} from './protocol.js';
+
+// The nearest point that lies on a monitor (layouts with gaps have off-screen areas
+// inside the global bounding box).
+export function clampToMonitors(x, y) {
+    let best = null, bestD = Infinity;
+    for (const m of Main.layoutManager.monitors) {
+        const cx = Math.min(Math.max(x, m.x), m.x + m.width - 1);
+        const cy = Math.min(Math.max(y, m.y), m.y + m.height - 1);
+        const d = (cx - x) ** 2 + (cy - y) ** 2;
+        if (d < bestD) {
+            bestD = d;
+            best = [cx, cy];
+        }
+    }
+    return best ?? [x, y];
+}
+
+export function onMonitor(x, y) {
+    return Main.layoutManager.monitors.some(m =>
+        x >= m.x && x < m.x + m.width && y >= m.y && y < m.y + m.height);
+}
 
 export function rect(r) {
     return {x: r.x, y: r.y, width: r.width, height: r.height};

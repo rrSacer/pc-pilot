@@ -6,6 +6,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 import {E_BAD_ARGS, E_INACTIVE, OpError} from './protocol.js';
+import {onMonitor} from './windows.js';
 
 export const BUTTONS = {
     left: Clutter.BUTTON_PRIMARY,
@@ -118,7 +119,7 @@ export class Input {
     static checkPoint(x, y) {
         if (!Number.isFinite(x) || !Number.isFinite(y))
             throw new OpError(E_BAD_ARGS, 'x and y must be numbers');
-        if (x < 0 || y < 0 || x >= global.screen_width || y >= global.screen_height)
+        if (!onMonitor(x, y))
             throw new OpError(E_BAD_ARGS, `point ${x},${y} is outside the screen`);
     }
 
