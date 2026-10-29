@@ -78,7 +78,7 @@ TOOLS = [
     {"name": "elements", "description": "Visible interactive elements; prefer to screenshots. ? = position unknown.",
      "inputSchema": schema({"query": {"type": "string"}, "window": {"type": ["string", "integer"]},
                             "max": {"type": "integer", "minimum": 1, "maximum": 200}})},
-    {"name": "windows", "description": "Windows with ids, scaled bounds; * = opened this session.", "inputSchema": schema()},
+    {"name": "windows", "description": "Windows with ids, scaled bounds; * = AI-opened, cleaned on stop.", "inputSchema": schema()},
 ]
 
 
@@ -721,7 +721,7 @@ class Server:
             for w in self.daemon.call("ui.window.list")["windows"]:
                 bounds = ",".join(str(round(w[k] * (self.scale_x if k in {"x", "width"} else self.scale_y)))
                                   for k in ("x", "y", "width", "height"))
-                rows.append(f'{w["id"]} {"* " if w.get("new") else ""}{w.get("app_id", "?")} {json.dumps(w["title"], ensure_ascii=False)} {bounds}' + (" [focused]" if w.get("focused") else ""))
+                rows.append(f'{w["id"]} {"* " if w.get("ai") else ""}{w.get("app_id", "?")} {json.dumps(w["title"], ensure_ascii=False)} {bounds}' + (" [focused]" if w.get("focused") else ""))
             return [text("\n".join(rows) or "No windows")]
         self.screen()
         # Preflight all coordinates and ids before executing the batch.
