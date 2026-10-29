@@ -298,6 +298,39 @@ class RealStackTests(unittest.TestCase):
         first_id = int(first.split()[0])
         self.assertEqual(first.split()[1], "*")
 
+        self.wait_rows(lambda rows: any(r.get("ev") == "layout" and
+                                        r.get("title") == "PCPilot Ext Probe" for r in rows))
+        layout = next(r for r in reversed(self.rows()) if r.get("ev") == "layout" and
+                      r.get("title") == "PCPilot Ext Probe")
+        match = re.search(rf"^{first_id} \* \S+ \"PCPilot Ext Probe\" (-?\d+),(-?\d+),\d+,\d+",
+                          first, re.M)
+        self.assertIsNotNone(match, first)
+        win_x, win_y = (int(value) for value in match.groups())
+        area_x, area_y, area_w, area_h = layout["widgets"]["area"]
+        scale = 1280 / 1920
+        point = [round(win_x + (area_x + area_w / 2) * scale),
+                 round(win_y + (area_y + area_h / 2) * scale)]
+
+        click_start = len(self.rows())
+        self.mcp.call("act", {"actions": [{"click": point}], "observe": "none", "speed": "fast"})
+        self.wait_rows(lambda rows: any(r.get("ev") == "area_click" for r in rows[click_start:]))
+        click = next(r for r in self.rows()[click_start:] if r.get("ev") == "area_click")
+        geometry = {"click": click, "area": layout["widgets"]["area"], "window": first, "point": point}
+        self.assertEqual(click["button"], 1, click)
+        # Gesture coordinates are local to the DrawingArea, not the top-level
+        # window; the area offsets above were used to calculate the screen point.
+        self.assertGreaterEqual(click["x"], 0, geometry)
+        self.assertLess(click["x"], area_w, geometry)
+        self.assertGreaterEqual(click["y"], 0, geometry)
+        self.assertLess(click["y"], area_h, geometry)
+
+        scroll_start = len(self.rows())
+        self.mcp.call("act", {"actions": [{"scroll": [point[0], point[1], 3]}],
+                              "observe": "none", "speed": "fast"})
+        self.wait_rows(lambda rows: any(r.get("ev") == "scroll" for r in rows[scroll_start:]))
+        scroll = next(r for r in self.rows()[scroll_start:] if r.get("ev") == "scroll")
+        self.assertNotEqual(scroll["dy"], 0, scroll)
+
         self.mcp.call("act", {"actions": [
             {"window": [first_id, "resize", 720, 480]},
             {"window": [first_id, "move", 80, 60]},
