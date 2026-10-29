@@ -30,6 +30,7 @@ INSTRUCTIONS = ("Prefer elements, shortcuts and launch; batch act actions. Obser
                 "use keep if the user wants windows left open. Use speed:fast for bulk work; "
                 "window fit if something opens small.")
 
+WRAPUP_TIMEOUT_S = 10
 ACT_BUDGET_S = 30
 HUMAN_BATCH_LIMIT = 12
 STYLED_ACTIONS = {"click", "double_click", "right_click", "move", "drag", "scroll", "type", "window", "focus"}
@@ -63,11 +64,13 @@ ACTION_VALUES = {
     "clipboard_set": {"type": "string"}, "clipboard_get": {"const": True},
 }
 TOOLS = [
-    {"name": "control", "description": "Start/stop/status. Stop when done; resume only if user asks.",
-     "inputSchema": schema({"action": enum("start", "stop", "status"), "resume": {"type": "boolean"}}, ["action"])},
+    {"name": "control", "description": "Start/stop/status. Stop cleans up; keep preserves windows. Resume only if user asks.",
+     "inputSchema": schema({"action": enum("start", "stop", "status"), "resume": {"type": "boolean"},
+                            "keep": {"type": "array", "items": {"type": ["string", "integer"]}, "maxItems": 200},
+                            "cleanup": {"type": "boolean"}}, ["action"])},
     {"name": "screenshot", "description": "Scaled screen; region [x,y,w,h] zooms. Prefer elements.",
      "inputSchema": schema({"region": FOUR})},
-    {"name": "act", "description": "Batch; click:[x,y] or eID; scroll:[dy] or [x,y,dy]. Window:[id,fit|resize,w,h|move,x,y].",
+    {"name": "act", "description": "Batch; click:[x,y] or eID; scroll:[dy] or [x,y,dy]. Window:[id,fit], [id,resize,w,h], [id,move,x,y].",
      "inputSchema": schema({"actions": {"type": "array", "minItems": 1, "maxItems": 100,
           "items": {**schema(ACTION_VALUES), "minProperties": 1, "maxProperties": 1}},
                             "observe": enum("none", "screenshot", "elements"),
@@ -75,7 +78,7 @@ TOOLS = [
     {"name": "elements", "description": "Visible interactive elements; prefer to screenshots. ? = position unknown.",
      "inputSchema": schema({"query": {"type": "string"}, "window": {"type": ["string", "integer"]},
                             "max": {"type": "integer", "minimum": 1, "maximum": 200}})},
-    {"name": "windows", "description": "Windows with ids and scaled bounds.", "inputSchema": schema()},
+    {"name": "windows", "description": "Windows with ids, scaled bounds; * = opened this session.", "inputSchema": schema()},
 ]
 
 
@@ -140,9 +143,10 @@ class DaemonClient:
                 while line := stream.readline(protocol.MAX_LINE + 1):
                     msg = protocol.decode(line)
                     if msg.get("event") == "session_ended":
-                        self.active = False
-                        if msg.get("reason") in {"user_hotkey", "user_release"}:
-                            self.aborted = True
+                        with self.lock:
+                            self.active = False
+                            if msg.get("reason") in {"user_hotkey", "user_release"}:
+                                self.aborted = True
                     elif "id" in msg:
                         with self.lock:
                             pending = self.pending.get(msg["id"])
@@ -173,9 +177,9 @@ class DaemonClient:
         if self.aborted:
             raise protocol.ProtocolError("user_aborted", "User took control")
 
-    def call(self, op, args=None):
+    def call(self, op, args=None, *, timeout=26):
         self.connect()
-        if op.startswith("ui."):
+        if op.startswith("ui.") or op == "session.end":
             self.check_abort()
         with self.lock:
             self.serial += 1
@@ -186,11 +190,13 @@ class DaemonClient:
             # Serialize shutdown and sending: after EOF closes the connection,
             # no subsequent batch action can be submitted on this socket.
             with self.lock:
-                if self.closed:
+                if op.startswith("ui.") or op == "session.end":
+                    self.check_abort()
+                elif self.closed:
                     raise protocol.ProtocolError("cancelled", "MCP connection closed; restart MCP")
                 self.sock.sendall(protocol.encode(protocol.request(ident, op, args)))
             try:
-                reply = waiter.get(timeout=26)
+                reply = waiter.get(timeout=timeout)
             except queue.Empty:
                 self.close()
                 raise protocol.ProtocolError("timeout", "Daemon response timed out; connection closed") from None
@@ -571,6 +577,13 @@ class Server:
                 bad("invalid control action/resume")
             if args.get("resume") and args["action"] != "start":
                 bad("resume requires start")
+            if any(key in args for key in ("keep", "cleanup")) and args["action"] != "stop":
+                bad("keep/cleanup require stop")
+            if "cleanup" in args and not isinstance(args["cleanup"], bool):
+                bad("cleanup must be boolean")
+            if "keep" in args and (not isinstance(args["keep"], list) or len(args["keep"]) > 200 or
+                    any(type(ident) not in (str, int) for ident in args["keep"])):
+                bad("keep must be a list of window ids")
         elif name == "screenshot" and "region" in args:
             vector(args["region"], 4)
         elif name == "elements":
@@ -624,6 +637,58 @@ class Server:
                 elif not isinstance(value, str):
                     bad(f"{key} requires text")
 
+    @staticmethod
+    def window_label(window, *, focus=False):
+        title = " ".join(str(window.get("title", "")).split())
+        app = str(window.get("app_id", ""))
+        if focus and "traycer" in f"{app} {title}".casefold():
+            return "Traycer"
+        return (title or app.removesuffix(".desktop").rsplit(".", 1)[-1] or "window")[:100]
+
+    def stop(self, args):
+        # Never auto-begin to tidy up; a previous abort/cancel prohibits *all*
+        # further sends, including session.end. Inactive stop is entirely local.
+        self.daemon.check_abort()
+        self.elements.clear()
+        if not self.daemon.active:
+            return [text("stopped")]
+        wrapup = None
+        failure = None
+        try:
+            wrapup = self.daemon.call("ui.session.wrapup", {
+                "keep": args.get("keep", []), "close_new": args.get("cleanup", True),
+                "return_to": "origin"}, timeout=WRAPUP_TIMEOUT_S)
+        except protocol.ProtocolError as exc:
+            self.daemon.check_abort()
+            if exc.code in {"user_aborted", "cancelled", "timeout", "disconnected"}:
+                raise
+            # Older extensions have no wrapup. Other UI failures must still
+            # release a live session, with a compact indication of failed cleanup.
+            if exc.code != "unknown_op":
+                failure = exc.code
+        self.daemon.check_abort()
+        self.daemon.call("session.end")
+        self.daemon.active = False
+        parts = ["stopped"]
+        if wrapup is not None:
+            parts.append(f"closed {len(wrapup.get('closed', []))}")
+            if wrapup.get("restored"):
+                parts.append(f"restored {len(wrapup['restored'])}")
+            left_open = wrapup.get("left_open", [])
+            if left_open:
+                names = ", ".join(json.dumps(self.window_label(window), ensure_ascii=False)
+                                  for window in left_open[:3])
+                if len(left_open) > 3:
+                    names += f" +{len(left_open) - 3}"
+                parts.append(f"left open: {names}")
+            if wrapup.get("focused"):
+                parts.append(f"returned to {self.window_label(wrapup['focused'], focus=True)}")
+            if wrapup.get("incomplete"):
+                parts.append("cleanup incomplete")
+        elif failure:
+            parts.append(f"cleanup failed ({failure})")
+        return [text(" · ".join(parts))]
+
     def tool(self, name, args):
         if self.cancelled.is_set():
             raise protocol.ProtocolError("cancelled", "MCP input closed")
@@ -637,10 +702,7 @@ class Server:
                 self.daemon.begin(args.get("resume", False))
                 return [text("active")]
             if action == "stop":
-                self.daemon.call("session.end")
-                self.daemon.active = False
-                self.elements.clear()
-                return [text("stopped")]
+                return self.stop(args)
             status = self.daemon.call("session.status")
             if status.get("aborted"):
                 self.daemon.aborted = True
