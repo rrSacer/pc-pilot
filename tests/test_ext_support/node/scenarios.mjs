@@ -14,13 +14,14 @@ let afterPaint = null;
 const virtualEvents=[];
 let pointerPos=[0,0];
 export const cursorTracker={inhibits:0,visible:true,inhibit_cursor_visibility(){this.inhibits++},
- uninhibit_cursor_visibility(){this.inhibits--},get_pointer_visible(){return this.inhibits===0},connect:()=>1,disconnect(){}};
+ uninhibit_cursor_visibility(){this.inhibits--;cursorOrder.push('visible')},get_pointer_visible(){return this.inhibits===0},connect:()=>1,disconnect(){}};
+export const cursorOrder=[];
 export const seatUnfocus={n:0};
 globalThis.global = {
  backend:{get_cursor_tracker:()=>cursorTracker},
  screen_width:1920,screen_height:1080,display:{focus_window:null,sort_windows_by_stacking:x=>x},
  get_window_actors:()=>[],get_pointer:()=>pointerPos,workspace_manager:{get_active_workspace_index:()=>0},
- stage:{key_focus:null,context:{get_backend:()=>({get_default_seat:()=>({inhibit_unfocus(){seatUnfocus.n++},uninhibit_unfocus(){seatUnfocus.n--},create_virtual_device:()=>({notify_keyval:(...x)=>virtualEvents.push(['key',...x]),notify_button:(...x)=>virtualEvents.push(['button',...x]),notify_absolute_motion:(...x)=>virtualEvents.push(['move',...x]),notify_discrete_scroll(){}})})})},
+  stage:{key_focus:null,context:{get_backend:()=>({get_default_seat:()=>({inhibit_unfocus(){seatUnfocus.n++},uninhibit_unfocus(){seatUnfocus.n--;cursorOrder.push('unfocus')},create_virtual_device:()=>({notify_keyval:(...x)=>virtualEvents.push(['key',...x]),notify_button:(...x)=>virtualEvents.push(['button',...x]),notify_absolute_motion:(...x)=>virtualEvents.push(['move',...x]),notify_discrete_scroll(){}})})})},
   connect:(sig,cb)=>{afterPaint=cb;return 1},disconnect(){},queue_redraw(){},set_key_focus(){}}
 };
 
@@ -61,6 +62,7 @@ async function liveExtension(session=1){
 }
 function assertCursorReleased(e){
  const c=e._overlay.cursor;assert.equal(cursorTracker.inhibits,0);assert.equal(cursorTracker.get_pointer_visible(),true);
+ assert.equal(seatUnfocus.n,0);
  assert.equal(c.engaged,false);assert.deepEqual(c._trail._points,[]);assert.equal(c._trail._timeline,null);
  assert.equal(e._input._keys.length,0);assert.equal(e._input._buttons.size,0);
 }
@@ -114,8 +116,12 @@ const safetyChecks=['cursor-inactive-reasons','cursor-connection-loss','cursor-d
 // Balanced inhibit is idempotent, including repeated release calls.
 {
  const e=await liveExtension(40),c=e._overlay.cursor;const base=cursorTracker.inhibits;
- c.release();assert.equal(cursorTracker.inhibits,base-1);c.engage();c.engage();assert.equal(cursorTracker.inhibits,base);
- c.release();assert.equal(cursorTracker.inhibits,base-1);c.release();assert.equal(cursorTracker.inhibits,base-1);
+ assert.equal(seatUnfocus.n,1);cursorOrder.length=0;
+ c.release();assert.equal(cursorTracker.inhibits,base-1);assert.equal(seatUnfocus.n,0);
+ assert.deepEqual(cursorOrder,['visible','unfocus']);
+ c.engage();c.engage();assert.equal(cursorTracker.inhibits,base);assert.equal(seatUnfocus.n,1);
+ c.release();assert.equal(cursorTracker.inhibits,base-1);assert.equal(seatUnfocus.n,0);
+ c.release();assert.equal(cursorTracker.inhibits,base-1);assert.equal(seatUnfocus.n,0);
  e._setInactive('user_hotkey');e.disable();
 }
 
@@ -146,7 +152,7 @@ for(const phase of ['mid-close','mid-glide']){
  const e=await liveExtension(43);e._ops._wrapupSteps=async(_a,_b,_c,token)=>token.sleep(12000);
  const result=await e._ops._wrapup({},e._token);
  assert.equal(result.incomplete,true);assert.equal(cursorTracker.get_pointer_visible(),true);
- assert.equal(e._overlay.cursor.engaged,false);e._setInactive('user_hotkey');e.disable();
+ assert.equal(e._overlay.cursor.engaged,false);assert.equal(seatUnfocus.n,0);e._setInactive('user_hotkey');e.disable();
 }
 
 safetyChecks.push('balanced-cursor-inhibit','trail-idle','wrapup-abort-mid-close','wrapup-abort-mid-glide','wrapup-cap');
@@ -194,6 +200,7 @@ assert.equal(clipboard.text,'USER COPY');
 
 // Active request queue: timeout cancels op child and does not start next until it settles.
 const ext=new PCPilotExtension(); ext.enable();
+ext._overlay.cursor.engage();
 ext._client.stop();
 const sent=[]; let reconnects=0;
 ext._client={epoch:7,send:(m,e)=>sent.push({m,e}),reconnect:()=>reconnects++,stop(){}};
@@ -214,6 +221,7 @@ ext._ops={run(op){opStarted++; if(op==='ignore')return new Promise(r=>{finishIgn
 ext._onMessage({id:10,op:'ignore'},7); ext._onMessage({id:11,op:'after-ignore'},7);
 await new Promise(r=>setTimeout(r,2050));
 assert.equal(opStarted,priorStart+1); assert.ok(reconnects>0); assert.equal(ext._active,false);
+assertCursorReleased(ext);
 finishIgnored({}); await new Promise(r=>setTimeout(r,5));
 assert.ok(sent.some(x=>x.m.id===11 && x.m.error?.code==='inactive'));
 

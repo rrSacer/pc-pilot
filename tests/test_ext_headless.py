@@ -30,6 +30,11 @@ class ExtensionHeadlessTests(unittest.TestCase):
         cls.shell_log = open(cls.dir / "shell.log", "w+")
         cls.shell_started = False
         cls.daemon = None
+        cls.log = cls.dir / "probe.jsonl"
+        cls.log.touch(); cls.log.chmod(0o666)
+        apps=cls.dir/"data/applications";apps.mkdir(parents=True)
+        (apps/"pcpilot-wrapup.desktop").write_text('[Desktop Entry]\nType=Application\nName=Wrapup Probe\n'
+            f'Exec=/usr/bin/env PROBE_LOG={cls.log} /usr/bin/python3 {SUPPORT / "gtk_probe.py"}\nTerminal=false\n')
         try:
             subprocess.run([str(ROOT / "dev/headless-shell.sh"), "start", str(cls.dir)],
                            cwd=ROOT, check=True, stdout=cls.shell_log, stderr=subprocess.STDOUT,
@@ -39,8 +44,6 @@ class ExtensionHeadlessTests(unittest.TestCase):
             ready = cls._agent()
             try: ready.call("fake.wait_ui", {"timeout": 30}, timeout=35)
             finally: ready.close()
-            cls.log = cls.dir / "probe.jsonl"
-            cls.log.touch(); cls.log.chmod(0o666)
             # Run the GTK probe in the nested shell; disown it from the wrapper command.
             subprocess.run([str(ROOT / "dev/headless-shell.sh"), "run", str(cls.dir), "--",
                 "sh", "-lc", f"PROBE_LOG={cls.log} python3 {SUPPORT / 'gtk_probe.py'} >/dev/null 2>&1 &"],
@@ -208,6 +211,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         win = next(w for w in windows if w["title"] == layout["title"])
         a.call("ui.window.action", {"id":win["id"],"action":"activate"})
         self._wait_probe(lambda _: any(w["id"]==win["id"] and w["focused"] for w in a.call("ui.window.list")["windows"]))
+        self._wait_test_state(lambda s:s["active"] and not s["real_cursor_visible"] and s.get("unfocus_inhibited"))
         ox, oy = win["x"], win["y"]; area = layout["widgets"]["area"]
         x, y = ox + area[0] + 40, oy + area[1] + 40
         # Mutter may report a stale pointer position just after a new session starts;
@@ -273,6 +277,13 @@ class ExtensionHeadlessTests(unittest.TestCase):
         dx,dy=x1-x0,y1-y0; length=max(1,(dx*dx+dy*dy)**.5)
         deviation=max(abs((r["x"]-x0)*dy-(r["y"]-y0)*dx)/length for r in rows)
         self.assertGreater(deviation,1.0,rows)
+        # Cursor hiding must not drop Wayland's pointer focus: application motion,
+        # click, and drag events all continue to arrive while the AI cursor is active.
+        a.call("ui.pointer.click",{"x":p2[0],"y":p2[1],"style":"instant"})
+        self._wait_probe(lambda rs:any(r.get("ev")=="area_click" for r in rs))
+        a.call("ui.pointer.drag",{"from":{"x":p2[0],"y":p2[1]},"to":{"x":p2[0]+25,"y":p2[1]+20},"style":"instant","duration_ms":120})
+        self._wait_probe(lambda rs:any(r.get("ev")=="drag_begin" for r in rs))
+        self._wait_probe(lambda rs:any(r.get("ev")=="drag_end" for r in rs))
         start=time.monotonic(); a.call("ui.pointer.move",{"x":p1[0],"y":p1[1],"style":"fast"}); fast_s=time.monotonic()-start
         self.assertLess(fast_s,human_s)
         start=time.monotonic(); a.call("ui.pointer.move",{"x":p2[0],"y":p2[1],"style":"instant"}); instant_s=time.monotonic()-start
@@ -283,6 +294,97 @@ class ExtensionHeadlessTests(unittest.TestCase):
         anchor=result.get("anchor",{})
         self.assertTrue(w["x"]+w["width"]*.55 <= anchor.get("x",-1) <= w["x"]+w["width"]*.65,anchor)
         self.assertTrue(w["y"]+w["height"]*.50 <= anchor.get("y",-1) <= w["y"]+w["height"]*.60,anchor)
+
+    def test_cursor_visibility_screenshots_and_trail_fade(self):
+        a=self._begin();self.addCleanup(self._end_client,a)
+        self._wait_test_state(lambda s:s["active"] and not s["real_cursor_visible"] and s.get("unfocus_inhibited"))
+        x,y=200,300
+        a.call("ui.pointer.move",{"x":x,"y":y,"style":"instant"})
+        plain=self._shot(); decorated=self._shot(overlay=True)
+        def red_pixels(path,box):
+            with Image.open(path) as im: pixels=im.convert("RGB").crop(box).get_flattened_data()
+            return sum(1 for r,g,b in pixels if r>220 and 20<g<90 and 50<b<125)
+        box=(x-35,y-35,x+36,y+36)
+        self.assertEqual(red_pixels(plain["path"],box),0)
+        self.assertGreater(red_pixels(decorated["path"],box),0)
+        result={}
+        def long_move():
+            try: result["move"]=a.call("ui.pointer.move",{"x":1700,"y":800,"style":"human"},timeout=10)
+            except Exception as e: result["error"]=e
+        worker=threading.Thread(target=long_move,daemon=True);worker.start();time.sleep(.35)
+        mid=self._raw("trail-mid.png");worker.join(4);self.assertFalse(worker.is_alive());self.assertNotIn("error",result,str(result))
+        time.sleep(1);faded=self._raw("trail-faded.png")
+        # Exclude the cursor arrow at the destination; the remaining red marks are its trail.
+        away=(50,50,1620,1030)
+        mid_count=sum(1 for r,g,b in mid.crop(away).get_flattened_data() if r>220 and 20<g<90 and 50<b<125)
+        late_count=sum(1 for r,g,b in faded.crop(away).get_flattened_data() if r>220 and 20<g<90 and 50<b<125)
+        self.assertGreater(mid_count,0);self.assertEqual(late_count,0)
+
+    def test_disable_releases_cursor_and_pointer_focus_inhibits(self):
+        a=self._begin();a.close()
+        self._wait_test_state(lambda s:s["active"] and s.get("unfocus_inhibited"))
+        subprocess.run([str(ROOT/"dev/headless-shell.sh"),"run",str(self.dir),"--",
+            "gnome-extensions","disable","pcpilot@local"],cwd=ROOT,check=True,timeout=20)
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline:
+            state=self._test_state()
+            if state and state.get("real_cursor_visible") and not state.get("unfocus_inhibited"):break
+            time.sleep(.05)
+        self.assertTrue(state and state.get("real_cursor_visible") and not state.get("unfocus_inhibited"),state)
+        subprocess.run([str(ROOT/"dev/headless-shell.sh"),"run",str(self.dir),"--",
+            "gnome-extensions","enable","pcpilot@local"],cwd=ROOT,check=True,timeout=20)
+        waiter=self._agent()
+        try:waiter.call("fake.wait_ui",{"timeout":8},timeout=10)
+        finally:waiter.close()
+
+    def test_wrapup_restores_snapshot_closes_new_and_honors_keep(self):
+        a=self._agent()
+        try:
+            # Put Calculator in the foreground before begin; it becomes the snapshot focus.
+            layout=next(r for r in reversed(self._wait_probe(lambda rs:any(x.get("ev")=="layout" for x in rs))) if r.get("ev")=="layout")
+            subprocess.run([str(ROOT/"dev/headless-shell.sh"),"run",str(self.dir),"--",
+                "gtk-launch","org.gnome.Calculator"],cwd=ROOT,check=True,timeout=15)
+            time.sleep(.5)
+            a.call("session.begin",{"label":"Focus Calculator"})
+            origin=next(w for w in a.call("ui.window.list")["windows"] if w.get("app_id")=="org.gnome.Calculator.desktop")
+            a.call("ui.window.action",{"id":origin["id"],"action":"activate","style":"instant"})
+            self._wait_probe(lambda _:any(w["id"]==origin["id"] and w["focused"] for w in a.call("ui.window.list")["windows"]))
+            a.call("ui.pointer.move",{"x":origin["x"]+origin["width"]//2,"y":origin["y"]+origin["height"]//2,"style":"instant"})
+            a.call("session.end",{"reason":"agent_request"})
+            a.call("session.begin",{"label":"Wrapup regression"})
+            origin=next(w for w in a.call("ui.window.list")["windows"] if w.get("id")==origin["id"])
+            self.assertTrue(origin["focused"],origin)
+            a.call("ui.window.action",{"id":origin["id"],"action":"activate"})
+            self._wait_probe(lambda _:any(w["id"]==origin["id"] and w["focused"] for w in a.call("ui.window.list")["windows"]))
+            start=a.call("ui.pointer.position")
+            original=next(w for w in a.call("ui.window.list")["windows"] if w["id"]==origin["id"])
+            first=a.call("ui.app.launch",{"app":"pcpilot-wrapup.desktop","wait_ms":8000})["window"]
+            second=a.call("ui.app.launch",{"app":"pcpilot-wrapup.desktop","wait_ms":8000})["window"]
+            self.assertNotEqual(first["id"],second["id"])
+            live={w["id"]:w for w in a.call("ui.window.list")["windows"]}
+            self.assertTrue(live[first["id"]]["new"]);self.assertTrue(live[second["id"]]["new"])
+            self.assertFalse(live[origin["id"]]["new"])
+            a.call("ui.window.action",{"id":origin["id"],"action":"maximize","style":"instant"})
+            a.call("ui.pointer.move",{"x":1700,"y":900,"style":"instant"})
+            result=a.call("ui.session.wrapup",{"keep":[second["id"]]})
+            self.assertIn(first["id"],[w["id"] for w in result["closed"]])
+            kept=next(w for w in result["left_open"] if w["id"]==second["id"])
+            self.assertEqual(kept["reason"],"kept")
+            self.assertIn(origin["id"],result["restored"])
+            restored=next(w for w in a.call("ui.window.list")["windows"] if w["id"]==origin["id"])
+            self.assertEqual((restored["x"],restored["y"],restored["width"],restored["height"]),
+                (original["x"],original["y"],original["width"],original["height"]))
+            self.assertEqual(result["focused"]["id"],origin["id"])
+            pos=a.call("ui.pointer.position");self.assertLessEqual(abs(pos["x"]-start["x"]),2);self.assertLessEqual(abs(pos["y"]-start["y"]),2)
+            state=self._wait_test_state(lambda s:s["active"] and s["real_cursor_visible"] and not s["cursor_engaged"])
+            again=a.call("ui.session.wrapup",{"keep":[second["id"]]})
+            self.assertEqual(again["closed"],[]);self.assertEqual(again["restored"],[])
+            # Exercise close_new=false on a new window while preserving the wrapup session.
+            third=a.call("ui.app.launch",{"app":"pcpilot-wrapup.desktop","wait_ms":8000})["window"]
+            no_close=a.call("ui.session.wrapup",{"close_new":False})
+            left=next(w for w in no_close["left_open"] if w["id"]==third["id"])
+            self.assertEqual(left["reason"],"close_new=false")
+        finally:a.close()
 
     def test_cancellation_ends_long_key_type(self):
         from pcpilot.protocol import ProtocolError
