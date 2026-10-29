@@ -9,6 +9,7 @@ import {Gio} from 'gi://Gio';
 import {planPath, fittsDuration, typingCadence} from '../../../extension/pcpilot@local/path.js';
 import {glide} from '../../../extension/pcpilot@local/motion.js';
 import Clutter, {timelines} from 'gi://Clutter';
+import {runV2Scenarios} from './v2-scenarios.mjs';
 
 let afterPaint = null;
 const virtualEvents=[];
@@ -31,13 +32,12 @@ const from=[100,100],to=[1400,800];
 const human=planPath(from,to,'human',{rand});
 assert.deepEqual(human.at(0),from); assert.deepEqual(human.at(human.duration),to);
 assert.ok(human.duration>=180 && human.duration<=900);
-let maxDeviation=0;
-for(let i=1;i<10;i++){
- const p=human.at(human.duration*i/10),s=i/10;
- maxDeviation=Math.max(maxDeviation,Math.abs(p[1]-(from[1]+(to[1]-from[1])*s)));
-}
-assert.ok(maxDeviation>0.5);
 const fast=planPath(from,to,'fast',{rand}); assert.ok(fast.duration>=100&&fast.duration<=180);
+const spatialDeviation=path=>Math.max(...Array.from({length:99},(_,i)=>{
+ const [x,y]=path.at(path.duration*(i+1)/100);
+ return Math.abs((to[0]-from[0])*(from[1]-y)-(from[0]-x)*(to[1]-from[1]))/Math.hypot(to[0]-from[0],to[1]-from[1]);
+}));
+assert.ok(spatialDeviation(fast)<1e-8);assert.ok(spatialDeviation(human)>1);
 assert.equal(planPath(from,to,'instant').duration,0);
 assert.ok(fittsDuration(500,rand)>=180&&fittsDuration(500,rand)<=900);
 assert.ok(typingCadence([...('a '.repeat(100))],4000,rand).reduce((a,b)=>a+b,0)<=4000);
@@ -290,4 +290,5 @@ await new Promise(r=>setTimeout(r,10));
 assert.equal(sessRan,1); assert.equal(sw.find(m=>m.id===1).error.code,'inactive'); assert.equal(sw.find(m=>m.id===2).ok,true);
 sess.disable();
 
-console.log(JSON.stringify({ok:true,checks:['op-session','paint-timeout','screenshot-cancel','typing-estimate','paste-cancel','clipboard-ownership','timeout-queue','timeout-fail-closed','stale-generation','overlay-exception','session-ack','session-ping-pong',...pathChecks,...safetyChecks],bugs:pasteCancelBug?[pasteCancelBug]:[]}));
+const v2Checks=await runV2Scenarios();
+console.log(JSON.stringify({ok:true,checks:['op-session','paint-timeout','screenshot-cancel','typing-estimate','paste-cancel','clipboard-ownership','timeout-queue','timeout-fail-closed','stale-generation','overlay-exception','session-ack','session-ping-pong',...pathChecks,...safetyChecks,...v2Checks],bugs:pasteCancelBug?[pasteCancelBug]:[]}));

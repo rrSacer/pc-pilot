@@ -22,13 +22,15 @@ class Label extends Actor{} class Widget extends Actor{} class BoxLayout extends
 class DrawingArea extends Actor{constructor(...a){super();this._init(...a)} _init(p={}){Object.assign(this,p)}};
 `;
 const sources = {
- glib: `export default {
+ glib: `let clockOffset=0, timeoutScale=0.1; export function advanceClock(ms){clockOffset+=ms*1000} export function setTimeoutScale(v){timeoutScale=v}
+ export default {
  PRIORITY_DEFAULT:0,PRIORITY_LOW:1,SOURCE_REMOVE:false,SOURCE_CONTINUE:true,
  getenv:()=>null,build_filenamev:a=>a.join('/'),get_real_time:()=>Date.now()*1000,
+ advanceClock, setTimeoutScale,
  markup_escape_text:s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;'),
- timeout_add(_p,ms,cb){let id=setTimeout(()=>cb(),Math.max(1,Math.ceil(ms/10))); timers.set(id,id);return id},
+ timeout_add(_p,ms,cb){let id=setTimeout(()=>cb(),Math.max(1,Math.ceil(ms*timeoutScale))); timers.set(id,id);return id},
  idle_add(_p,cb){let id=setTimeout(cb,1);timers.set(id,id);return id},source_remove(id){clearTimeout(id)},
- get_monotonic_time:()=>Date.now()*1000}; export const timers=new Map();`,
+ get_monotonic_time:()=>Date.now()*1000+clockOffset}; export const timers=new Map();`,
  gio:`class Cancellable{cancel(){this.cancelled=true}is_cancelled(){return !!this.cancelled}}
  class File{static records=[]; constructor(path){this.path=path;this.deleted=false;File.records.push(this)}
   async replace_async(){await new Promise(r=>setTimeout(r,10));return {close_async:async()=>{},read_async:async()=>({read_bytes_async:async()=>({toArray:()=>Array(24).fill(0)}),close(){}})}}

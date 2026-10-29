@@ -1,0 +1,174 @@
+import assert from 'node:assert/strict';
+import GLib, {setTimeoutScale} from 'gi://GLib';
+import Clutter from 'gi://Clutter';
+import {Ops} from '../../../extension/pcpilot@local/ops.js';
+import {Token} from '../../../extension/pcpilot@local/input.js';
+import {clampToMonitors,onMonitor} from '../../../extension/pcpilot@local/windows.js';
+import {planPath,typingCadence} from '../../../extension/pcpilot@local/path.js';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import {seatUnfocus} from './scenarios.mjs';
+
+export async function runV2Scenarios() {
+ let wins=[],createdCb=null,winEvents=[],nextSignal=1,pointer=[100,100],nowOffset=0,workspace=0;
+ const display={focus_window:null,sort_windows_by_stacking:a=>a,
+  connect(_sig,cb){createdCb=cb;return nextSignal++},disconnect(){createdCb=null}};
+ global.display=display;
+ global.get_window_actors=()=>wins.map(meta_window=>({meta_window}));
+ global.get_pointer=()=>pointer;
+ global.get_current_time=()=>1;
+ global.workspace_manager={get_active_workspace_index:()=>workspace,get_workspace_by_index:()=>({activate(){workspace=0}})};
+ global.screen_width=1920;global.screen_height=1080;
+ const fakeApps=[{x:0,y:0,width:1000,height:800,index:0},{x:1200,y:0,width:1000,height:800,index:1}];
+ Main.layoutManager.monitors=fakeApps;
+ const resetWorld=(initial=[])=>{wins=[...initial];winEvents=[];display.focus_window=initial.find(w=>w.focused)??initial[0]??null;pointer=[100,100];workspace=0;};
+ const add=w=>{wins.push(w);createdCb?.(display,w)};
+ class FakeWindow {
+  constructor(id,{x=100,y=100,width=400,height=300,title=`Window ${id}`,parent=null,focused=false,appId=`app.${id}`,workspaceIndex=0}={}){
+   Object.assign(this,{id,x,y,width,height,title,parent,focused,minimized:false,maximized:false,fullscreen:false,deleted:false,appId,onDelete:null,workspaceIndex});
+  }
+  get_id(){return this.id} get_title(){return this.title} get_gtk_application_id(){return this.appId} get_wm_class(){return ''} get_pid(){return this.id}
+  get_frame_rect(){return {x:this.x,y:this.y,width:this.width,height:this.height}} get_buffer_rect(){return this.get_frame_rect()}
+  has_focus(){return display.focus_window===this} is_override_redirect(){return false} get_window_type(){return 0}
+  is_on_all_workspaces(){return false} get_workspace(){return {index:()=>this.workspaceIndex}} is_maximized(){return this.maximized} is_fullscreen(){return this.fullscreen}
+  find_root_ancestor(){let w=this;while(w.parent)w=w.parent;return w}
+  allows_move(){return true} allows_resize(){return true} get_work_area_current_monitor(){return {x:0,y:0,width:1000,height:800}}
+  unmaximize(){this.maximized=false} maximize(){this.maximized=true} unmake_fullscreen(){this.fullscreen=false} make_fullscreen(){this.fullscreen=true}
+  unminimize(){this.minimized=false} minimize(){this.minimized=true} activate(){display.focus_window=this;}
+  move_resize_frame(_user,x,y,width,height){winEvents.push(['move_resize_frame',this.id,x,y,width,height]);Object.assign(this,{x,y,width,height})}
+  delete(){winEvents.push(['delete',this.id]);this.onDelete?.(this);if(!this.onDelete){this.deleted=true;wins=wins.filter(x=>x!==this)}}
+ }
+ const makeOps=()=>{
+  const input={_keys:[],_buttons:new Set(),events:[],position:()=>pointer,
+   move(x,y){this.events.push(['move',x,y,Date.now()]);pointer=[x,y]},
+   button(b,down){this.events.push(['button',b,down,Date.now()]);down?this._buttons.add(b):this._buttons.delete(b)},
+   key(k,down){this.events.push(['key',k,down,Date.now()]);down?this._keys.push(k):this._keys.splice(this._keys.indexOf(k),1)},scroll(){}};
+  const ops=new Ops({overlay:{cursor:{release(){winEvents.push(['cursor_release'])},ripple(){},scrollHint(){}},engageCursor(){}},input});
+  ops._activate=async w=>{winEvents.push(['activate',w.get_id(),Date.now()]);display.focus_window=w;workspace=w.workspaceIndex;};
+  ops._glideTo=async(x,y,_style,token)=>{token.check();input.move(x,y)};
+  return {ops,input};
+ };
+ const createSession=(initial=[])=>{resetWorld(initial);const env=makeOps();env.ops.session.snapshot();return env};
+ const attachHandler=(ops,key,fn)=>{ops._handlers[key]=fn};
+ const authoredDuring=async(ops,fn)=>{attachHandler(ops,'pointer.click',fn);await ops.run('pointer.click',{},new Token())};
+ const created=(id,options)=>new FakeWindow(id,options);
+ const runSteps=async(ops,args={})=>{const result={closed:[],restored:[],left_open:[],focused:null};await ops._wrapupSteps(new Set((args.keep??[]).map(Number)),args.close_new!==false,args.return_to??'origin',new Token(),result);return result};
+
+ // R1: temporal newness and AI authorship are distinct; run() brackets actual AI ops.
+ {
+  const {ops}=createSession([created(1,{focused:true})]);add(created(2));
+  await authoredDuring(ops,()=>{add(created(3));return {}});
+  GLib.advanceClock(2900);add(created(4));GLib.advanceClock(200);add(created(5));add(created(6));
+  const result=await runSteps(ops);
+  assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]).sort((a,b)=>a-b),[3,4]);
+  for(const id of [2,5,6])assert.equal(result.left_open.find(w=>w.id===id)?.reason,'not_authored');
+  const listed=ops._windowList().windows;
+  assert.equal(listed.find(w=>w.id===2).ai,false);assert.equal(listed.find(w=>w.id===3),undefined);
+ }
+ // R2: keep and pre-existing roots protect every transient in that family.
+ {
+  const base=created(8,{focused:true});const parent=created(6),dialog=created(7,{parent,title:'Dialog'}),preDialog=created(9,{parent:base,title:'Preexisting dialog'});
+  const {ops}=createSession([base]);await authoredDuring(ops,()=>{add(parent);add(dialog);add(preDialog);return {}});
+  let plan=ops._closePlan(new Set([7]),true);
+  assert.equal(plan.find(([w])=>w.id===7)[1],'kept');assert.equal(plan.find(([w])=>w.id===6)[1],'family_protected');
+  assert.equal(plan.find(([w])=>w.id===9)[1],'family_protected');
+  assert.deepEqual(winEvents.filter(e=>e[0]==='delete'),[]);
+  plan=ops._closePlan(new Set([6]),true);assert.equal(plan.find(([w])=>w.id===7)[1],'family_protected');
+ }
+ // R3: refusing windows and wrapup-born dialogs are marked before delete and never retried.
+ {
+  const {ops}=createSession([created(1,{focused:true})]);const refusing=created(4);let dialog;
+  refusing.onDelete=()=>{if(!dialog){dialog=created(5,{title:'Save?'});add(dialog)}};
+  await authoredDuring(ops,()=>{add(refusing);return {}});
+  const one=await runSteps(ops);assert.deepEqual(winEvents.filter(e=>e[0]==='delete').map(e=>e[1]),[4]);
+  assert.equal(one.left_open.find(w=>w.id===4)?.reason,'not_closed');assert.equal(one.left_open.find(w=>w.id===5)?.reason,'not_closed');
+  winEvents=[];const two=await runSteps(ops);assert.deepEqual(winEvents.filter(e=>e[0]==='delete'),[]);
+  assert.equal(two.left_open.find(w=>w.id===4)?.reason,'not_closed');assert.equal(two.left_open.find(w=>w.id===5)?.reason,'not_closed');
+ }
+ // R4: journal only restores still-current AI-applied properties.
+ {
+  const w3=created(3,{x:100}),w8=created(8,{x:100,focused:true}),w9=created(9,{x:100});
+  const {ops}=createSession([w3,w8,w9]);w3.x=777;
+  const token=new Token();await ops._windowAction({id:8,action:'move',x:300,y:150,style:'instant'},token);
+  await ops._windowAction({id:9,action:'move',x:300,y:150,style:'instant'},token);w9.x=777;
+  const rest=ops.session.restorable();assert.deepEqual(rest.map(([w])=>w.id),[8]);
+  winEvents=[];const r=await runSteps(ops);assert.deepEqual(r.restored,[8]);
+  assert.equal(w8.x,100);assert.equal(w3.x,777);assert.equal(w9.x,777);
+  assert.deepEqual(winEvents.filter(e=>e[0]==='move_resize_frame').map(e=>e[1]),[8]);
+  const env2=createSession([created(11,{focused:true}),created(10,{workspaceIndex:1})]);
+  await env2.ops._windowAction({id:10,action:'activate'},new Token());assert.equal(workspace,1);
+  await runSteps(env2.ops);assert.equal(workspace,0);
+  const env3=createSession([created(13,{focused:true}),created(12,{workspaceIndex:1})]);
+  await env3.ops._windowAction({id:12,action:'activate'},new Token());workspace=2;
+  env3.ops._activate=async w=>{display.focus_window=w};
+  await runSteps(env3.ops);assert.equal(workspace,2);
+ }
+ // R5: requested hold duration survives capped glides and zero-distance drags; cancel releases now.
+ {
+  setTimeoutScale(1);
+  const {ops,input}=makeOps();const token=new Token();
+  const p=ops._pointerDrag({from:{x:100,y:100},to:{x:800,y:700},style:'human',duration_ms:5000},token);
+  await p;let edges=input.events.filter(e=>e[0]==='button'&&e[1]===1);
+  assert.ok(edges[1][3]-edges[0][3]>=5000,edges);
+  const zero=makeOps();await zero.ops._pointerDrag({from:{x:100,y:100},to:{x:100,y:100},style:'fast',duration_ms:250},new Token());
+  edges=zero.input.events.filter(e=>e[0]==='button'&&e[1]===1);assert.ok(edges[1][3]-edges[0][3]>=250,edges);
+  const fast=makeOps();await fast.ops._pointerDrag({from:{x:100,y:100},to:{x:500,y:400},style:'fast',duration_ms:400},new Token());
+  edges=fast.input.events.filter(e=>e[0]==='button'&&e[1]===1);assert.ok(edges[1][3]-edges[0][3]>=400,edges);
+  const abort=makeOps(),t=new Token();const work=abort.ops._pointerDrag({from:{x:100,y:100},to:{x:900,y:700},style:'human',duration_ms:5000},t).catch(e=>e.code);
+  await new Promise(r=>setTimeout(r,1600));const press=abort.input.events.find(e=>e[0]==='button'&&e[2]);assert.ok(press);
+  t.cancel();assert.equal(await work,'inactive');const release=abort.input.events.filter(e=>e[0]==='button'&&!e[2]).at(-1);assert.ok(Date.now()-release[3]<100);
+  setTimeoutScale(0.1);
+ }
+ // R6: randomized integer cadence is bounded for long inputs and rounding boundaries.
+ {
+  for(const n of [44,45,63,64,6000,20000])for(const value of [0.01,0.5,0.75,0.99]){
+   const out=typingCadence(Array(n).fill('a'),4000,()=>value);
+   assert.ok(out.every(Number.isInteger));assert.ok(out.reduce((a,b)=>a+b,0)<=4000,`n=${n}, rand=${value}`);
+  }
+ }
+ // Monitor-gap target is invalid; every clamped path point remains on a real monitor.
+ {
+  const {ops}=makeOps();
+  assert.equal(onMonitor(1100,300),false);
+  const clamped=clampToMonitors(1100,300);assert.ok(onMonitor(...clamped));
+  assert.deepEqual(clamped,[1200,300]);
+  await assert.rejects(ops._pointerMove({x:1100,y:300,style:'instant'},new Token()),e=>e.code==='bad_args');
+  ops._glideTo=Ops.prototype._glideTo;
+  const points=[];ops._input.move=(x,y)=>{points.push([x,y]);pointer=[x,y]};
+  await ops._glideTo(1250,650,'human',new Token());
+  assert.ok(points.length>0&&points.every(p=>onMonitor(...p)));
+ }
+ // R7: real _wrapupSteps aborts while waiting for close and during its return glide.
+ {
+  const {ops,input}=createSession([created(50,{focused:true})]);const refusing=created(51);refusing.onDelete=()=>{};
+  await authoredDuring(ops,()=>{add(refusing);return {}});const token=new Token();
+  const p=ops._wrapupSteps(new Set(),true,'origin',token,{closed:[],restored:[],left_open:[],focused:null}).catch(e=>e.code);
+  while(!winEvents.some(e=>e[0]==='delete'))await new Promise(r=>setTimeout(r,2));
+  token.cancel();assert.equal(await p,'inactive');const n=winEvents.length;await new Promise(r=>setTimeout(r,40));assert.equal(winEvents.length,n);
+  assert.deepEqual(winEvents.filter(e=>['activate','move_resize_frame'].includes(e[0])),[]);
+ }
+ {
+  const {ops,input}=createSession([]);pointer=[1700,700];const token=new Token();
+  ops._glideTo=Ops.prototype._glideTo;
+  const p=ops._wrapupSteps(new Set(),true,'origin',token,{closed:[],restored:[],left_open:[],focused:null}).catch(e=>e.code);
+  const until=Date.now()+600;while(!input.events.some(e=>e[0]==='move')&&Date.now()<until)await new Promise(r=>setTimeout(r,5));
+  assert.ok(input.events.some(e=>e[0]==='move'));token.cancel();assert.equal(await p,'inactive');
+  const moves=input.events.filter(e=>e[0]==='move').length,events=winEvents.length;await new Promise(r=>setTimeout(r,60));
+  assert.equal(input.events.filter(e=>e[0]==='move').length,moves);assert.equal(winEvents.length,events);
+ }
+ // Cap behavior also traverses real close/focus/return steps, rather than a substituted sleep.
+ {
+  const {ops}=createSession([created(60,{focused:true})]);ops.session.clear();pointer=[100,100];ops.session.snapshot();pointer=[1700,700];
+  const refusing=created(61);refusing.onDelete=()=>{};ops.session.beginAiOp();add(refusing);ops.session.endAiOp();
+  const token=new Token();ops._overlay.cursor={release(){winEvents.push(['release'])}};
+  setTimeoutScale(0.001);const result=await ops._wrapup({},token);setTimeoutScale(0.1);assert.equal(result.incomplete,true);
+  assert.ok(winEvents.some(e=>e[0]==='delete'&&e[1]===61));assert.ok(winEvents.some(e=>e[0]==='release'));
+ }
+ // R7: measure spatial perpendicular deviation, not timing deviation along a straight line.
+ {
+  const a=[100,100],b=[1400,800],len=Math.hypot(b[0]-a[0],b[1]-a[1]);
+  const deviation=path=>Math.max(...Array.from({length:99},(_,i)=>{const [x,y]=path.at(path.duration*(i+1)/100);return Math.abs((b[0]-a[0])*(a[1]-y)-(a[0]-x)*(b[1]-a[1]))/len}));
+  assert.ok(deviation(planPath(a,b,'fast'))<1e-8);
+  assert.ok(deviation(planPath(a,b,'human',{rand:()=>0.75}))>1);
+ }
+ return ['r1-authorship','r2-transient-families','r3-idempotent-refusal','r4-journal-conflicts','r5-drag-hold','r6-cadence-budget','monitor-clamp','r7-real-wrapup-aborts','r7-real-cap','path-perpendicular'];
+}
