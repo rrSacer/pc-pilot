@@ -26,7 +26,18 @@ VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 INSTRUCTIONS = ("Prefer elements, shortcuts and launch; batch act actions. Observe only when needed. "
                 "Coordinates are global scaled screen pixels (longest side <=1280 by default). "
                 "Call control stop when done. USER_TOOK_CONTROL: stop and wait for the user; "
-                "resume only on their explicit request.")
+                "resume only on their explicit request. Close tabs/files you opened (ctrl+w) before stop; "
+                "use keep if the user wants windows left open. Use speed:fast for bulk work; "
+                "window fit if something opens small.")
+
+ACT_BUDGET_S = 30
+HUMAN_BATCH_LIMIT = 12
+STYLED_ACTIONS = {"click", "double_click", "right_click", "move", "drag", "scroll", "type", "window", "focus"}
+
+
+class BatchBudgetReached(Exception):
+    """Stop between UI actions without ending the owner's desktop session."""
+
 
 
 def schema(properties=None, required=()):
@@ -43,12 +54,12 @@ FOUR = {**POINT, "minItems": 4, "maxItems": 4}
 CLICK = {"anyOf": [POINT, {"type": "string"}]}
 ACTION_VALUES = {
     "click": CLICK, "double_click": CLICK, "right_click": CLICK, "move": POINT,
-    "drag": FOUR, "scroll": {**POINT, "minItems": 3, "maxItems": 3},
+    "drag": FOUR, "scroll": {**POINT, "minItems": 1, "maxItems": 3},
     "type": {"type": "string"}, "key": {"type": "string"},
     "wait": {"type": "integer", "minimum": 0, "maximum": 10000},
     "launch": {"type": "string"}, "open": {"type": "string"},
     "focus": {"type": ["string", "integer"]},
-    "window": {"type": "array", "minItems": 2, "maxItems": 2},
+    "window": {"type": "array", "minItems": 2, "maxItems": 4},
     "clipboard_set": {"type": "string"}, "clipboard_get": {"const": True},
 }
 TOOLS = [
@@ -56,10 +67,11 @@ TOOLS = [
      "inputSchema": schema({"action": enum("start", "stop", "status"), "resume": {"type": "boolean"}}, ["action"])},
     {"name": "screenshot", "description": "Scaled screen; region [x,y,w,h] zooms. Prefer elements.",
      "inputSchema": schema({"region": FOUR})},
-    {"name": "act", "description": "Batch actions; click accepts [x,y] or element id. Observe only if needed.",
+    {"name": "act", "description": "Batch; click:[x,y] or eID; scroll:[dy] or [x,y,dy]. Window:[id,fit|resize,w,h|move,x,y].",
      "inputSchema": schema({"actions": {"type": "array", "minItems": 1, "maxItems": 100,
           "items": {**schema(ACTION_VALUES), "minProperties": 1, "maxProperties": 1}},
-                            "observe": enum("none", "screenshot", "elements")}, ["actions"])},
+                            "observe": enum("none", "screenshot", "elements"),
+                            "speed": enum("human", "fast", "instant")}, ["actions"])},
     {"name": "elements", "description": "Visible interactive elements; prefer to screenshots. ? = position unknown.",
      "inputSchema": schema({"query": {"type": "string"}, "window": {"type": ["string", "integer"]},
                             "max": {"type": "integer", "minimum": 1, "maximum": 200}})},
@@ -490,7 +502,7 @@ class Server:
             lines.append(f'{ident} {item["role"]} {json.dumps(item["name"], ensure_ascii=False)} {position}' + (f" [{states}]" if states else ""))
         return [text("\n".join(lines) or "No elements")]
 
-    def action(self, action):
+    def action(self, action, style="human", deadline=None):
         name, value = next(iter(action.items()))
         labels = {"click": "Clicando", "double_click": "Clique duplo", "right_click": "Clique direito",
                   "move": "Movendo ponteiro", "drag": "Arrastando", "scroll": "Rolando", "type": "Digitando",
@@ -503,29 +515,50 @@ class Server:
             if element:
                 label += f' em {element["name"][:80]!r}'
         self.daemon.call("ui.status", {"text": label})
+        self.daemon.check_abort()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise BatchBudgetReached
         if name in {"click", "double_click", "right_click"}:
             return self.daemon.call("ui.pointer.click", {**self.click_point(value),
-                        "button": "right" if name == "right_click" else "left", "count": 2 if name == "double_click" else 1})
+                        "button": "right" if name == "right_click" else "left", "count": 2 if name == "double_click" else 1,
+                        "style": style})
         if name == "move":
-            return self.daemon.call("ui.pointer.move", self.point(value))
+            return self.daemon.call("ui.pointer.move", {**self.point(value), "style": style})
         if name == "drag":
-            return self.daemon.call("ui.pointer.drag", {"from": self.point(value[:2]), "to": self.point(value[2:])})
+            return self.daemon.call("ui.pointer.drag", {"from": self.point(value[:2]), "to": self.point(value[2:]), "style": style})
         if name == "scroll":
-            return self.daemon.call("ui.pointer.scroll", {**self.point(value[:2]), "dx": 0, "dy": value[2]})
+            return self.daemon.call("ui.pointer.scroll", {
+                **(self.point(value[:2]) if len(value) == 3 else {}),
+                "dx": 0, "dy": value[-1], "style": style})
         if name == "wait":
             end = time.monotonic() + value / 1000
             while time.monotonic() < end:
                 self.daemon.check_abort()
                 time.sleep(min(.05, max(0, end - time.monotonic())))
             return {}
+        if name == "window":
+            arguments = {"id": value[0], "action": value[1], "style": style}
+            if value[1] == "resize":
+                arguments.update(self.window_size(value[2:]))
+            elif value[1] == "move":
+                arguments.update(self.point(value[2:]))
+            return self.daemon.call("ui.window.action", arguments)
         op, arguments = {
             "type": ("key.type", {"text": value}), "key": ("key.press", {"keys": value}),
             "launch": ("app.launch", {"app": value}), "open": ("open_uri", {"uri": value}),
             "focus": ("window.action", {"id": value, "action": "activate"}),
-            "window": ("window.action", {"id": value[0], "action": value[1]} if name == "window" else {}),
             "clipboard_set": ("clipboard.set", {"text": value}), "clipboard_get": ("clipboard.get", {}),
         }[name]
+        if name in {"type", "focus"}:
+            arguments["style"] = style
         return self.daemon.call(f"ui.{op}", arguments)
+
+    def window_size(self, value):
+        width, height = vector(value, 2)
+        if width <= 0 or height <= 0:
+            bad("window dimensions must be positive")
+        return {"width": max(1, round(width / self.scale_x)),
+                "height": max(1, round(height / self.scale_y))}
 
     def validate(self, name, args):
         definition = next((tool["inputSchema"] for tool in TOOLS if tool["name"] == name), None)
@@ -547,8 +580,10 @@ class Server:
                 bad("invalid elements arguments")
         elif name == "act":
             actions = args.get("actions")
-            if not isinstance(actions, list) or not 1 <= len(actions) <= 100 or args.get("observe", "none") not in ("none", "screenshot", "elements"):
-                bad("invalid actions/observe")
+            if (not isinstance(actions, list) or not 1 <= len(actions) <= 100 or
+                    args.get("observe", "none") not in ("none", "screenshot", "elements") or
+                    args.get("speed", "human") not in ("human", "fast", "instant")):
+                bad("invalid actions/observe/speed")
             for action in actions:
                 if not isinstance(action, dict) or len(action) != 1:
                     bad("each action must have one key")
@@ -559,14 +594,26 @@ class Server:
                     if not isinstance(value, str):
                         vector(value, 2)
                 elif key in ("move", "drag", "scroll"):
-                    vector(value, {"move": 2, "drag": 4, "scroll": 3}[key])
+                    if key == "scroll":
+                        vector(value, 1 if isinstance(value, list) and len(value) == 1 else 3)
+                    else:
+                        vector(value, {"move": 2, "drag": 4}[key])
                 elif key == "wait":
                     if type(value) is not int or not 0 <= value <= 10000:
                         bad("wait must be 0..10000 ms")
                 elif key == "window":
-                    if (not isinstance(value, list) or len(value) != 2 or
+                    if (not isinstance(value, list) or len(value) not in (2, 4) or
                             not isinstance(value[0], (str, int)) or isinstance(value[0], bool) or
-                            value[1] not in ("activate", "close", "maximize", "unmaximize", "minimize", "fullscreen")):
+                            not isinstance(value[1], str)):
+                        bad("invalid window action")
+                    if value[1] in ("resize", "move"):
+                        if len(value) != 4:
+                            bad("window resize/move requires two coordinates")
+                        vector(value[2:], 2)
+                        if value[1] == "resize" and any(v <= 0 for v in value[2:]):
+                            bad("window dimensions must be positive")
+                    elif len(value) != 2 or value[1] not in (
+                            "activate", "close", "maximize", "unmaximize", "minimize", "fullscreen", "fit"):
                         bad("invalid window action")
                 elif key == "focus":
                     if not isinstance(value, (str, int)) or isinstance(value, bool):
@@ -583,6 +630,7 @@ class Server:
         if self.request_cancelled.is_set():
             raise protocol.ProtocolError("cancelled", "Request cancelled")
         self.validate(name, args)
+        deadline = time.monotonic() + ACT_BUDGET_S if name == "act" else None
         if name == "control":
             action = args["action"]
             if action == "start":
@@ -609,7 +657,7 @@ class Server:
             for w in self.daemon.call("ui.window.list")["windows"]:
                 bounds = ",".join(str(round(w[k] * (self.scale_x if k in {"x", "width"} else self.scale_y)))
                                   for k in ("x", "y", "width", "height"))
-                rows.append(f'{w["id"]} {w.get("app_id", "?")} {json.dumps(w["title"], ensure_ascii=False)} {bounds}' + (" [focused]" if w.get("focused") else ""))
+                rows.append(f'{w["id"]} {"* " if w.get("new") else ""}{w.get("app_id", "?")} {json.dumps(w["title"], ensure_ascii=False)} {bounds}' + (" [focused]" if w.get("focused") else ""))
             return [text("\n".join(rows) or "No windows")]
         self.screen()
         # Preflight all coordinates and ids before executing the batch.
@@ -617,23 +665,45 @@ class Server:
             key, value = next(iter(action.items()))
             if key in ("click", "double_click", "right_click"):
                 self.click_point(value)
-            elif key in ("move", "scroll"):
+            elif key == "move" or (key == "scroll" and len(value) == 3):
                 self.point(value[:2])
             elif key == "drag":
                 self.point(value[:2])
                 self.point(value[2:])
+            elif key == "window":
+                if value[1] == "resize":
+                    self.window_size(value[2:])
+                elif value[1] == "move":
+                    self.point(value[2:])
+        style = args.get("speed", "human")
+        downgraded = (style == "human" and
+                      sum(next(iter(action)) in STYLED_ACTIONS for action in args["actions"]) > HUMAN_BATCH_LIMIT)
+        if downgraded:
+            style = "fast"
         clipboard = []
         completed = 0
         try:
             for action in args["actions"]:
                 self.daemon.check_abort()
-                result = self.action(action)
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    result = self.action(action, style, deadline)
+                except BatchBudgetReached:
+                    break
                 completed += 1
                 if "clipboard_get" in action:
                     clipboard.append(result.get("text", ""))
             self.daemon.check_abort()
-            content = [text(f"ok {completed}" + ("\n" + "\n".join(clipboard) if clipboard else ""))]
+            partial = completed != len(args["actions"])
+            note = f"partial: {completed}/{len(args['actions'])} done, budget" if partial else f"ok {completed}"
+            if downgraded:
+                note += " · speed fast (batch)"
             observation = args.get("observe", "none")
+            if observation != "none" and time.monotonic() >= deadline:
+                note += " · observe skipped (budget)"
+                observation = "none"
+            content = [text(note + ("\n" + "\n".join(clipboard) if clipboard else ""))]
             if observation == "screenshot":
                 content += self.screenshot({})
             elif observation == "elements":
