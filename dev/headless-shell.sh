@@ -122,6 +122,7 @@ WAYLAND_DISPLAY=wayland-pcpilot
 PCPILOT_WAYLAND_SOCKET=$dir/runtime/wayland-pcpilot
 PCPILOT_SOCKET=$sock
 PCPILOT_HEADLESS_DIR=$dir
+PCPILOT_TEST_HOOKS=${PCPILOT_TEST_HOOKS:-1}
 EOF
     chown "$(uid_of):$(gid_of)" "$dir/env.base"
 
