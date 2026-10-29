@@ -131,7 +131,7 @@ class RealStackTests(unittest.TestCase):
             '[Desktop Entry]\nType=Application\nName=PCPilot E2E Probe\n'
             f'Exec=/usr/bin/env PROBE_LOG={cls.probe_log} /usr/bin/python3 {SUPPORT / "gtk_probe.py"}\n'
             'Terminal=false\nStartupWMClass=pcpilot-e2e-probe\n')
-        cls.second_probe_title = "PCPilot E2E Probe Second"
+        cls.second_probe_title = "PCPilot-E2E-Probe-Second"
         (applications / "pcpilot-e2e-probe-second.desktop").write_text(
             '[Desktop Entry]\nType=Application\nName=PCPilot E2E Probe Second\n'
             f'Exec=/usr/bin/env PROBE_LOG={cls.probe_log} PROBE_TITLE={cls.second_probe_title} '
@@ -303,7 +303,7 @@ class RealStackTests(unittest.TestCase):
             {"window": [first_id, "move", 80, 60]},
         ], "observe": "none", "speed": "fast"})
         self.mcp.call("act", {"actions": [
-            {"window": [first_id, "fit"]}, {"scroll": [160]},
+            {"window": [first_id, "fit"]}, {"scroll": [3]},
         ], "observe": "none", "speed": "instant"})
 
         stopped = self.mcp.call("control", {"action": "stop", "keep": [first_id]})
