@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec /usr/bin/python3 -I -c 'import sys; sys.path.insert(0, "/opt/pcpilot"); from pcpilot.cli import main; raise SystemExit(main())' "$@"

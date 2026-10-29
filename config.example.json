@@ -1,0 +1,9 @@
+{
+  "hotkey": "Ctrl+Alt+Esc",
+  "idle_timeout_s": 120,
+  "max_session_s": 1800,
+  "agent_uids": [0],
+  "desktop_user": null,
+  "exclude_name_patterns": [],
+  "ui_wayland_socket": "/run/user/{uid}/wayland-0"
+}
