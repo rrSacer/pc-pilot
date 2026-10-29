@@ -102,6 +102,32 @@ def on_activate(app):
             window=[win.get_width(), win.get_height()], surface_transform=[sx, sy])
         return False
 
+    def dialog(title):
+        d = Gtk.Window(title=title, transient_for=win, modal=True)
+        d.set_default_size(320, 160)
+        d.set_child(Gtk.Label(label=title))
+        d.connect("close-request", lambda _d: (log(ev="dialog_close", title=title), False)[1])
+        d.present()
+        log(ev="dialog", title=title)
+        return d
+
+    # PROBE_DIALOG=1: open a modal dialog transient for this window once it is mapped.
+    if os.environ.get("PROBE_DIALOG") == "1":
+        win.connect("map", lambda w: GLib.timeout_add(500, lambda: (dialog(TITLE + " Dialog"), False)[1]))
+
+    # PROBE_CONFIRM_CLOSE=1: refuse the first close and ask "save changes?" in a modal
+    # dialog instead (like an editor with unsaved text); later closes go through.
+    state = {"asked": False}
+
+    def on_close(_w):
+        log(ev="close_request", asked=state["asked"])
+        if os.environ.get("PROBE_CONFIRM_CLOSE") == "1" and not state["asked"]:
+            state["asked"] = True
+            dialog(TITLE + " Save?")
+            return True
+        return False
+
+    win.connect("close-request", on_close)
     win.connect("map", lambda w: GLib.timeout_add(300, report))
     win.present()
     entry.grab_focus()
