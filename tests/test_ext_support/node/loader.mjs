@@ -1,0 +1,57 @@
+const names = new Map([
+  ['gi://GLib', 'glib'], ['gi://Gio', 'gio'], ['gi://Clutter', 'clutter'],
+  ['gi://St', 'st'], ['gi://Shell', 'shell'], ['gi://Meta', 'meta'],
+  ['resource:///org/gnome/shell/extensions/extension.js', 'extension'],
+  ['resource:///org/gnome/shell/ui/main.js', 'main'],
+  ['resource:///org/gnome/shell/ui/status/keyboard.js', 'keyboard'],
+]);
+export async function resolve(specifier, context, nextResolve) {
+  if (names.has(specifier)) return {url: `mock:${names.get(specifier)}`, shortCircuit: true};
+  return nextResolve(specifier, context);
+}
+
+const actor = `class Actor {
+ constructor(p={}){Object.assign(this,{visible:true,children:[],style:'',opacity:255},p);this.clutter_text={set_markup:s=>{this.markup=s}};}
+ add_child(c){this.children.push(c);c.parent=this} remove_child(c){this.children=this.children.filter(x=>x!==c);c.parent=null}
+ get_parent(){return this.parent||null} set(p){Object.assign(this,p)} set_style(s){this.style=s}
+ set_child_above_sibling(){} destroy(){this.destroyed=true} is_mapped(){return this.visible}
+ ease(){} remove_all_transitions(){} }
+class Label extends Actor{} class Widget extends Actor{} class BoxLayout extends Actor{};
+`;
+const sources = {
+ glib: `export default {
+ PRIORITY_DEFAULT:0,PRIORITY_LOW:1,SOURCE_REMOVE:false,SOURCE_CONTINUE:true,
+ getenv:()=>null,build_filenamev:a=>a.join('/'),get_real_time:()=>Date.now()*1000,
+ markup_escape_text:s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;'),
+ timeout_add(_p,ms,cb){let id=setTimeout(()=>cb(),Math.max(1,Math.ceil(ms/10))); timers.set(id,id);return id},
+ idle_add(_p,cb){let id=setTimeout(cb,1);timers.set(id,id);return id},source_remove(id){clearTimeout(id)},
+ get_monotonic_time:()=>Date.now()*1000}; export const timers=new Map();`,
+ gio:`class Cancellable{cancel(){this.cancelled=true}is_cancelled(){return !!this.cancelled}}
+ class File{static records=[]; constructor(path){this.path=path;this.deleted=false;File.records.push(this)}
+  async replace_async(){await new Promise(r=>setTimeout(r,10));return {close_async:async()=>{},read_async:async()=>({read_bytes_async:async()=>({toArray:()=>Array(24).fill(0)}),close(){}})}}
+  async delete_async(){this.deleted=true}}
+ class SocketClient{} class DataInputStream{} class OutputStream{} class InputStream{} class AppInfo{}
+ const Gio={Cancellable,File,SocketClient,DataInputStream,OutputStream,InputStream,AppInfo,_promisify(){},
+ FileCreateFlags:{PRIVATE:0},IOErrorEnum:{CANCELLED:1}}; Gio.File.new_for_path=p=>new File(p); export {Gio}; export default Gio;`,
+ clutter:`const C={BUTTON_PRIMARY:1,BUTTON_MIDDLE:2,BUTTON_SECONDARY:3,ButtonState:{PRESSED:1,RELEASED:0},
+ InputDeviceType:{POINTER_DEVICE:1,KEYBOARD_DEVICE:2},KeyState:{PRESSED:1,RELEASED:0},ScrollSource:{WHEEL:0},
+ Orientation:{VERTICAL:1},ActorAlign:{CENTER:1,START:2},AnimationMode:{EASE_IN_OUT_SINE:0},BinLayout:class {},
+ KEY_Control_L:0xffe3,KEY_Shift_L:0xffe1,KEY_v:118,KEY_Return:13};
+ export default C;`,
+ st:`${actor} const St={Widget,Label,BoxLayout,ClipboardType:{CLIPBOARD:0},
+ ThemeContext:{get_for_stage:()=>({scale_factor:1})},Clipboard:{get_default:()=>clipboard}};
+ const clipboard={text:'ORIGINAL',writes:[],slow:false,userCopy:null,get_text(_t,cb){setTimeout(()=>cb(null,this.text),this.slow?100:0)},
+ get_content(_t,_m,cb){setTimeout(()=>cb(null,null),0)},get_mimetypes:()=>[],set_text(_t,v){this.text=v;this.writes.push(v)},set_content(){}};
+ export {clipboard}; export default St;`,
+ shell:`class Screenshot{static calls=0; async screenshot(){Screenshot.calls++} async screenshot_area(){Screenshot.calls++}}
+ const Shell={Screenshot,WindowTracker:{get_default:()=>({get_window_app:()=>null})},AppSystem:{get_default:()=>({})}}; export default Shell;`,
+ meta:`export default {WindowType:{NORMAL:0,DIALOG:1,MODAL_DIALOG:2,UTILITY:3}};`,
+ extension:`export class Extension {}`, keyboard:`export function getInputSourceManager(){return {currentSource:{xkbId:'us'}}};`,
+ main:`export const layoutManager={monitors:[{x:0,y:0,width:1920,height:1080,index:0}],primaryIndex:0,primaryMonitor:{x:0,y:0,width:1920,height:1080},
+ hotCorners:[],panelBox:{height:24},connect:()=>1,disconnect(){},addTopChrome(a){a.parent=this},
+ set_child_above_sibling(){}}; export const overview={visible:false,animationInProgress:false}; export const inputMethod={currentFocus:null,commit(){}}; export let modalCount=0;`
+};
+export async function load(url, context, nextLoad) {
+ if (!url.startsWith('mock:')) return nextLoad(url,context);
+ return {format:'module',source:sources[url.slice(5)],shortCircuit:true};
+}
