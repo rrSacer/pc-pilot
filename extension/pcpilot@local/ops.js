@@ -16,7 +16,7 @@ import {MODIFIER_KEYVALS, charToKeyval, parseChord} from './keys.js';
 import {animate, glide} from './motion.js';
 import {STYLES, minJerk, planPath, scrollAnchor, scrollCadence, typingCadence} from './path.js';
 import {E_BAD_ARGS, E_FAILED, E_INACTIVE, E_NOT_FOUND, E_UNKNOWN_OP, OpError} from './protocol.js';
-import {SessionState} from './session.js';
+import {SessionState, restoreWindow} from './session.js';
 import {findWindow, listWindows, rect, windowInfo} from './windows.js';
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot');
@@ -44,6 +44,8 @@ const MAX_TYPE_MS = 15000;
 const MAX_LAUNCH_WAIT_MS = 15000;
 const HUMAN_TYPING_EXTRA_MS = 4000;
 const GEOMETRY_MS = {human: 250, fast: 120, instant: 0};
+const WRAPUP_CAP_MS = 8000;
+const CLOSE_WAIT_MS = 1500;
 const MIN_WINDOW_PX = 80;
 
 // Layouts whose current group types plain ASCII through keyvals (the virtual keyboard
@@ -203,6 +205,7 @@ export class Ops {
             'clipboard.get': this._clipboardGet,
             'clipboard.set': this._clipboardSet,
             'status': this._status,
+            'session.wrapup': this._wrapup,
         };
     }
 
@@ -965,6 +968,131 @@ export class Ops {
         }
         await token.sleep(50);
         return {};
+    }
+
+    // ---- session wrapup ----
+
+    // Leave the desktop as the session found it: close the windows it opened (except
+    // `keep`), put back pre-existing windows it changed, refocus where the user was,
+    // glide the pointer home and fade the AI cursor. Hard cap WRAPUP_CAP_MS: then it
+    // stops where it is and reports incomplete. A session abort cancels it outright.
+    async _wrapup(args, token) {
+        const keepArg = args.keep ?? [];
+        if (!Array.isArray(keepArg))
+            throw new OpError(E_BAD_ARGS, 'keep must be an array of window ids');
+        const keep = new Set(keepArg.map(Number));
+        const closeNew = args.close_new !== false;
+        const returnTo = args.return_to ?? 'origin';
+        if (returnTo !== 'origin' && !Number.isFinite(Number(returnTo)))
+            throw new OpError(E_BAD_ARGS, 'return_to must be "origin" or a window id');
+
+        const result = {closed: [], restored: [], left_open: [], focused: null};
+        const cap = token.child();
+        let capped = false;
+        let capId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, WRAPUP_CAP_MS, () => {
+            capId = 0;
+            capped = true;
+            cap.cancel();
+            return GLib.SOURCE_REMOVE;
+        });
+        try {
+            await this._wrapupSteps(keep, closeNew, returnTo, cap, result);
+        } catch (e) {
+            if (!(capped && !token.cancelled && e instanceof OpError && e.code === E_INACTIVE))
+                throw e; // a real abort (or a bug): the session cleanup takes over
+            result.incomplete = true;
+        } finally {
+            if (capId)
+                GLib.source_remove(capId);
+        }
+        token.check();
+        this._overlay.cursor?.release({fade: true}); // real cursor back, ours fades out
+        return result;
+    }
+
+    async _wrapupSteps(keep, closeNew, returnTo, token, result) {
+        const brief = w => ({id: w.get_id(), title: w.get_title() ?? '', app_id: windowInfo(w).app_id});
+        const reported = new Set();
+        const leave = (w, reason) => {
+            reported.add(w.get_id());
+            result.left_open.push({...brief(w), reason});
+        };
+
+        // 1. Windows opened during the session.
+        const closing = [];
+        for (const w of listWindows().filter(x => this.session.isNew(x))) {
+            if (keep.has(w.get_id()))
+                leave(w, 'kept');
+            else if (!closeNew)
+                leave(w, 'close_new=false');
+            else
+                closing.push([w.get_id(), brief(w), w]);
+        }
+        if (closing.length > 0) {
+            const time = global.get_current_time();
+            for (const [, , w] of closing)
+                w.delete(time); // graceful: the app may ask to save instead
+            const deadline = GLib.get_monotonic_time() + CLOSE_WAIT_MS * 1000;
+            const open = () => new Set(listWindows().map(x => x.get_id()));
+            while (closing.some(([id]) => open().has(id)) && GLib.get_monotonic_time() < deadline)
+                await token.sleep(100);
+            const still = open();
+            for (const [id, info, w] of closing) {
+                if (still.has(id))
+                    leave(w, 'not_closed');
+                else
+                    result.closed.push(info);
+            }
+            // Anything new that popped up meanwhile (e.g. "save changes?") stays, reported.
+            for (const w of listWindows()) {
+                if (this.session.isNew(w) && !reported.has(w.get_id()) && !keep.has(w.get_id()))
+                    leave(w, 'not_closed');
+            }
+        }
+
+        // 2. Pre-existing windows the session changed.
+        for (const [w, base] of this.session.changed()) {
+            try {
+                restoreWindow(w, base);
+                result.restored.push(w.get_id());
+            } catch (e) {
+                console.warn(`pcpilot: could not restore window ${w.get_id()}: ${e.message}`);
+            }
+        }
+        const ws = this.session.workspace;
+        if (ws !== null && global.workspace_manager.get_active_workspace_index() !== ws)
+            global.workspace_manager.get_workspace_by_index(ws)?.activate(global.get_current_time());
+        if (result.restored.length > 0)
+            await token.sleep(150);
+
+        // 3. Focus where the user was (the agent's terminal), else a Traycer window.
+        const windows = listWindows();
+        const byId = id => windows.find(x => x.get_id() === Number(id)) ?? null;
+        let target = returnTo !== 'origin' ? byId(returnTo) : null;
+        if (!target && this.session.focusId !== null)
+            target = byId(this.session.focusId);
+        if (!target) {
+            target = windows.find(x => /traycer/i.test(windowInfo(x).app_id)) ??
+                windows.find(x => /traycer/i.test(x.get_title() ?? '')) ?? null;
+        }
+        if (target) {
+            await this._activate(target, token);
+            result.focused = brief(target);
+        }
+
+        // 4. Pointer back home: where it was, unless that is outside the focused window.
+        let home = this.session.pointer;
+        if (target) {
+            const f = target.get_frame_rect();
+            const inside = home && home[0] >= f.x && home[0] < f.x + f.width &&
+                home[1] >= f.y && home[1] < f.y + f.height;
+            if (!inside)
+                home = [f.x + Math.round(f.width / 2), f.y + Math.round(f.height / 2)];
+        }
+        if (home) {
+            await this._glideTo(Math.min(Math.max(home[0], 0), global.screen_width - 1),
+                Math.min(Math.max(home[1], 0), global.screen_height - 1), 'human', token);
+        }
     }
 
     // ---- misc ----
