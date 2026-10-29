@@ -753,13 +753,23 @@ export class Ops {
     }
 
     // Spawn an app (optionally with URIs), recording each spawned process's identity in
-    // the session from the pid callback itself (right after the fork), so its windows can
-    // be matched without guessing (the tracker may not map them to the .desktop).
+    // the session from the pid callback, so its windows can be matched without guessing
+    // (the tracker may not map them to the .desktop). DO_NOT_REAP_CHILD keeps an exited
+    // child as a zombie, so its pid cannot be reused before we read its identity; a child
+    // watch then reaps it, for every pid, whatever happens to the session meanwhile.
     _spawn(info, uris) {
         const ctx = global.create_app_launch_context(0, -1);
         if (info instanceof Gio.DesktopAppInfo) {
-            info.launch_uris_as_manager(uris, ctx, GLib.SpawnFlags.SEARCH_PATH, null,
-                (_info, pid) => this.session.launchedPid(pid));
+            info.launch_uris_as_manager(uris, ctx,
+                GLib.SpawnFlags.SEARCH_PATH | GLib.SpawnFlags.DO_NOT_REAP_CHILD, null,
+                (_info, pid) => {
+                    try {
+                        this.session.launchedPid(pid);
+                    } finally {
+                        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid,
+                            (watched, _status) => GLib.spawn_close_pid(watched));
+                    }
+                });
         } else {
             info.launch_uris(uris, ctx);
         }
