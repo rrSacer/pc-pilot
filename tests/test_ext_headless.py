@@ -33,8 +33,14 @@ class ExtensionHeadlessTests(unittest.TestCase):
         cls.log = cls.dir / "probe.jsonl"
         cls.log.touch(); cls.log.chmod(0o666)
         apps=cls.dir/"data/applications";apps.mkdir(parents=True)
-        (apps/"pcpilot-wrapup.desktop").write_text('[Desktop Entry]\nType=Application\nName=Wrapup Probe\n'
-            f'Exec=/usr/bin/env PROBE_LOG={cls.log} /usr/bin/python3 {SUPPORT / "gtk_probe.py"}\nTerminal=false\n')
+        cls.extra_logs={}
+        for app,title,envs in (("pcpilot-wrapup","WrapupProbe",{}),
+                               ("pcpilot-family","Family",{"PROBE_DIALOG":"1"}),
+                               ("pcpilot-confirm","Confirm",{"PROBE_CONFIRM_CLOSE":"1"})):
+            log=cls.dir/f"{app}.jsonl";log.touch();log.chmod(0o666);cls.extra_logs[app]=log
+            env=" ".join([f"PROBE_LOG={log}",f"PROBE_TITLE={title}",*(f"{k}={v}" for k,v in envs.items())])
+            (apps/f"{app}.desktop").write_text(f'[Desktop Entry]\nType=Application\nName={title}\n'
+                f'Exec=/usr/bin/env {env} /usr/bin/python3 {SUPPORT / "gtk_probe.py"}\nTerminal=false\n')
         try:
             subprocess.run([str(ROOT / "dev/headless-shell.sh"), "start", str(cls.dir)],
                            cwd=ROOT, check=True, stdout=cls.shell_log, stderr=subprocess.STDOUT,
@@ -268,9 +274,9 @@ class ExtensionHeadlessTests(unittest.TestCase):
         # measuring the human trajectory.
         a.call("ui.pointer.move",{"x":p1[0],"y":p1[1],"style":"instant"})
         time.sleep(.05)
-        before=len([r for r in self._rows() if r.get("ev")=="motion"])
+        before=len([r for r in self._rows() if r.get("ev")=="motion" and r.get("source")=="window"])
         start=time.monotonic(); a.call("ui.pointer.move",{"x":p2[0],"y":p2[1],"style":"human"}); human_s=time.monotonic()-start
-        rows=[r for r in self._rows() if r.get("ev")=="motion"][before:]
+        rows=[r for r in self._rows() if r.get("ev")=="motion" and r.get("source")=="window"][before:]
         self.assertGreaterEqual(len(rows),5,rows)
         self.assertGreaterEqual(human_s,.15)
         x0,y0=rows[0]["x"],rows[0]["y"]; x1,y1=rows[-1]["x"],rows[-1]["y"]
@@ -385,6 +391,90 @@ class ExtensionHeadlessTests(unittest.TestCase):
             left=next(w for w in no_close["left_open"] if w["id"]==third["id"])
             self.assertEqual(left["reason"],"close_new=false")
         finally:a.close()
+
+    def test_v2_external_authorship_and_calculator_journal_restore(self):
+        a=self._agent();self.addCleanup(self._end_client,a)
+        # Focus Calculator and put the pointer inside it before the tested snapshot.
+        a.call("session.begin",{"label":"focus baseline"})
+        calc=a.call("ui.app.launch",{"app":"org.gnome.Calculator.desktop","wait_ms":8000})["window"]
+        a.call("ui.window.action",{"id":calc["id"],"action":"activate","style":"instant"})
+        a.call("ui.pointer.move",{"x":calc["x"]+calc["width"]//2,"y":calc["y"]+calc["height"]//2,"style":"instant"})
+        a.call("session.end",{"reason":"agent_request"})
+        a.call("session.begin",{"label":"authorship and journal"})
+        calc=next(w for w in a.call("ui.window.list")["windows"] if w["id"]==calc["id"])
+        original=(calc["x"],calc["y"],calc["width"],calc["height"])
+        launch_reply=a.call("ui.app.launch",{"app":"pcpilot-wrapup.desktop","wait_ms":8000})
+        launched=launch_reply.get("window")
+        if not launched:
+            deadline=time.monotonic()+5
+            while time.monotonic()<deadline:
+                launched=next((w for w in a.call("ui.window.list")["windows"] if w["title"]=="WrapupProbe" and w["new"]),None)
+                if launched:break
+                time.sleep(.05)
+        self.assertIsNotNone(launched,launch_reply)
+        tracked=next(w for w in a.call("ui.window.list")["windows"] if w["id"]==launched["id"])
+        self.assertTrue(tracked["ai"])
+        time.sleep(3.5)  # external launch is outside the post-op authorship window
+        extlog=self.dir/"external.jsonl";extlog.touch();extlog.chmod(0o666)
+        subprocess.run([str(ROOT/"dev/headless-shell.sh"),"run",str(self.dir),"--","sh","-lc",
+            f"env PROBE_LOG={extlog} PROBE_TITLE=External /usr/bin/python3 {SUPPORT / 'gtk_probe.py'} >/dev/null 2>&1 &"],
+            cwd=ROOT,check=True,timeout=15)
+        deadline=time.monotonic()+8;external=None
+        while time.monotonic()<deadline:
+            external=next((w for w in a.call("ui.window.list")["windows"] if w["title"]=="External"),None)
+            if external:break
+            time.sleep(.05)
+        self.assertIsNotNone(external)
+        self.assertTrue(external["new"]);self.assertFalse(external["ai"])
+        a.call("ui.window.action",{"id":calc["id"],"action":"move","x":40,"y":50,"style":"fast"})
+        result=a.call("ui.session.wrapup")
+        self.assertIn(launched["id"],[w["id"] for w in result["closed"]])
+        self.assertEqual(next(w for w in result["left_open"] if w["id"]==external["id"])["reason"],"not_authored")
+        self.assertIn(calc["id"],result["restored"]);self.assertEqual(result["focused"]["id"],calc["id"])
+        after=next(w for w in a.call("ui.window.list")["windows"] if w["id"]==calc["id"])
+        self.assertEqual((after["x"],after["y"],after["width"],after["height"]),original)
+        self.assertTrue(any(w["id"]==external["id"] and not w["ai"] for w in a.call("ui.window.list")["windows"]))
+
+    def test_v2_keep_dialog_family_and_confirm_close_is_idempotent(self):
+        a=self._agent();self.addCleanup(self._end_client,a)
+        a.call("session.begin",{"label":"transient families"})
+        family=a.call("ui.app.launch",{"app":"pcpilot-family.desktop","wait_ms":8000})["window"]
+        deadline=time.monotonic()+5;dialog=None
+        while time.monotonic()<deadline:
+            dialog=next((w for w in a.call("ui.window.list")["windows"] if w["title"]=="Family Dialog"),None)
+            if dialog:break
+            time.sleep(.05)
+        self.assertIsNotNone(dialog)
+        self.assertTrue(any(r.get("ev")=="dialog" for r in self._read_jsonl(self.extra_logs["pcpilot-family"])))
+        result=a.call("ui.session.wrapup",{"keep":[dialog["id"]]})
+        self.assertEqual(next(w for w in result["left_open"] if w["id"]==dialog["id"])["reason"],"kept")
+        self.assertEqual(next(w for w in result["left_open"] if w["id"]==family["id"])["reason"],"family_protected")
+        remaining={w["id"] for w in a.call("ui.window.list")["windows"]}
+        self.assertIn(family["id"],remaining);self.assertIn(dialog["id"],remaining)
+
+        # A separate session avoids the family's still-open authored windows changing
+        # what the refusing-close mode reports.
+        a.call("session.end",{"reason":"agent_request"});a.call("session.begin",{"label":"refusing close"})
+        confirm=a.call("ui.app.launch",{"app":"pcpilot-confirm.desktop","wait_ms":8000})["window"]
+        result=a.call("ui.session.wrapup")
+        log=self._read_jsonl(self.extra_logs["pcpilot-confirm"])
+        dialogs=[w for w in a.call("ui.window.list")["windows"] if w["title"]=="Confirm Save?"]
+        self.assertTrue(dialogs)
+        self.assertEqual(next(w for w in result["left_open"] if w["id"]==confirm["id"])["reason"],"not_closed")
+        self.assertEqual(next(w for w in result["left_open"] if w["id"]==dialogs[0]["id"])["reason"],"not_closed")
+        close_count=sum(r.get("ev")=="close_request" for r in log);self.assertEqual(close_count,1)
+        again=a.call("ui.session.wrapup")
+        log2=self._read_jsonl(self.extra_logs["pcpilot-confirm"])
+        self.assertEqual(sum(r.get("ev")=="close_request" for r in log2),close_count)
+        self.assertFalse(again["closed"])
+
+    @staticmethod
+    def _read_jsonl(path):
+        out=[]
+        for line in path.read_text(errors="replace").splitlines():
+            try:out.append(__import__("json").loads(line))
+            except ValueError:pass
+        return out
 
     def test_cancellation_ends_long_key_type(self):
         from pcpilot.protocol import ProtocolError

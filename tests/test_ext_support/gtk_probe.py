@@ -35,7 +35,7 @@ def on_activate(app):
     win = Gtk.ApplicationWindow(application=app, title=TITLE)
     win.set_default_size(800, 600)
     window_motion = Gtk.EventControllerMotion()
-    window_motion.connect("motion", lambda c, x, y: log(ev="motion", x=x, y=y, t=time.monotonic()))
+    window_motion.connect("motion", lambda c, x, y: log(ev="motion", source="window", x=x, y=y, t=time.monotonic()))
     win.add_controller(window_motion)
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     for m in ("top", "bottom", "start", "end"):
@@ -74,9 +74,6 @@ def on_activate(app):
         ev="area_click", n=n, button=g.get_current_button(), x=round(x), y=round(y),
         state=int(g.get_current_event_state())))
     area.add_controller(area_click)
-    motion = Gtk.EventControllerMotion()
-    motion.connect("motion", lambda c, x, y: log(ev="motion", x=x, y=y, t=time.monotonic()))
-    area.add_controller(motion)
     scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.BOTH_AXES |
                                        Gtk.EventControllerScrollFlags.DISCRETE)
     scroll.connect("scroll", lambda c, dx, dy: (log(ev="scroll", dx=dx, dy=dy), False)[1])
