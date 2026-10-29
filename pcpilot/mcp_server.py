@@ -659,9 +659,11 @@ class Server:
                 "keep": args.get("keep", []), "close_new": args.get("cleanup", True),
                 "return_to": "origin"}, timeout=WRAPUP_TIMEOUT_S)
         except protocol.ProtocolError as exc:
-            self.daemon.check_abort()
+            if self.daemon.aborted:
+                raise protocol.ProtocolError("user_aborted", "User took control") from exc
             if exc.code in {"user_aborted", "cancelled", "timeout", "disconnected"}:
                 raise
+            self.daemon.check_abort()
             # Older extensions have no wrapup. Other UI failures must still
             # release a live session, with a compact indication of failed cleanup.
             if exc.code != "unknown_op":
