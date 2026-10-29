@@ -1,0 +1,44 @@
+[Unit]
+Description=PCPilot daemon (AI desktop control: input grab, panic hotkey, session broker)
+Documentation=file:///opt/pcpilot/README.md
+After=systemd-logind.service
+
+[Service]
+Type=notify
+# -E/-s: ignore PYTHON* env and user site-packages; code comes from the
+# root-owned /opt/pcpilot only.
+WorkingDirectory=/opt/pcpilot
+ExecStart=/usr/bin/python3 -E -s -m pcpilot.daemon
+Restart=on-failure
+RestartSec=2
+# The event loop pings every 2s; a hung interpreter is killed (grabs drop with it).
+WatchdogSec=10
+# Closing the device fds releases any grab; SIGKILL fallback is fine too.
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+RuntimeDirectory=pcpilot
+RuntimeDirectoryMode=0755
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+# read-only, not yes: UI auth stats the compositor's /run/user/<uid>/wayland-0.
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# AF_NETLINK: NETLINK_SOCK_DIAG (unix_diag) for UI authentication.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+DevicePolicy=closed
+DeviceAllow=char-input rw
+
+[Install]
+WantedBy=multi-user.target
