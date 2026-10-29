@@ -2,8 +2,10 @@
 // Everything is non-reactive (clicks fall through to the windows below) and lives in
 // top chrome, above all windows including fullscreen ones.
 
+import Cairo from 'gi://cairo';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
+import GObject from 'gi://GObject';
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -11,6 +13,9 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {AICursor} from './cursor.js';
 
 const RED = '#ff453a';
+const BORDER_PX = 8;
+const GLOW_PX = 36;
+const GLOW_ALPHA = 0.5;
 const PULSE_MS = 1400;
 const TOAST_MS = 2500;
 const PAINT_TIMEOUT_MS = 1500; // the daemon waits 2s for the ack
@@ -18,6 +23,30 @@ const PAINT_TIMEOUT_MS = 1500; // the daemon waits 2s for the ack
 function esc(s) {
     return GLib.markup_escape_text(String(s), -1);
 }
+
+// Soft red glow fading inwards from the border (St does not paint inset box-shadows on
+// background-less widgets). Static: repainted only when resized.
+const Glow = GObject.registerClass(
+class PCPilotGlow extends St.DrawingArea {
+    vfunc_repaint() {
+        const cr = this.get_context();
+        const [w, h] = this.get_surface_size();
+        const g = GLOW_PX * St.ThemeContext.get_for_stage(global.stage).scale_factor;
+        const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+            const grad = new Cairo.LinearGradient(x0, y0, x1, y1);
+            grad.addColorStopRGBA(0, 1, 0.27, 0.23, GLOW_ALPHA);
+            grad.addColorStopRGBA(1, 1, 0.27, 0.23, 0);
+            cr.setSource(grad);
+            cr.rectangle(rx, ry, rw, rh);
+            cr.fill();
+        };
+        strip(0, 0, 0, g, 0, 0, w, g); // top
+        strip(0, h, 0, h - g, 0, h - g, w, g); // bottom
+        strip(0, 0, g, 0, 0, 0, g, h); // left
+        strip(w, 0, w - g, 0, w - g, 0, g, h); // right
+        cr.$dispose?.();
+    }
+});
 
 export class Overlay {
     // onCursorChange: called whenever the AI cursor is engaged/released.
@@ -129,20 +158,16 @@ export class Overlay {
             const frame = new St.Widget({
                 reactive: false,
                 x: m.x, y: m.y, width: m.width, height: m.height,
-                style: `border: 4px solid ${RED};`,
+                style: `border: ${BORDER_PX}px solid ${RED};`,
                 layout_manager: new Clutter.BinLayout(),
             });
             // Separate glow layer so the pulse only fades the soft inner shadow.
-            const glow = new St.Widget({
-                reactive: false,
-                x_expand: true, y_expand: true,
-                style: 'box-shadow: inset 0 0 18px rgba(255,69,58,0.55);',
-            });
+            const glow = new Glow({reactive: false, x_expand: true, y_expand: true});
             const inner = new St.Widget({
                 reactive: false,
                 x_expand: true, y_expand: true,
                 layout_manager: new Clutter.BinLayout(),
-                style: 'padding-top: 6px;',
+                style: 'padding-top: 4px;',
             });
             frame.add_child(glow);
             frame.add_child(inner);
@@ -251,7 +276,7 @@ export class Overlay {
             this._pulseHigh = !this._pulseHigh;
             for (const f of this._frames) {
                 f.glow.ease({
-                    opacity: this._pulseHigh ? 255 : 110,
+                    opacity: this._pulseHigh ? 255 : 140,
                     duration: PULSE_MS - 100,
                     mode: Clutter.AnimationMode.EASE_IN_OUT_SINE,
                 });
