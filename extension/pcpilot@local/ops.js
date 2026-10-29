@@ -1,0 +1,852 @@
+// UI op handlers. Coordinates are logical stage pixels. Every handler is async and
+// yields to the main loop between steps; long ones check the session token so that
+// `state inactive` cancels them mid-way.
+
+import Clutter from 'gi://Clutter';
+import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
+import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
+import St from 'gi://St';
+
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as Keyboard from 'resource:///org/gnome/shell/ui/status/keyboard.js';
+
+import {BUTTONS, Input} from './input.js';
+import {MODIFIER_KEYVALS, charToKeyval, parseChord} from './keys.js';
+import {E_BAD_ARGS, E_FAILED, E_INACTIVE, E_NOT_FOUND, E_UNKNOWN_OP, OpError} from './protocol.js';
+
+Gio._promisify(Shell.Screenshot.prototype, 'screenshot');
+Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
+Gio._promisify(Gio.File.prototype, 'replace_async');
+Gio._promisify(Gio.File.prototype, 'read_async');
+Gio._promisify(Gio.File.prototype, 'delete_async');
+Gio._promisify(Gio.File.prototype, 'make_directory_async');
+Gio._promisify(Gio.File.prototype, 'query_info_async');
+Gio._promisify(Gio.File.prototype, 'set_attributes_async');
+Gio._promisify(Gio.AppInfo.prototype, 'launch_uris_async');
+Gio._promisify(Gio.InputStream.prototype, 'read_bytes_async');
+Gio._promisify(Gio.OutputStream.prototype, 'close_async');
+Gio._promisify(Gio.AppInfo, 'launch_default_for_uri_async');
+
+const KEEP_SCREENSHOTS = 10;
+const MAX_TEXT = 20000;
+const IM_CHUNK = 64;
+const KEYVAL_YIELD_EVERY = 16;
+const CHANNEL_SWITCH_MS = 40; // IM commits and key events travel different paths
+const PASTE_SETTLE_MS = 300;
+const CLIPBOARD_READ_MS = 2000;
+// key.type must finish well inside the per-op limit (extension 18s, daemon 20s).
+const MAX_TYPE_MS = 15000;
+const MAX_LAUNCH_WAIT_MS = 15000;
+
+// Layouts whose current group types plain ASCII through keyvals (the virtual keyboard
+// can only press keyvals present in the active layout; there is no keymap query API).
+const LATIN_LAYOUT = /^(us|br|gb|pt|es|latam|it|de|fr|ca|ie|nl|dk|no|se|fi|ch|be|pl|cz|sk|hu|ro|tr|ee|lv|lt|si|hr|is|za|au|nz|epo)\b/;
+// ASCII characters that the layout only has on a third/fourth level or as dead keys:
+// Mutter's keyval picker cannot type them (shift+AltGr is "Unhandled level"), so they
+// go through the clipboard when there is no input-method focus.
+const LAYOUT_UNSAFE = {
+    br: '`~^<>',
+    pt: '`~^',
+    es: '`^',
+    latam: '`^~',
+    de: '^`',
+    fr: '^`~',
+};
+const LAYOUT_EXTRA = {
+    br: 'çÇ',
+    pt: 'çÇ',
+    es: 'ñÑçÇ',
+    latam: 'ñÑ',
+    de: 'äöüÄÖÜß',
+};
+const TERMINAL = /terminal|ptyxis|console|kgx|kitty|alacritty|foot|wezterm|tilix|konsole|xterm|ghostty|terminator|blackbox/i;
+
+const MODIFIER_NAMES = Object.keys(MODIFIER_KEYVALS);
+
+function num(v, name, {min = -Infinity, max = Infinity, int = false, def} = {}) {
+    if (v === undefined || v === null) {
+        if (def !== undefined)
+            return def;
+        throw new OpError(E_BAD_ARGS, `${name} is required`);
+    }
+    if (typeof v !== 'number' || !Number.isFinite(v))
+        throw new OpError(E_BAD_ARGS, `${name} must be a number`);
+    if (int && !Number.isInteger(v))
+        throw new OpError(E_BAD_ARGS, `${name} must be an integer`);
+    if (v < min || v > max)
+        throw new OpError(E_BAD_ARGS, `${name} must be in [${min}, ${max}]`);
+    return v;
+}
+
+function point(p, name) {
+    if (!p || typeof p !== 'object')
+        throw new OpError(E_BAD_ARGS, `${name} must be {x,y}`);
+    const x = num(p.x, `${name}.x`), y = num(p.y, `${name}.y`);
+    Input.checkPoint(x, y);
+    return [x, y];
+}
+
+function optionalPoint(args) {
+    if (args.x === undefined && args.y === undefined)
+        return null;
+    return point(args, 'point');
+}
+
+function str(v, name, {optional = false} = {}) {
+    if (v === undefined || v === null) {
+        if (optional)
+            return null;
+        throw new OpError(E_BAD_ARGS, `${name} is required`);
+    }
+    if (typeof v !== 'string')
+        throw new OpError(E_BAD_ARGS, `${name} must be a string`);
+    return v;
+}
+
+function rect(r) {
+    return {x: r.x, y: r.y, width: r.width, height: r.height};
+}
+
+function clipboardGetText() {
+    return new Promise(resolve => {
+        St.Clipboard.get_default().get_text(St.ClipboardType.CLIPBOARD, (_cb, text) => resolve(text));
+    });
+}
+
+function clipboardGetContent(mimetype) {
+    return new Promise(resolve => {
+        St.Clipboard.get_default().get_content(St.ClipboardType.CLIPBOARD, mimetype,
+            (_cb, bytes) => resolve(bytes));
+    });
+}
+
+// Resolves with `promise`, but rejects as soon as `token` is cancelled or after `ms`
+// (for calls that cannot be cancelled, e.g. reading a selection owned by another app).
+function bounded(promise, token, ms, what) {
+    return new Promise((resolve, reject) => {
+        let id = 0, dispose = null;
+        const finish = (fn, v) => {
+            if (id)
+                GLib.source_remove(id);
+            id = 0;
+            dispose?.();
+            fn(v);
+        };
+        id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+            id = 0;
+            finish(reject, new OpError(E_FAILED, `${what} timed out`));
+            return GLib.SOURCE_REMOVE;
+        });
+        dispose = token.onCancel(() => finish(reject, new OpError(E_INACTIVE, 'session ended')));
+        promise.then(v => finish(resolve, v), e => finish(reject, e));
+    });
+}
+
+function plainSleep(ms) {
+    return new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+        resolve();
+        return GLib.SOURCE_REMOVE;
+    }));
+}
+
+async function pngSize(file) {
+    const stream = await file.read_async(GLib.PRIORITY_DEFAULT, null);
+    try {
+        const bytes = (await stream.read_bytes_async(24, GLib.PRIORITY_DEFAULT, null)).toArray();
+        if (bytes.length < 24 || bytes[1] !== 0x50 || bytes[2] !== 0x4e || bytes[3] !== 0x47)
+            throw new OpError(E_FAILED, 'screenshot is not a PNG');
+        const be = o => ((bytes[o] << 24) | (bytes[o + 1] << 16) | (bytes[o + 2] << 8) | bytes[o + 3]) >>> 0;
+        return [be(16), be(20)];
+    } finally {
+        stream.close(null);
+    }
+}
+
+export function windowInfo(w) {
+    const f = w.get_frame_rect();
+    const b = w.get_buffer_rect();
+    const app = Shell.WindowTracker.get_default().get_window_app(w);
+    return {
+        id: w.get_id(),
+        title: w.get_title() ?? '',
+        app_id: app?.get_id() ?? w.get_gtk_application_id() ?? w.get_wm_class() ?? '',
+        pid: w.get_pid(),
+        ...rect(f),
+        buffer: rect(b),
+        focused: w.has_focus(),
+        minimized: w.minimized,
+        workspace: w.is_on_all_workspaces() ? -1 : (w.get_workspace()?.index() ?? -1),
+    };
+}
+
+const LISTED_TYPES = new Set([
+    Meta.WindowType.NORMAL, Meta.WindowType.DIALOG, Meta.WindowType.MODAL_DIALOG,
+    Meta.WindowType.UTILITY,
+]);
+
+function listWindows() {
+    const wins = global.get_window_actors()
+        .map(a => a.meta_window)
+        .filter(w => w && !w.is_override_redirect() && LISTED_TYPES.has(w.get_window_type()));
+    // Top of the stack first.
+    return global.display.sort_windows_by_stacking(wins).reverse();
+}
+
+function findWindow(id) {
+    if (typeof id === 'string' && /^\d+$/.test(id))
+        id = Number(id);
+    if (typeof id !== 'number')
+        throw new OpError(E_BAD_ARGS, 'id must be a window id');
+    const w = listWindows().find(x => x.get_id() === id);
+    if (!w)
+        throw new OpError(E_NOT_FOUND, `no window ${id}`);
+    return w;
+}
+
+export class Ops {
+    constructor({overlay, input}) {
+        this._overlay = overlay;
+        this._input = input;
+        this._shots = [];
+        this._shotSeq = 0;
+        this._handlers = {
+            'screen.info': this._screenInfo,
+            'screenshot': this._screenshot,
+            'pointer.move': this._pointerMove,
+            'pointer.click': this._pointerClick,
+            'pointer.drag': this._pointerDrag,
+            'pointer.scroll': this._pointerScroll,
+            'pointer.position': this._pointerPosition,
+            'key.press': this._keyPress,
+            'key.type': this._keyType,
+            'app.search': this._appSearch,
+            'app.launch': this._appLaunch,
+            'open_uri': this._openUri,
+            'window.list': this._windowList,
+            'window.action': this._windowAction,
+            'clipboard.get': this._clipboardGet,
+            'clipboard.set': this._clipboardSet,
+            'status': this._status,
+        };
+    }
+
+    run(op, args, token) {
+        const h = this._handlers[op];
+        if (!h)
+            throw new OpError(E_UNKNOWN_OP, `unknown op: ${op}`);
+        if (args === null || typeof args !== 'object' || Array.isArray(args))
+            throw new OpError(E_BAD_ARGS, 'args must be an object');
+        return h.call(this, args, token);
+    }
+
+    // ---- screen ----
+
+    _screenInfo() {
+        const lm = Main.layoutManager;
+        return {
+            width: global.screen_width,
+            height: global.screen_height,
+            monitors: lm.monitors.map(m => ({
+                x: m.x, y: m.y, width: m.width, height: m.height,
+                scale: m.geometry_scale,
+                primary: m.index === lm.primaryIndex,
+            })),
+        };
+    }
+
+    async _screenshot(args, token) {
+        let area = null;
+        if (args.region !== undefined && args.region !== null) {
+            const r = args.region;
+            if (typeof r !== 'object')
+                throw new OpError(E_BAD_ARGS, 'region must be {x,y,width,height}');
+            let x = num(r.x, 'region.x'), y = num(r.y, 'region.y');
+            let w = num(r.width, 'region.width', {min: 1}), h = num(r.height, 'region.height', {min: 1});
+            // Clamp to the screen (model-space rounding can overshoot by a pixel).
+            const x2 = Math.min(Math.round(x + w), global.screen_width);
+            const y2 = Math.min(Math.round(y + h), global.screen_height);
+            x = Math.max(0, Math.round(x));
+            y = Math.max(0, Math.round(y));
+            w = x2 - x;
+            h = y2 - y;
+            if (w <= 0 || h <= 0)
+                throw new OpError(E_BAD_ARGS, 'region does not intersect the screen');
+            const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+            area = [x * scale, y * scale, w * scale, h * scale];
+        }
+        const cursor = args.cursor === true;
+        // Debug/test only: capture with the overlay visible to verify it is drawn.
+        const includeOverlay = args.include_overlay === true;
+        token.check();
+
+        const dir = await this._shotDir(token);
+        const path = GLib.build_filenamev([dir, `shot-${GLib.get_real_time()}-${++this._shotSeq}.png`]);
+        const file = Gio.File.new_for_path(path);
+        const stream = await file.replace_async(null, false, Gio.FileCreateFlags.PRIVATE,
+            GLib.PRIORITY_DEFAULT, token.cancellable);
+        let ok = false;
+        try {
+            const shooter = new Shell.Screenshot();
+            const capture = async () => {
+                token.check(); // never capture for a session that is over
+                if (area)
+                    await shooter.screenshot_area(...area, stream);
+                else
+                    await shooter.screenshot(cursor, stream);
+            };
+            if (includeOverlay) {
+                await capture();
+            } else {
+                await this._overlay.withHidden(async () => {
+                    await this._overlay.waitPaint();
+                    await capture();
+                });
+            }
+            await stream.close_async(GLib.PRIORITY_DEFAULT, null);
+            token.check();
+            const [width, height] = await pngSize(file);
+            token.check();
+            ok = true;
+            this._rememberShot(file);
+            return {path, width, height};
+        } finally {
+            if (!ok) {
+                await stream.close_async(GLib.PRIORITY_DEFAULT, null).catch(() => {});
+                await file.delete_async(GLib.PRIORITY_DEFAULT, null).catch(() => {});
+            }
+        }
+    }
+
+    // $XDG_RUNTIME_DIR/pcpilot, created 0700; refuses anything but a real directory owned
+    // by us (no symlink). The runtime dir itself belongs to the desktop user anyway.
+    async _shotDir(token) {
+        const dir = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'pcpilot']);
+        const file = Gio.File.new_for_path(dir);
+        try {
+            await file.make_directory_async(GLib.PRIORITY_DEFAULT, token.cancellable);
+        } catch (e) {
+            if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.EXISTS))
+                throw new OpError(E_FAILED, `cannot create ${dir}: ${e.message}`);
+        }
+        const info = await file.query_info_async('standard::type,unix::uid,unix::mode',
+            Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, GLib.PRIORITY_DEFAULT, token.cancellable);
+        if (info.get_file_type() !== Gio.FileType.DIRECTORY ||
+            info.get_attribute_uint32('unix::uid') !== new Gio.Credentials().get_unix_user())
+            throw new OpError(E_FAILED, `${dir} is not a directory owned by this user`);
+        if ((info.get_attribute_uint32('unix::mode') & 0o077) !== 0) {
+            const mode = new Gio.FileInfo();
+            mode.set_attribute_uint32('unix::mode', 0o700);
+            await file.set_attributes_async(mode, Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS,
+                GLib.PRIORITY_DEFAULT, token.cancellable);
+        }
+        return dir;
+    }
+
+    _rememberShot(file) {
+        this._shots.push(file);
+        while (this._shots.length > KEEP_SCREENSHOTS)
+            this._shots.shift().delete_async(GLib.PRIORITY_LOW, null).catch(() => {});
+    }
+
+    // ---- pointer ----
+
+    // Absolute motion is applied asynchronously by Mutter's input thread, and the very
+    // first event of a fresh virtual pointer can land with only one axis applied: verify
+    // through the real pointer position and resend if needed.
+    async _moveTo(x, y, token) {
+        for (let attempt = 0; attempt < 4; attempt++) {
+            this._input.move(x, y);
+            for (let i = 0; i < 5; i++) {
+                await token.sleep(4);
+                const [px, py] = global.get_pointer();
+                if (Math.abs(px - x) <= 1 && Math.abs(py - y) <= 1)
+                    return;
+            }
+        }
+        console.warn(`pcpilot: pointer did not reach ${x},${y}`);
+    }
+
+    async _pointerMove(args, token) {
+        const [x, y] = point(args, 'point');
+        await this._moveTo(x, y, token);
+        return {};
+    }
+
+    _pointerPosition() {
+        return this._input.position();
+    }
+
+    _modifiers(list) {
+        if (list === undefined || list === null)
+            return [];
+        if (!Array.isArray(list))
+            throw new OpError(E_BAD_ARGS, 'modifiers must be an array');
+        return list.map(m => {
+            const k = MODIFIER_KEYVALS[String(m).toLowerCase()];
+            if (k === undefined)
+                throw new OpError(E_BAD_ARGS, `modifier must be one of ${MODIFIER_NAMES.join(', ')}`);
+            return k;
+        });
+    }
+
+    _button(name, def = 'left') {
+        const b = BUTTONS[name ?? def];
+        if (b === undefined)
+            throw new OpError(E_BAD_ARGS, 'button must be left, right or middle');
+        return b;
+    }
+
+    async _pointerClick(args, token) {
+        const p = optionalPoint(args);
+        const button = this._button(args.button);
+        const count = num(args.count, 'count', {min: 1, max: 3, int: true, def: 1});
+        const mods = this._modifiers(args.modifiers);
+        if (p)
+            await this._moveTo(...p, token);
+        for (const k of mods)
+            this._input.key(k, true);
+        try {
+            if (mods.length > 0)
+                await token.sleep(30); // modifiers travel on the keyboard device
+            for (let i = 0; i < count; i++) {
+                if (i > 0)
+                    await token.sleep(40);
+                this._input.button(button, true);
+                await token.sleep(10);
+                this._input.button(button, false);
+            }
+        } finally {
+            this._input.button(button, false);
+            for (const k of [...mods].reverse())
+                this._input.key(k, false);
+        }
+        this._fixKeyFocus();
+        return {};
+    }
+
+    async _pointerDrag(args, token) {
+        const [x1, y1] = point(args.from, 'from');
+        const [x2, y2] = point(args.to, 'to');
+        const button = this._button(args.button);
+        const duration = num(args.duration_ms, 'duration_ms', {min: 0, max: 10000, def: 300});
+        const steps = Math.max(5, Math.round(duration / 16));
+        await this._moveTo(x1, y1, token);
+        await token.sleep(20);
+        this._input.button(button, true);
+        try {
+            await token.sleep(50);
+            for (let i = 1; i <= steps; i++) {
+                const t = i / steps;
+                this._input.move(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
+                await token.sleep(Math.max(1, Math.round(duration / steps)));
+            }
+            await this._moveTo(x2, y2, token);
+            await token.sleep(30);
+        } finally {
+            this._input.button(button, false);
+        }
+        return {};
+    }
+
+    async _pointerScroll(args, token) {
+        const p = optionalPoint(args);
+        const dx = num(args.dx, 'dx', {min: -50, max: 50, int: true, def: 0});
+        const dy = num(args.dy, 'dy', {min: -50, max: 50, int: true, def: 0});
+        if (p)
+            await this._moveTo(...p, token);
+        const steps = [
+            [Math.abs(dy), dy > 0 ? Clutter.ScrollDirection.DOWN : Clutter.ScrollDirection.UP],
+            [Math.abs(dx), dx > 0 ? Clutter.ScrollDirection.RIGHT : Clutter.ScrollDirection.LEFT],
+        ];
+        for (const [n, dir] of steps) {
+            for (let i = 0; i < n; i++) {
+                this._input.scroll(dir);
+                await token.sleep(15);
+            }
+        }
+        return {};
+    }
+
+    // ---- keyboard ----
+
+    // Keyboard events go to the stage's key focus actor when there is one, not to the
+    // focused window. Hiding the overview programmatically (e.g. the startup overview)
+    // leaves key focus on an overview actor, so keys silently vanish and apps never get
+    // text-input focus. Without a modal grab (menus, dialogs, overview all push one) and
+    // with a focused window, shell key focus is stale: clear it so input reaches the app.
+    // Returns true when focus was changed (callers give the client a moment to react).
+    _fixKeyFocus() {
+        const focus = global.stage.key_focus;
+        if (!focus || Main.modalCount > 0 || !global.display.focus_window)
+            return false;
+        if (Main.overview.visible || Main.overview.animationInProgress)
+            return false;
+        global.stage.set_key_focus(null);
+        return true;
+    }
+
+    async _keyPress(args, token) {
+        let keys = args.keys;
+        if (typeof keys === 'string')
+            keys = [keys];
+        if (!Array.isArray(keys) || keys.length === 0)
+            throw new OpError(E_BAD_ARGS, 'keys must be a string or a non-empty array');
+        const repeat = num(args.repeat, 'repeat', {min: 1, max: 100, int: true, def: 1});
+        const chords = keys.map(parseChord); // validate everything first
+        if (this._fixKeyFocus())
+            await token.sleep(50);
+        for (let r = 0; r < repeat; r++) {
+            for (const c of chords) {
+                token.check();
+                this._input.chord(c);
+                await token.sleep(20);
+            }
+        }
+        return {};
+    }
+
+    _typeableSet() {
+        const src = Keyboard.getInputSourceManager().currentSource;
+        const layout = (src?.xkbId ?? 'us').split(/[+(]/)[0];
+        if (!LATIN_LAYOUT.test(layout))
+            return null; // nothing reliably typeable as keyvals
+        return {layout, extra: LAYOUT_EXTRA[layout] ?? '', unsafe: LAYOUT_UNSAFE[layout] ?? ''};
+    }
+
+    _canKeyval(ch, typeable) {
+        if (ch === '\n' || ch === '\t')
+            return true;
+        if (!typeable)
+            return false;
+        const cp = ch.codePointAt(0);
+        if (typeable.unsafe.includes(ch))
+            return false;
+        return (cp >= 0x20 && cp <= 0x7e) || typeable.extra.includes(ch);
+    }
+
+    async _keyType(args, token) {
+        const text = str(args.text, 'text').replace(/\r\n?/g, '\n');
+        if (text.length > MAX_TEXT)
+            throw new OpError(E_BAD_ARGS, `text longer than ${MAX_TEXT}`);
+        const delay = num(args.delay_ms, 'delay_ms', {min: 0, max: 1000, def: 0});
+        // Optional override (tests/debugging): "im" | "keyval" | "clipboard".
+        const forced = str(args.method, 'method', {optional: true});
+        if (forced && !['im', 'keyval', 'clipboard'].includes(forced))
+            throw new OpError(E_BAD_ARGS, 'method must be im, keyval or clipboard');
+
+        if (this._fixKeyFocus())
+            await token.sleep(100); // let the client re-enable text-input
+        const imFocus = Main.inputMethod?.currentFocus ?? null;
+        if (forced === 'im' && !imFocus)
+            throw new OpError(E_FAILED, 'no input method focus');
+        const useIm = forced ? forced === 'im' : imFocus !== null;
+        const typeable = this._typeableSet();
+
+        // Plan runs: [kind, text] with kind im | keyval | clipboard | newline.
+        const runs = [];
+        const push = (kind, ch) => {
+            const last = runs[runs.length - 1];
+            if (last && last[0] === kind && kind !== 'newline')
+                last[1] += ch;
+            else
+                runs.push([kind, ch]);
+        };
+        for (const ch of text) {
+            let kind;
+            if (ch === '\n')
+                kind = 'newline';
+            else if (forced === 'clipboard')
+                kind = 'clipboard';
+            else if (useIm)
+                kind = 'im';
+            else if (forced === 'keyval' || this._canKeyval(ch, typeable))
+                kind = 'keyval';
+            else
+                kind = 'clipboard';
+            push(kind, ch);
+        }
+
+        // Refuse what cannot finish inside the op time limit (the agent should split it).
+        const pastes = runs.filter(r => r[0] === 'clipboard').length;
+        const estimate = [...text].length * delay + pastes * (PASTE_SETTLE_MS + 100);
+        if (estimate > MAX_TYPE_MS) {
+            throw new OpError(E_BAD_ARGS,
+                `typing would take ~${Math.ceil(estimate / 1000)}s (max ${MAX_TYPE_MS / 1000}s): ` +
+                'split the text or lower delay_ms');
+        }
+
+        const methods = new Set();
+        let lastChannel = null;
+        const switchTo = async channel => {
+            if (lastChannel && lastChannel !== channel)
+                await token.sleep(CHANNEL_SWITCH_MS);
+            lastChannel = channel;
+        };
+        for (const [kind, chunk] of runs) {
+            token.check();
+            if (kind === 'newline') {
+                await switchTo('key');
+                this._input.tap(Clutter.KEY_Return);
+                await token.sleep(delay);
+            } else if (kind === 'im') {
+                methods.add('im');
+                await switchTo('im');
+                await this._typeIm(chunk, delay, token);
+            } else if (kind === 'keyval') {
+                methods.add('keyval');
+                await switchTo('key');
+                await this._typeKeyvals(chunk, delay, token);
+            } else {
+                methods.add('clipboard');
+                await switchTo('key');
+                await this._paste(chunk, token);
+                await token.sleep(delay);
+            }
+        }
+        let method = 'keyval';
+        if (methods.size > 1)
+            method = 'mixed';
+        else if (methods.size === 1)
+            [method] = methods;
+        return {method};
+    }
+
+    async _typeIm(text, delay, token) {
+        const chars = [...text];
+        const step = delay > 0 ? 1 : IM_CHUNK;
+        for (let i = 0; i < chars.length; i += step) {
+            token.check();
+            Main.inputMethod.commit(chars.slice(i, i + step).join(''));
+            await token.sleep(delay);
+        }
+    }
+
+    async _typeKeyvals(text, delay, token) {
+        let n = 0;
+        for (const ch of text) {
+            token.check();
+            this._input.tap(charToKeyval(ch));
+            if (delay > 0 || ++n % KEYVAL_YIELD_EVERY === 0)
+                await token.sleep(delay);
+        }
+    }
+
+    _focusIsTerminal() {
+        const w = global.display.focus_window;
+        if (!w)
+            return false;
+        const app = Shell.WindowTracker.get_default().get_window_app(w);
+        return TERMINAL.test(`${app?.get_id() ?? ''} ${w.get_wm_class() ?? ''} ${w.get_gtk_application_id() ?? ''}`);
+    }
+
+    // Paste text through the clipboard, then put the previous clipboard content back.
+    async _paste(text, token) {
+        const clipboard = St.Clipboard.get_default();
+        const type = St.ClipboardType.CLIPBOARD;
+        const savedText = await bounded(clipboardGetText(), token, CLIPBOARD_READ_MS, 'clipboard read');
+        let saved = null;
+        if (savedText === null) {
+            const mimes = clipboard.get_mimetypes(type) ?? [];
+            const mime = mimes.find(m => m.startsWith('image/')) ?? mimes[0];
+            if (mime) {
+                const bytes = await bounded(clipboardGetContent(mime), token, CLIPBOARD_READ_MS,
+                    'clipboard read');
+                if (bytes)
+                    saved = [mime, bytes];
+            }
+        }
+        token.check(); // nothing touched yet: a session that ended leaves the clipboard alone
+        clipboard.set_text(type, text);
+        try {
+            await token.sleep(30);
+            const chord = this._focusIsTerminal()
+                ? [Clutter.KEY_Control_L, Clutter.KEY_Shift_L, Clutter.KEY_v]
+                : [Clutter.KEY_Control_L, Clutter.KEY_v];
+            this._input.chord(chord);
+        } finally {
+            // Give the client time to read the selection, then put the user's content back
+            // only if the selection is still ours (the user may have copied something new).
+            await plainSleep(PASTE_SETTLE_MS);
+            const now = await Promise.race([clipboardGetText(), plainSleep(500).then(() => undefined)]);
+            if (now === text) {
+                if (savedText !== null)
+                    clipboard.set_text(type, savedText);
+                else if (saved)
+                    clipboard.set_content(type, saved[0], saved[1]);
+            }
+        }
+    }
+
+    // ---- apps / windows ----
+
+    _appSearch(args) {
+        const query = str(args.query, 'query');
+        const sys = Shell.AppSystem.get_default();
+        const ids = Shell.AppSystem.search(query).flat();
+        const apps = [];
+        for (const id of ids) {
+            const app = sys.lookup_app(id);
+            if (app)
+                apps.push({id: app.get_id(), name: app.get_name()});
+            if (apps.length >= 10)
+                break;
+        }
+        return {apps};
+    }
+
+    _resolveApp(name) {
+        const sys = Shell.AppSystem.get_default();
+        let app = sys.lookup_app(name) ?? sys.lookup_app(`${name}.desktop`) ??
+            sys.lookup_desktop_wmclass?.(name) ?? null;
+        if (!app) {
+            const [first] = Shell.AppSystem.search(name).flat();
+            if (first)
+                app = sys.lookup_app(first);
+        }
+        if (!app)
+            throw new OpError(E_NOT_FOUND, `no app matching ${name}`);
+        return app;
+    }
+
+    async _appLaunch(args, token) {
+        const app = this._resolveApp(str(args.app, 'app'));
+        const uris = args.uris ?? [];
+        if (!Array.isArray(uris) || uris.some(u => typeof u !== 'string'))
+            throw new OpError(E_BAD_ARGS, 'uris must be an array of strings');
+        const waitMs = num(args.wait_ms, 'wait_ms', {min: 0, max: MAX_LAUNCH_WAIT_MS, def: 8000});
+        const before = new Set(app.get_windows().map(w => w.get_id()));
+        const allBefore = new Set(listWindows().map(w => w.get_id()));
+        const result = {app_id: app.get_id(), name: app.get_name()};
+
+        try {
+            if (uris.length > 0) {
+                await app.get_app_info().launch_uris_async(uris,
+                    global.create_app_launch_context(0, -1), token.cancellable);
+            } else if (before.size > 0) {
+                // Already running: bring it forward rather than spawning another window.
+                const [w] = app.get_windows();
+                await this._activate(w, token);
+                await token.sleep(100);
+                result.window = windowInfo(w);
+                return result;
+            } else {
+                app.launch(0, -1, Shell.AppLaunchGpu.APP_PREF);
+            }
+        } catch (e) {
+            if (e instanceof OpError)
+                throw e;
+            throw new OpError(E_FAILED, `launch failed: ${e.message}`);
+        }
+
+        // Opening URIs in a running app often reuses an existing window: don't wait long.
+        const wait = before.size > 0 ? Math.min(waitMs, 1500) : waitMs;
+        const deadline = GLib.get_monotonic_time() + wait * 1000;
+        while (GLib.get_monotonic_time() < deadline) {
+            await token.sleep(100);
+            const ready = x => x.get_compositor_private() && x.get_frame_rect().width > 0;
+            // Prefer windows the tracker matched to this app; else a brand-new window it
+            // could not match to any .desktop file (app_id/StartupWMClass mismatch).
+            const w = app.get_windows().find(x => !before.has(x.get_id()) && ready(x)) ??
+                listWindows().find(x => !allBefore.has(x.get_id()) && ready(x) &&
+                    (Shell.WindowTracker.get_default().get_window_app(x)?.get_id() ?? 'window:')
+                        .startsWith('window:'));
+            if (w) {
+                // Focus-stealing prevention can leave a freshly launched window unfocused;
+                // the agent launched it to use it.
+                await this._activate(w, token);
+                await token.sleep(100);
+                result.window = windowInfo(w);
+                break;
+            }
+        }
+        if (!result.window && before.size > 0) {
+            const w = global.display.focus_window;
+            const mine = w && app.get_windows().includes(w) ? w : app.get_windows()[0];
+            if (mine)
+                result.window = windowInfo(mine);
+        }
+        return result;
+    }
+
+    async _openUri(args) {
+        const uri = str(args.uri, 'uri');
+        if (!GLib.uri_peek_scheme(uri))
+            throw new OpError(E_BAD_ARGS, 'uri needs a scheme (https://, file://, ...)');
+        try {
+            await Gio.AppInfo.launch_default_for_uri_async(uri, global.create_app_launch_context(0, -1), null);
+        } catch (e) {
+            throw new OpError(E_FAILED, e.message);
+        }
+        return {};
+    }
+
+    // Main.activateWindow() hides the overview, but that is a no-op while the overview is
+    // still animating (e.g. the login/startup animation): retry until it is really gone.
+    async _activate(w, token) {
+        Main.activateWindow(w, global.get_current_time());
+        for (let i = 0; i < 40 && (Main.overview.visible || Main.overview.animationInProgress); i++) {
+            await token.sleep(50);
+            if (Main.overview.visible && !Main.overview.animationInProgress)
+                Main.overview.hide();
+        }
+        if (!w.has_focus())
+            w.activate(global.get_current_time());
+        if (this._fixKeyFocus())
+            await token.sleep(50);
+    }
+
+    _windowList() {
+        return {windows: listWindows().map(windowInfo)};
+    }
+
+    async _windowAction(args, token) {
+        const w = findWindow(args.id);
+        const time = global.get_current_time();
+        switch (args.action) {
+        case 'activate':
+            await this._activate(w, token);
+            break;
+        case 'close':
+            w.delete(time);
+            break;
+        case 'maximize':
+            w.maximize();
+            break;
+        case 'unmaximize':
+            w.unmaximize();
+            break;
+        case 'minimize':
+            w.minimize();
+            break;
+        case 'fullscreen':
+            w.make_fullscreen();
+            break;
+        case 'unfullscreen':
+            w.unmake_fullscreen();
+            break;
+        default:
+            throw new OpError(E_BAD_ARGS,
+                'action must be activate, close, maximize, unmaximize, minimize or fullscreen');
+        }
+        await token.sleep(50);
+        return {};
+    }
+
+    // ---- misc ----
+
+    async _clipboardGet(_args, token) {
+        return {text: (await bounded(clipboardGetText(), token, CLIPBOARD_READ_MS, 'clipboard read')) ?? ''};
+    }
+
+    _clipboardSet(args) {
+        St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, str(args.text, 'text'));
+        return {};
+    }
+
+    _status(args) {
+        this._overlay.setStatus(str(args.text, 'text'));
+        return {};
+    }
+}
