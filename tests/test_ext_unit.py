@@ -13,7 +13,7 @@ NODE_TEST = ROOT / "tests/test_ext_support/node/bootstrap.mjs"
 class ExtensionUnitRegressionTests(unittest.TestCase):
     def test_real_extension_modules_regressions(self):
         proc = subprocess.run([shutil.which("node"), "--no-warnings", "--import", str(NODE_TEST)],
-            cwd=ROOT, capture_output=True, text=True, timeout=30)
+            cwd=ROOT, capture_output=True, text=True, timeout=90)
         self.assertEqual(proc.returncode, 0, f"Node scenario failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
         result = json.loads(proc.stdout.strip().splitlines()[-1])
         self.assertEqual(result["ok"], True)

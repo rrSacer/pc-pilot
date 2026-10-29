@@ -15,11 +15,12 @@ const virtualEvents=[];
 let pointerPos=[0,0];
 export const cursorTracker={inhibits:0,visible:true,inhibit_cursor_visibility(){this.inhibits++},
  uninhibit_cursor_visibility(){this.inhibits--},get_pointer_visible(){return this.inhibits===0},connect:()=>1,disconnect(){}};
+export const seatUnfocus={n:0};
 globalThis.global = {
  backend:{get_cursor_tracker:()=>cursorTracker},
  screen_width:1920,screen_height:1080,display:{focus_window:null,sort_windows_by_stacking:x=>x},
  get_window_actors:()=>[],get_pointer:()=>pointerPos,workspace_manager:{get_active_workspace_index:()=>0},
- stage:{key_focus:null,context:{get_backend:()=>({get_default_seat:()=>({create_virtual_device:()=>({notify_keyval:(...x)=>virtualEvents.push(['key',...x]),notify_button:(...x)=>virtualEvents.push(['button',...x]),notify_absolute_motion:(...x)=>virtualEvents.push(['move',...x]),notify_discrete_scroll(){}})})})},
+ stage:{key_focus:null,context:{get_backend:()=>({get_default_seat:()=>({inhibit_unfocus(){seatUnfocus.n++},uninhibit_unfocus(){seatUnfocus.n--},create_virtual_device:()=>({notify_keyval:(...x)=>virtualEvents.push(['key',...x]),notify_button:(...x)=>virtualEvents.push(['button',...x]),notify_absolute_motion:(...x)=>virtualEvents.push(['move',...x]),notify_discrete_scroll(){}})})})},
   connect:(sig,cb)=>{afterPaint=cb;return 1},disconnect(){},queue_redraw(){},set_key_focus(){}}
 };
 
