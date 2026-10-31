@@ -795,10 +795,11 @@ ACTIVE = "active"
 
 
 class Session:
-    def __init__(self, loop, sid, owner, label):
+    def __init__(self, loop, sid, owner, label, theme="neutral"):
         self.id = sid
         self.owner = owner
         self.label = label
+        self.theme = theme if isinstance(theme, str) and theme in {"claude", "codex", "gemini", "neutral"} else "neutral"
         self.phase = STARTING
         self.ending = False
         self.end_reason = None
@@ -1346,10 +1347,11 @@ class Daemon:
             conn.send(P.err(id_, P.E_UI_UNAVAILABLE, "UI failed re-validation"))
             return
 
-        s = Session(self.loop, next(self._session_ids), conn, _sanitize_label(args.get("label") or conn.client or "IA"))
+        s = Session(self.loop, next(self._session_ids), conn,
+                    _sanitize_label(args.get("label") or conn.client or "IA"), args.get("theme"))
         self.session = s
         log.info("session %d starting for %r (%s)", s.id, conn, s.label)
-        self.ui.send(P.event(P.EV_STATE, active=True, label=s.label, hotkey=self.hotkey.text, session=s.id))
+        self.ui.send(P.event(P.EV_STATE, active=True, label=s.label, theme=s.theme, hotkey=self.hotkey.text, session=s.id))
         self._supervise(s, self.loop.create_task(self._begin_wait(s, conn, id_, resume)))
 
     async def _begin_wait(self, s, conn, id_, resume):

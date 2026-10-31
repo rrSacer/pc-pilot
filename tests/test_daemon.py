@@ -66,6 +66,24 @@ class DaemonCase(unittest.TestCase):
 
 
 class SessionTests(DaemonCase):
+    def test_session_theme_is_whitelisted_and_reported_to_ui(self):
+        self.device()
+        self.start()
+        ui, agent = self.ui_connect(), self.agent()
+        for value in ("claude", "codex", "gemini", "neutral", "surprise", 42, [], {}):
+            with self.subTest(theme=value):
+                mark = ui.mark()
+                self.begin_ok(agent, label="Test", theme=value)
+                state = ui.wait_state(True, since=mark)
+                expected = value if isinstance(value, str) and value in {"claude", "codex", "gemini", "neutral"} else "neutral"
+                self.assertEqual(state["theme"], expected)
+                self.assertEqual(state["label"], "Test")
+                self.end(agent)
+        mark = ui.mark()
+        self.begin_ok(agent)
+        self.assertEqual(ui.wait_state(True, since=mark)["theme"], "neutral")
+        self.end(agent)
+
     def test_failed_capture_warning_dedupes_until_reason_change_or_device_reappears(self):
         class Loop:
             def create_task(self, coro):
