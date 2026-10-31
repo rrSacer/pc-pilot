@@ -10,6 +10,9 @@ from pathlib import Path
 
 from PIL import Image
 from tests.temp_paths import socket_temp_base
+from tests.test_ext_support.theme_probe import (
+    THEME_NAMES, close, is_frame_pixel, rgb, rim_color, theme
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 # Polling ceilings: generous so a loaded machine does not flake; every wait returns as
@@ -199,16 +202,18 @@ class ExtensionHeadlessTests(unittest.TestCase):
         with Image.open(with_overlay["path"]) as opened:
             over = opened.convert("RGB")
             px = over.getpixel((1, 540))
-        self.assertTrue(all(abs(x-y) <= 10 for x, y in zip(px, (255, 69, 58))), px)
-        self.assertTrue(all(abs(x-y) <= 10 for x, y in zip(over.getpixel((7, 540)), (255, 69, 58))))
-        self.assertFalse(all(abs(x-y) <= 10 for x, y in zip(over.getpixel((8, 540)), (255, 69, 58))))
-        self.assertNotEqual(im.getpixel((1, 540)), px)
+        expected_rim = rim_color("neutral", 1, 540)
+        self.assertTrue(close(px, expected_rim, tol=14), px)
+        self.assertTrue(close(over.getpixel((1, 540)), rim_color("neutral", 1, 540), tol=14))
+        self.assertFalse(close(over.getpixel((6, 540)), rim_color("neutral", 6, 540), tol=14))
+        self.assertEqual(im.getpixel((1, 540)), px)
+        self.assertNotEqual(im.crop((700, 0, 1220, 90)).tobytes(), over.crop((700, 0, 1220, 90)).tobytes())
         region = self._shot({"region": {"x": 100, "y": 100, "width": 300, "height": 200}})
         with Image.open(region["path"]) as opened: self.assertEqual(opened.size, (300, 200))
         before_toast = self._raw("before-toast.png")
         a.call("fake.state", {"active": False, "reason": "user_hotkey"})
         raw = self._raw("toast.png")
-        self.assertFalse(all(abs(x-y) <= 10 for x, y in zip(raw.getpixel((1,540)), (255,69,58))))
+        self.assertFalse(is_frame_pixel(raw.getpixel((1, 540))))
         self.assertNotEqual(raw.crop((700, 0, 1220, 130)).tobytes(), before_toast.crop((700, 0, 1220, 130)).tobytes(), "toast should alter the top-centre crop")
         time.sleep(2.6)
         later = self._raw("after-toast.png")
@@ -307,30 +312,36 @@ class ExtensionHeadlessTests(unittest.TestCase):
         self.assertTrue(w["x"]+w["width"]*.55 <= anchor.get("x",-1) <= w["x"]+w["width"]*.65,anchor)
         self.assertTrue(w["y"]+w["height"]*.50 <= anchor.get("y",-1) <= w["y"]+w["height"]*.60,anchor)
 
+    @staticmethod
+    def _changed(a, b, box, tol=24):
+        """How many pixels of `box` differ between two RGB images by more than `tol`."""
+        return sum(1 for p, q in zip(a.crop(box).get_flattened_data(), b.crop(box).get_flattened_data())
+                   if max(abs(i - j) for i, j in zip(p, q)) > tol)
+
     def test_cursor_visibility_screenshots_and_trail_fade(self):
         a=self._begin();self.addCleanup(self._end_client,a)
         self._wait_test_state(lambda s:s["active"] and not s["real_cursor_visible"] and s.get("unfocus_inhibited"))
         x,y=200,300
         a.call("ui.pointer.move",{"x":x,"y":y,"style":"instant"})
         plain=self._shot(); decorated=self._shot(overlay=True)
-        def red_pixels(path,box):
-            with Image.open(path) as im: pixels=im.convert("RGB").crop(box).get_flattened_data()
-            return sum(1 for r,g,b in pixels if r>220 and 20<g<90 and 50<b<125)
-        box=(x-35,y-35,x+36,y+36)
-        self.assertEqual(red_pixels(plain["path"],box),0)
-        self.assertGreater(red_pixels(decorated["path"],box),0)
+        def rgb_of(shot):
+            with Image.open(shot["path"]) as opened: return opened.convert("RGB")
+        plain,decorated=rgb_of(plain),rgb_of(decorated)
+        # The AI arrow (themed, with its badge) is in the debug capture only.
+        box=(x-12,y-12,x+36,y+40)
+        self.assertGreater(self._changed(plain,decorated,box),60,"include_overlay shows the AI cursor")
         result={}
         def long_move():
             try: result["move"]=a.call("ui.pointer.move",{"x":1700,"y":800,"style":"human"},timeout=30)
             except Exception as e: result["error"]=e
         worker=threading.Thread(target=long_move,daemon=True);worker.start();time.sleep(.35)
-        mid=self._raw("trail-mid.png");worker.join(4);self.assertFalse(worker.is_alive());self.assertNotIn("error",result,str(result))
-        time.sleep(1);faded=self._raw("trail-faded.png")
-        # Exclude the cursor arrow at the destination; the remaining red marks are its trail.
-        away=(50,50,1620,1030)
-        mid_count=sum(1 for r,g,b in mid.crop(away).get_flattened_data() if r>220 and 20<g<90 and 50<b<125)
-        late_count=sum(1 for r,g,b in faded.crop(away).get_flattened_data() if r>220 and 20<g<90 and 50<b<125)
-        self.assertGreater(mid_count,0);self.assertEqual(late_count,0)
+        mid=self._raw("trail-mid.png");worker.join(6);self.assertFalse(worker.is_alive());self.assertNotIn("error",result,str(result))
+        time.sleep(1.5);faded=self._raw("trail-faded.png")
+        clean=rgb_of(self._shot())  # captures never contain the cursor, trail or ripple
+        # Everything but the pill (top) and the arrow resting at the destination.
+        away=(40,100,1560,1040)
+        self.assertGreater(self._changed(mid,clean,away),650,"the arrow and its trail are drawn during the move")
+        self.assertLess(self._changed(faded,clean,away),60,"the trail has faded ~1.5 s after the move")  # a text caret may blink
 
     def test_disable_releases_cursor_and_pointer_focus_inhibits(self):
         a=self._begin();a.close()
@@ -383,6 +394,9 @@ class ExtensionHeadlessTests(unittest.TestCase):
             a.call("ui.window.action",{"id":origin["id"],"action":"maximize","style":"instant"})
             a.call("ui.pointer.move",{"x":1700,"y":900,"style":"instant"})
             result=a.call("ui.session.wrapup",{"keep":[second["id"]]})
+            # Right after the wrapup the AI cursor is released and the real one is back; the next
+            # op in the same session would bring the overlay back, so look before asking more.
+            state=self._wait_test_state(lambda s:s["active"] and s["real_cursor_visible"] and not s["cursor_engaged"])
             self.assertIn(first["id"],[w["id"] for w in result["closed"]])
             kept=next(w for w in result["left_open"] if w["id"]==second["id"])
             self.assertEqual(kept["reason"],"kept")
@@ -392,7 +406,6 @@ class ExtensionHeadlessTests(unittest.TestCase):
                 (original["x"],original["y"],original["width"],original["height"]))
             self.assertEqual(result["focused"]["id"],origin["id"])
             pos=a.call("ui.pointer.position");self.assertLessEqual(abs(pos["x"]-start["x"]),2);self.assertLessEqual(abs(pos["y"]-start["y"]),2)
-            state=self._wait_test_state(lambda s:s["active"] and s["real_cursor_visible"] and not s["cursor_engaged"])
             again=a.call("ui.session.wrapup",{"keep":[second["id"]]})
             self.assertEqual(again["closed"],[]);self.assertEqual(again["restored"],[])
             # Exercise close_new=false on a new window while preserving the wrapup session.
@@ -646,9 +659,9 @@ class ExtensionHeadlessTests(unittest.TestCase):
         while time.monotonic()<deadline:
             lost = self._raw("daemon-loss.png")
             p = lost.getpixel((1,540))
-            if not all(abs(x-y)<=10 for x,y in zip(p,(255,69,58))): break
+            if not is_frame_pixel(p): break
             time.sleep(.1)
-        self.assertFalse(all(abs(x-y)<=10 for x,y in zip(lost.getpixel((1,540)),(255,69,58))))
+        self.assertFalse(is_frame_pixel(lost.getpixel((1,540))))
         self.assertNotEqual(lost.crop((700,0,1220,130)).tobytes(), before.crop((700,0,1220,130)).tobytes())
         self._start_daemon()
         waiter = self._agent()
@@ -672,7 +685,7 @@ class ExtensionHeadlessTests(unittest.TestCase):
         self.assertEqual((full["x"],full["y"],full["width"],full["height"]),(0,0,1920,1080))
         shot = self._shot(overlay=True)
         with Image.open(shot["path"]) as opened: edge = opened.convert("RGB").getpixel((1,540))
-        self.assertTrue(all(abs(x-y)<=10 for x,y in zip(edge,(255,69,58))), edge)
+        self.assertTrue(close(edge, rim_color("neutral", 1, 540), tol=14), edge)
         a.call("ui.window.action", {"id":wid,"action":"maximize"})
         w = next(w for w in a.call("ui.window.list")["windows"] if w["id"]==wid); self.assertEqual(w["width"],1920)
         for action in ("unmaximize", "minimize", "activate", "close"):
@@ -681,6 +694,206 @@ class ExtensionHeadlessTests(unittest.TestCase):
         self.assertEqual(cm.exception.code,"not_found")
         with self.assertRaises(ProtocolError) as cm: a.call("ui.app.launch", {"app":"org.no.such.App.desktop"})
         self.assertEqual(cm.exception.code,"not_found")
+
+    # ---- v2.1: themes, steady overlay, human timing, wrapup return + resume ----
+
+    PILL_BOX = (700, 0, 1220, 90)  # the capsule is centred on the primary monitor, under y=60
+
+    @staticmethod
+    def _rgba(css):
+        import re
+        m = re.fullmatch(r"rgba\((\d+),\s*(\d+),\s*(\d+),\s*([\d.]+)\)", css)
+        return tuple(int(x) for x in m.groups()[:3])
+
+    @staticmethod
+    def _count_near(img, colour, tol):
+        return sum(1 for p in img.get_flattened_data() if all(abs(a - b) <= tol for a, b in zip(p, colour)))
+
+    @classmethod
+    def _open_rgb(cls, shot):
+        with Image.open(shot["path"]) as opened:
+            return opened.convert("RGB")
+
+    def test_themes_render_distinct_frames_and_switch_cleanly(self):
+        a = self._agent(); self.addCleanup(self._end_client, a)
+        pills = {}
+        for name in THEME_NAMES:
+            a.call("session.end")
+            a.call("session.begin", {"label": "Tema", "theme": name})
+            self._wait_test_state(lambda s, n=name: s["active"] and s["theme"] == n and s["cursor_engaged"])
+            a.call("ui.status", {"text": "Verificando o tema"})
+            over = self._open_rgb(self._shot(overlay=True)); plain = self._open_rgb(self._shot())
+            for x, y in ((1, 540), (1918, 540), (960, 1), (960, 1078)):  # the 4 px line on every side
+                self.assertTrue(close(over.getpixel((x, y)), rim_color(name, x, y), 16),
+                                (name, x, y, over.getpixel((x, y)), rim_color(name, x, y)))
+            self.assertFalse(close(over.getpixel((8, 540)), rim_color(name, 8, 540), 10), "line is 4 px, then glow")
+            t = theme(name)
+            capsule = over.crop(self.PILL_BOX)
+            self.assertGreater(self._count_near(capsule, self._rgba(t["pill"]["bg"]), 12), 4000, name)
+            badge = [tuple(int(c[i:i + 2], 16) for i in (1, 3, 5)) for c in t["badge"]["bg"]]
+            self.assertGreater(sum(self._count_near(capsule, c, 45) for c in badge), 40, f"{name}: brand badge")
+            self.assertNotEqual(plain.crop(self.PILL_BOX).tobytes(), capsule.tobytes(), "captures omit the pill")
+            self.assertGreater(self._count_near(plain.crop((0, 0, 30, 1080)), rim_color(name, 1, 540), 20), 100,
+                               "captures keep the thin frame (it never flashes off)")
+            pills[name] = capsule.tobytes()
+        self.assertEqual(len(set(pills.values())), 4, "every theme looks different")
+        a.call("fake.state", {"active": True, "theme": "bogus"})
+        self._wait_test_state(lambda s: s["active"] and s["theme"] == "neutral")
+
+    def test_frame_is_symmetric_tinted_and_never_darkens(self):
+        a = self._agent(); self.addCleanup(self._end_client, a)
+        a.call("session.end")
+        a.call("session.begin", {"label": "Tema", "theme": "codex"})
+        layout = next(r for r in reversed(self._wait_probe(lambda rs: any(x.get("ev") == "layout" for x in rs)))
+                      if r.get("ev") == "layout")
+        win = next(w for w in a.call("ui.window.list")["windows"] if w["title"] == layout["title"])
+        a.call("ui.window.action", {"id": win["id"], "action": "activate"})
+        a.call("ui.window.action", {"id": win["id"], "action": "maximize"})
+        a.call("ui.pointer.move", {"x": 960, "y": 700, "style": "instant"})
+        self._wait_probe(lambda _: True, .5)
+        im = self._open_rgb(self._shot(overlay=True))
+        bg = im.getpixel((960, 800))
+        glow = rgb(theme("codex")["glow"])
+        channel = max(range(3), key=lambda c: abs(glow[c] - bg[c]))
+
+        def mean(points):
+            px = [im.getpixel(p) for p in points]
+            return tuple(sum(p[c] for p in px) / len(px) for c in range(3))
+
+        def alpha(p):  # how much of the glow tint is on top of the (uniform) background
+            return (p[channel] - bg[channel]) / (glow[channel] - bg[channel])
+
+        sides = {
+            "left": lambda k: mean([(k, y) for y in range(560, 1000, 8)]),
+            "right": lambda k: mean([(1919 - k, y) for y in range(560, 1000, 8)]),
+            "bottom": lambda k: mean([(x, 1079 - k) for x in range(500, 1400, 8)]),
+        }
+        for k in range(6, 23):
+            alphas = {s: alpha(f(k)) for s, f in sides.items()}
+            self.assertLess(max(alphas.values()) - min(alphas.values()), 0.05, (k, alphas))
+            for s, f in sides.items():  # tinted, never a dark smudge
+                self.assertGreaterEqual(sum(f(k)) / 3, sum(bg) / 3 * 0.9, (s, k, f(k), bg))
+        self.assertGreater(alpha(sides["left"](6)), 0.08, "the glow is visible next to the line")
+        self.assertLess(abs(alpha(sides["left"](30))), 0.03, "and gone by 30 px")
+
+    def test_no_overlay_flicker_while_idle_and_capturing(self):
+        a = self._agent(); self.addCleanup(self._end_client, a)
+        a.call("session.end")
+        a.call("session.begin", {"label": "Tema", "theme": "codex"})
+        self._wait_test_state(lambda s: s["active"] and s["cursor_engaged"])
+        a.call("ui.pointer.move", {"x": 900, "y": 600, "style": "instant"})
+        a.call("ui.status", {"text": "Parado"})
+        time.sleep(1.2)  # the trail is gone; nothing animates from here on
+        boxes = [(0, 480, 40, 600), (1880, 480, 1920, 600), (880, 1040, 1040, 1080), (0, 0, 40, 40),
+                 self.PILL_BOX]
+        errors = []
+
+        def capture_ops():
+            c = self._agent()
+            try:
+                for _ in range(6):
+                    c.call("ui.screenshot", {}); time.sleep(.15)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+            finally:
+                c.close()
+
+        worker = threading.Thread(target=capture_ops, daemon=True); worker.start()
+        samples = []
+        for _ in range(10):
+            shot = self._raw("flicker.png")
+            samples.append([shot.crop(b).tobytes() for b in boxes])
+            time.sleep(.1)
+        worker.join(15)
+        self.assertFalse(worker.is_alive()); self.assertEqual(errors, [])
+        for i, box in enumerate(boxes):  # the old pulse changed the glow every ~1.4 s
+            self.assertEqual(len({s[i] for s in samples}), 1, f"region {box} changed while idle/capturing")
+        a.call("session.end")
+        time.sleep(2.8)
+        gone = self._raw("flicker-after.png")
+        self.assertNotEqual(gone.crop(self.PILL_BOX).tobytes(), samples[0][-1], "the pill really was on screen")
+
+    def test_human_timing_budget(self):
+        a = self._begin(); self.addCleanup(self._end_client, a)
+        layout = next(r for r in reversed(self._wait_probe(lambda rs: any(x.get("ev") == "layout" for x in rs)))
+                      if r.get("ev") == "layout")
+        win = next(w for w in a.call("ui.window.list")["windows"] if w["title"] == layout["title"])
+        a.call("ui.window.action", {"id": win["id"], "action": "activate"})
+
+        def timed(op, args):
+            start = time.monotonic(); a.call(op, args, timeout=30); return time.monotonic() - start
+
+        def jump(x, y):
+            a.call("ui.pointer.move", {"x": x, "y": y, "style": "instant"}); time.sleep(.15)
+
+        jump(100, 100)
+        long_move = timed("ui.pointer.move", {"x": 1500, "y": 800})
+        self.assertTrue(1.3 <= long_move <= 3.4, long_move)  # ~1.7 km/s peak, slow homing
+        jump(300, 300)
+        short_move = timed("ui.pointer.move", {"x": 380, "y": 360})
+        self.assertTrue(.45 <= short_move <= 1.4, short_move)
+        jump(100, 100)
+        fast = timed("ui.pointer.move", {"x": 1500, "y": 800, "style": "fast"})
+        self.assertTrue(.08 <= fast <= .5, fast)
+        jump(100, 100)
+        self.assertLess(timed("ui.pointer.move", {"x": 1500, "y": 800, "style": "instant"}), .15)
+        hover = timed("ui.pointer.click", {})  # at the current position: hover, then press
+        self.assertTrue(.15 <= hover <= .9, hover)
+        jump(100, 100)
+        far_click = timed("ui.pointer.click", {"x": 1700, "y": 900})
+        self.assertTrue(1.6 <= far_click <= 6, far_click)  # glide + hover + press
+        area = layout["widgets"]["area"]
+        x, y = win["x"] + area[0] + 40, win["y"] + area[1] + 40
+        jump(x, y)
+        drag = timed("ui.pointer.drag", {"from": {"x": x, "y": y}, "to": {"x": x + 300, "y": y + 20}})
+        self.assertTrue(.9 <= drag <= 5, drag)
+
+    def test_wrapup_returns_to_origin_fades_and_resumes(self):
+        a = self._agent(); self.addCleanup(self._end_client, a)
+        layout = next(r for r in reversed(self._wait_probe(lambda rs: any(x.get("ev") == "layout" for x in rs)))
+                      if r.get("ev") == "layout")
+        a.call("session.end")
+        a.call("session.begin", {"label": "Claude", "theme": "claude"})  # make the probe the user's window
+        probe = next(w for w in a.call("ui.window.list")["windows"] if w["title"] == layout["title"])
+        a.call("ui.window.action", {"id": probe["id"], "action": "activate"})
+        a.call("session.end")
+        a.call("session.begin", {"label": "Claude", "theme": "claude"})  # snapshot: probe focused, pointer here
+        self._wait_test_state(lambda s: s["active"] and s["theme"] == "claude" and s["cursor_engaged"])
+        home = a.call("ui.pointer.position")
+        launched = a.call("ui.app.launch", {"app": "pcpilot-wrapup.desktop", "wait_ms": LAUNCH_WAIT_MS})
+        calc = launched["window"]["id"]
+        a.call("ui.pointer.move", {"x": 1650, "y": 250})
+        start = time.monotonic()
+        result = a.call("ui.session.wrapup", {"keep": [], "close_new": False, "return_to": "origin"}, timeout=30)
+        took = time.monotonic() - start
+        # Nothing else may run before these two looks: any other op re-engages the overlay.
+        state = self._test_state()
+        faded = self._raw("wrapup-faded.png")
+        self.assertLess(took, 8.5)
+        self.assertEqual(result["focused"]["id"], probe["id"])
+        self.assertEqual(result["closed"], [])
+        self.assertIn((calc, "close_new=false"), [(w["id"], w["reason"]) for w in result["left_open"]])
+        self.assertTrue(state["active"]); self.assertFalse(state["cursor_engaged"])
+        self.assertTrue(state["real_cursor_visible"])
+        pill_bg = self._rgba(theme("claude")["pill"]["bg"])
+        self.assertLess(self._count_near(faded.crop(self.PILL_BOX), pill_bg, 12), 300, "the pill faded out")
+        self.assertFalse(close(faded.getpixel((1, 540)), rim_color("claude", 1, 540), 16), "and so did the frame")
+        # The next op shows everything again (no op runs behind an invisible safety signal).
+        pos = a.call("ui.pointer.position")
+        self.assertLessEqual(abs(pos["x"] - home["x"]), 3); self.assertLessEqual(abs(pos["y"] - home["y"]), 3)
+        self.assertTrue(next(w for w in a.call("ui.window.list")["windows"] if w["id"] == probe["id"])["focused"])
+        self._wait_test_state(lambda s: s["cursor_engaged"] and not s["real_cursor_visible"])
+        a.call("ui.window.action", {"id": calc, "action": "close"})
+        # Idle release + resume: session.end, then a new session with another theme.
+        a.call("session.end", {"reason": "agent_request"})
+        self._wait_test_state(lambda s: not s["active"] and s["real_cursor_visible"])
+        a.call("session.begin", {"label": "Gemini", "theme": "gemini"})
+        state = self._wait_test_state(lambda s: s["active"] and s["theme"] == "gemini" and s["cursor_engaged"])
+        self.assertFalse(state["real_cursor_visible"])
+        back = self._raw("wrapup-resumed.png")
+        self.assertGreater(self._count_near(back.crop(self.PILL_BOX), self._rgba(theme("gemini")["pill"]["bg"]), 12), 4000)
+        self.assertTrue(close(back.getpixel((1, 540)), rim_color("gemini", 1, 540), 16))
+        self.assertTrue(all(not w["new"] for w in a.call("ui.window.list")["windows"]), "fresh snapshot")
 
 
 @unittest.skipUnless(available(), "requires root, gnome-shell, and uid 1000 sacer")
