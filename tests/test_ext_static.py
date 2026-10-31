@@ -63,9 +63,9 @@ class ExtensionStaticTests(unittest.TestCase):
 
 class FakeDaemonThemeContractTests(unittest.TestCase):
     def test_fake_daemon_theme_contract(self):
-        td = tempfile.mkdtemp(prefix="fake-theme-", dir=socket_temp_base())
-        sock_path = os.path.join(td, "daemon.sock")
-        self.addCleanup(lambda: os.path.exists(td) and os.system(f"rm -rf {td}"))
+        tmp = tempfile.TemporaryDirectory(prefix="fake-theme-", dir=socket_temp_base())
+        self.addCleanup(tmp.cleanup)
+        sock_path = os.path.join(tmp.name, "daemon.sock")
 
         loop = asyncio.new_event_loop()
         daemon = FakeDaemon(sock_path)
@@ -77,7 +77,22 @@ class FakeDaemonThemeContractTests(unittest.TestCase):
 
         t = threading.Thread(target=run_loop, daemon=True)
         t.start()
-        self.addCleanup(lambda: (loop.call_soon_threadsafe(loop.stop), t.join(timeout=2)))
+
+        async def shutdown():
+            await asyncio.sleep(0.2)  # let the closed clients' handlers see EOF and finish
+            await daemon.close()
+            others = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+            for task in others:
+                task.cancel()
+            await asyncio.gather(*others, return_exceptions=True)
+
+        def stop_loop():
+            asyncio.run_coroutine_threadsafe(shutdown(), loop).result(5)
+            loop.call_soon_threadsafe(loop.stop)
+            t.join(timeout=5)
+            loop.close()
+
+        self.addCleanup(stop_loop)  # runs after the client sockets below are closed
 
         # Wait for socket to be created
         for _ in range(50):
