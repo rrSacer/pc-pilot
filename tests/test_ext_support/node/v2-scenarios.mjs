@@ -6,11 +6,31 @@ import Clutter from 'gi://Clutter';
 import {Ops} from '../../../extension/pcpilot@local/ops.js';
 import {Token} from '../../../extension/pcpilot@local/input.js';
 import {clampToMonitors,onMonitor} from '../../../extension/pcpilot@local/windows.js';
-import {planPath,typingCadence} from '../../../extension/pcpilot@local/path.js';
+import {planPath,typingCadence,scrollCadence,fittsDuration,HUMAN_SPEED_MULTIPLIER,MAX_GLIDE_MS} from '../../../extension/pcpilot@local/path.js';
+import {themeFor,THEMES,DEFAULT_THEME} from '../../../extension/pcpilot@local/theme.js';
+import {FRAME} from '../../../extension/pcpilot@local/paint.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import {seatUnfocus} from './scenarios.mjs';
+import {seatUnfocus,cursorTracker} from './scenarios.mjs';
+import {recordOpacity} from './v21-scenarios.mjs';
+import {Overlay} from '../../../extension/pcpilot@local/overlay.js';
 
 export async function runV2Scenarios() {
+ // Themes are a pure lookup with a neutral fallback; the edge remains 4px with a
+ // 20px tinted glow, so visual regressions do not depend on screenshots/timing.
+ assert.deepEqual(themeFor('claude'),{id:'claude',...THEMES.claude});
+ assert.equal(themeFor('CODEX').id,'codex');
+ assert.equal(themeFor('gemini').id,'gemini');
+ for(const bad of [undefined,null,7,'','unknown','constructor','__proto__'])
+  assert.equal(themeFor(bad).id,DEFAULT_THEME);
+ assert.equal(FRAME.line,4);assert.equal(FRAME.glow,20);
+ assert.ok(THEMES.claude.glow && THEMES.codex.glow && THEMES.gemini.glow && THEMES.neutral.glow);
+ assert.equal(HUMAN_SPEED_MULTIPLIER,1);assert.equal(MAX_GLIDE_MS,3200);
+ for(const [distance,lo,hi] of [[50,500,900],[150,500,900],[800,1400,2400],[1300,1400,2400]]) {
+  const ms=fittsDuration(distance,()=>0.5);assert.ok(ms>=lo&&ms<=hi,`distance=${distance}, duration=${ms}`);
+ }
+ const cadence=scrollCadence(100,'human',()=>0.5);
+ assert.ok(cadence.every(n=>n>0));assert.ok(cadence.reduce((a,b)=>a+b,0)<18000);
+ assert.ok(new Set(cadence).size>1,'human scroll cadence should vary');
  let wins=[],createdCb=null,winEvents=[],nextSignal=1,pointer=[100,100],nowOffset=0,workspace=0;
  const display={focus_window:null,sort_windows_by_stacking:a=>a,
   connect(_sig,cb){createdCb=cb;return nextSignal++},disconnect(){createdCb=null}};
@@ -58,6 +78,89 @@ export async function runV2Scenarios() {
   return `${pid} (${comm}) ${fields.join(' ')}`;
  };
  const runSteps=async(ops,args={})=>{const result={closed:[],restored:[],left_open:[],focused:null};await ops._wrapupSteps(new Set((args.keep??[]).map(Number)),args.close_new!==false,args.return_to??'origin',new Token(),result);return result};
+
+ // Human motion samples have changing, asymmetric speed; stable styles remain stable.
+ {
+  const a=[100,100],b=[1050,700],p=planPath(a,b,'human',{rand:()=>0.73});
+  assert.deepEqual(p.at(0),a);assert.deepEqual(p.at(p.duration),b);
+  const moved=t=>{const q=p.at(t);return Math.hypot(q[0]-a[0],q[1]-a[1])};
+  const early=moved(p.duration*0.25),middle=moved(p.duration*0.5),late=moved(p.duration*0.75);
+  assert.ok(Math.abs((middle-early)-(late-middle))>0.1,'human velocity should be asymmetric');
+  const fast1=planPath(a,b,'fast'),fast2=planPath(a,b,'fast');
+  assert.equal(fast1.duration,fast2.duration);assert.deepEqual(fast1.at(fast1.duration),fast2.at(fast2.duration));
+  const instant=planPath(a,b,'instant');assert.equal(instant.duration,0);assert.deepEqual(instant.at(0),b);
+  const drag=planPath(a,b,'human',{drag:true,rand:()=>0.73});
+  assert.ok(drag.duration<=MAX_GLIDE_MS);assert.deepEqual(drag.at(drag.duration),b);
+  assert.ok(drag.duration/p.duration>1.27&&drag.duration/p.duration<1.29);
+  assert.ok(p.duration>=1400&&p.duration<=2400,`long human move duration=${p.duration}`);
+  const short=planPath(a,[a[0]+100,a[1]],'human',{rand:()=>0.73});
+  assert.ok(short.duration>=500&&short.duration<=900,`short human move duration=${short.duration}`);
+ }
+
+ // Wrapup returns focus and pointer to the snapshot home, remains safe to repeat,
+ // and uses a fresh home after a new snapshot.
+ {
+  const origin=created(70,{x:0,y:0,width:500,height:400,focused:true,appId:'org.traycer.App'});
+  const {ops}=createSession([origin]);pointer=[250,200];ops.session.snapshot();
+  pointer=[900,700];display.focus_window=null;
+  const first=await ops._wrapup({},new Token());
+  assert.equal(first.focused?.id,70);assert.deepEqual(pointer,[250,200]);assert.equal(display.focus_window,origin);
+  const second=await ops._wrapup({},new Token());
+  assert.equal(second.focused?.id,70);assert.deepEqual(pointer,[250,200]);
+  pointer=[300,250];ops.session.clear();ops.session.snapshot();pointer=[800,600];
+  const third=await ops._wrapup({},new Token());assert.deepEqual(pointer,[300,250]);assert.equal(third.focused?.id,70);
+ }
+
+ // Wrapup with the real overlay: it fades, a repeat is silent, the next op brings the overlay
+ // back (no op runs behind an invisible safety signal), and the idle-release shape
+ // (close_new:false, return_to:'origin') leaves AI windows open and ends in a fresh session.
+ {
+  let paintCb=null;const stage=global.stage,savedConnect=stage.connect,savedQueue=stage.queue_redraw;
+  stage.connect=(_sig,cb)=>{paintCb=cb;return 1};stage.queue_redraw=()=>queueMicrotask(()=>paintCb?.());
+  setTimeoutScale(1);
+  try{
+   const origin=created(80,{x:0,y:0,width:500,height:400,focused:true,appId:'org.traycer.App'});
+   const {ops}=createSession([origin]);pointer=[250,200];ops.session.snapshot();
+   const overlay=new Overlay();ops._overlay=overlay;delete ops._glideTo; // the real human glide home
+   const inhibitsBefore=cursorTracker.inhibits;
+   assert.equal(await overlay.show('Claude','Ctrl+Alt+Esc','claude'),true);
+   assert.equal(cursorTracker.inhibits,inhibitsBefore+1);
+   const aiWindow=created(81,{x:600,y:100,width:300,height:300,appId:'org.example.Notes',pid:8100});
+   add(aiWindow);ops.session.author(aiWindow);pointer=[900,700];display.focus_window=aiWindow;
+   const actors=()=>[overlay._pillBox,overlay._cursorLayer,...overlay._frames.map(f=>f.frame)];
+   const idleArgs={keep:[],close_new:false,return_to:'origin'};
+
+   const first=await ops.run('session.wrapup',idleArgs,new Token());
+   assert.deepEqual(first.closed,[]);assert.equal(first.focused?.id,80);assert.deepEqual(pointer,[250,200]);
+   assert.deepEqual(first.left_open.map(w=>[w.id,w.reason]),[[81,'close_new=false']]);
+   assert.equal(wins.includes(aiWindow),true,'the AI window stays open under close_new:false');
+   assert.equal(overlay._finished,true,'overlay faded out by the wrapup');
+   assert.ok(actors().every(a=>a.opacity===0));
+   assert.equal(cursorTracker.inhibits,inhibitsBefore,'real cursor back after the fade');
+
+   // A repeated wrapup (pointer already home) neither re-shows nor re-fades the overlay.
+   const quiet=recordOpacity(actors());
+   const second=await ops.run('session.wrapup',idleArgs,new Token());
+   assert.equal(second.focused?.id,80);assert.deepEqual(quiet.writes,[],'a repeated wrapup does not flash the overlay');
+   assert.equal(overlay._finished,true);assert.equal(cursorTracker.inhibits,inhibitsBefore);
+
+   // Any other op in the same session brings frame, pill and AI cursor back first.
+   await ops.run('window.list',{},new Token());
+   assert.equal(overlay._finished,false);assert.ok(actors().every(a=>a.opacity===255));
+   assert.ok(overlay._frames.every(f=>f.frame.visible));assert.equal(overlay._pillBox.visible,true);
+   assert.equal(overlay.cursor.engaged,true);assert.equal(cursorTracker.inhibits,inhibitsBefore+1);
+
+   // Idle release ends the session, the next tool call begins a fresh one with its own theme.
+   overlay.hide('Controle devolvido a você — a IA terminou');ops.session.clear();
+   assert.equal(cursorTracker.inhibits,inhibitsBefore);
+   pointer=[300,250];ops.session.snapshot();
+   assert.equal(await overlay.show('Gemini','Ctrl+Alt+Esc','gemini'),true);
+   assert.equal(overlay.themeId,'gemini');assert.equal(overlay.active,true);
+   assert.ok(actors().every(a=>a.opacity===255));assert.equal(overlay._toast.visible,false);
+   assert.equal(ops.session.taken,true);assert.equal(ops.session.isNew(aiWindow),false,'the kept window is part of the new baseline');
+   overlay.destroy();assert.equal(cursorTracker.inhibits,inhibitsBefore);
+  }finally{stage.connect=savedConnect;stage.queue_redraw=savedQueue;setTimeoutScale(0.1)}
+ }
 
  // The pid callback must read the spawned child's identity before a reused pid
  // can appear, and every callback path must install a watcher that reaps it.
@@ -428,5 +531,5 @@ export async function runV2Scenarios() {
   assert.ok(deviation(planPath(a,b,'fast'))<1e-8);
   assert.ok(deviation(planPath(a,b,'human',{rand:()=>0.75}))>1);
  }
- return ['r1-authorship','rr-spawned-pid-ancestry','rr-cancelled-launches','r2-transient-families','r3-idempotent-refusal','r4-journal-conflicts','r5-drag-hold','r6-cadence-budget','monitor-clamp','r7-real-wrapup-aborts','r7-real-cap','path-perpendicular','spawn-reserved-pid-reaped'];
+ return ['theme-lookup-frame','path-v21-timing','path-v21-velocity','wrapup-return-home','wrapup-fade-resume','r1-authorship','rr-spawned-pid-ancestry','rr-cancelled-launches','r2-transient-families','r3-idempotent-refusal','r4-journal-conflicts','r5-drag-hold','r6-cadence-budget','monitor-clamp','r7-real-wrapup-aborts','r7-real-cap','path-perpendicular','spawn-reserved-pid-reaped'];
 }

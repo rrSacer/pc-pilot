@@ -7,9 +7,11 @@ import {clipboard} from 'gi://St';
 import Shell from 'gi://Shell';
 import {Gio} from 'gi://Gio';
 import {planPath, fittsDuration, typingCadence} from '../../../extension/pcpilot@local/path.js';
+import {themeFor} from '../../../extension/pcpilot@local/theme.js';
 import {glide} from '../../../extension/pcpilot@local/motion.js';
 import Clutter, {timelines} from 'gi://Clutter';
 import {runV2Scenarios} from './v2-scenarios.mjs';
+import {runV21Scenarios} from './v21-scenarios.mjs';
 
 let afterPaint = null;
 const virtualEvents=[];
@@ -31,7 +33,7 @@ const rand=()=>0.75;
 const from=[100,100],to=[1400,800];
 const human=planPath(from,to,'human',{rand});
 assert.deepEqual(human.at(0),from); assert.deepEqual(human.at(human.duration),to);
-assert.ok(human.duration>=180 && human.duration<=900);
+assert.ok(human.duration>=1400 && human.duration<=2400);
 const fast=planPath(from,to,'fast',{rand}); assert.ok(fast.duration>=100&&fast.duration<=180);
 const spatialDeviation=path=>Math.max(...Array.from({length:99},(_,i)=>{
  const [x,y]=path.at(path.duration*(i+1)/100);
@@ -39,7 +41,8 @@ const spatialDeviation=path=>Math.max(...Array.from({length:99},(_,i)=>{
 }));
 assert.ok(spatialDeviation(fast)<1e-8);assert.ok(spatialDeviation(human)>1);
 assert.equal(planPath(from,to,'instant').duration,0);
-assert.ok(fittsDuration(500,rand)>=180&&fittsDuration(500,rand)<=900);
+assert.ok(fittsDuration(100,rand)>=500&&fittsDuration(100,rand)<=900);
+assert.ok(fittsDuration(1000,rand)>=1400&&fittsDuration(1000,rand)<=2400);
 assert.ok(typingCadence([...('a '.repeat(100))],4000,rand).reduce((a,b)=>a+b,0)<=4000);
 
 // A cancelled glide stops its compositor timeline and emits no later pointer moves.
@@ -59,6 +62,20 @@ async function liveExtension(session=1){
  await e._setActive({active:true,session},session);
  assert.equal(e._active,true);assert.equal(e._overlay.cursor.engaged,true);
  return e;
+}
+
+// State theme changes reach the whole overlay, including the cursor and its trail.
+{
+ const e=new PCPilotExtension();e.enable();e._client.stop();e._client={epoch:50,send(){},stop(){}};
+ e._overlay._waitPainted=async()=>true;
+ for(const [i,name] of ['claude','codex','gemini','neutral','unknown'].entries()){
+  await e._setActive({active:true,session:i+1,theme:name},50);
+  const expected=themeFor(name).id;
+  assert.equal(e._overlay.themeId,expected);
+  assert.equal(e._overlay.cursor._theme.id,expected);
+  e._setInactive(null);
+ }
+ e.disable();
 }
 function assertCursorReleased(e){
  const c=e._overlay.cursor;assert.equal(cursorTracker.inhibits,0);assert.equal(cursorTracker.get_pointer_visible(),true);
@@ -85,7 +102,7 @@ for(const reason of endReasons){
  await new Promise(r=>setTimeout(r,35));assert.equal(motion.count(),before);
  await motion.work; e.disable();
 }
-const safetyChecks=['cursor-inactive-reasons','cursor-connection-loss','cursor-disable','cursor-cleanup-exception','cursor-overlay-failures'];
+const safetyChecks=['theme-state-cursor','cursor-inactive-reasons','cursor-connection-loss','cursor-disable','cursor-cleanup-exception','cursor-overlay-failures'];
 
 // Connection loss and explicit disable share the same synchronous cursor-first cleanup.
 {
@@ -144,7 +161,7 @@ const safetyChecks=['cursor-inactive-reasons','cursor-connection-loss','cursor-d
  assert.equal(e._overlay.cursor.engaged,false);assert.equal(seatUnfocus.n,0);e._setInactive('user_hotkey');e.disable();
 }
 
-safetyChecks.push('balanced-cursor-inhibit','trail-idle','wrapup-cap');
+safetyChecks.push('balanced-cursor-inhibit','trail-idle','wrapup-cap','screenshot-frame-only');
 
 // A real paint is the only success path; a timeout from a stage that never paints fails closed.
 const overlay = new Overlay();
@@ -161,15 +178,26 @@ ops._typeableSet=()=>({layout:'us',extra:'',unsafe:''});
 const token=new Token();
 await assert.rejects(ops._keyType({text:'y'.repeat(20),delay_ms:1000},token),e=>e.code==='bad_args' && /take/.test(e.message));
 
-// A screenshot cancelled during waitPaint must neither call the compositor nor keep its file.
-const shotToken=new Token(); let finishPaint;
-ops._shotDir=async()=>'/tmp/unit';
-ops._overlay={waitPaint:()=>new Promise(r=>{finishPaint=r}),withHidden:fn=>fn()};
-const callsBefore=Shell.Screenshot.calls;
+// Capture hides only the pill/cursor synchronously; frames stay visible on screen.
+// Cancellation during capture still deletes the incomplete screenshot.
+const captureOverlay=new Overlay();
+global.stage.queue_redraw=()=>{queueMicrotask(()=>afterPaint?.())};
+assert.equal(await captureOverlay.show('test','hotkey','codex'),true);
+ops._shotDir=async()=>'/tmp/unit';ops._overlay=captureOverlay;
+const shotToken=new Token(),callsBefore=Shell.Screenshot.calls;
+const originalScreenshot=Shell.Screenshot.prototype.screenshot;
+Shell.Screenshot.prototype.screenshot=async function(...args){
+ assert.ok(captureOverlay._frames.every(f=>f.frame.visible),'capture must leave the safety frame visible');
+ assert.equal(captureOverlay._pillBox.visible,false,'capture must hide the identifying pill');
+ assert.equal(captureOverlay._cursorLayer.visible,false,'capture must hide the AI cursor and trail');
+ shotToken.cancel();return originalScreenshot.call(this,...args);
+};
 const shot=ops._screenshot({},shotToken).catch(e=>e.code);
-await new Promise(r=>setTimeout(r,20)); shotToken.cancel(); finishPaint();
-assert.equal(await shot,'inactive'); assert.equal(Shell.Screenshot.calls,callsBefore);
+assert.equal(await shot,'inactive');assert.equal(Shell.Screenshot.calls,callsBefore+1);
+assert.ok(captureOverlay._frames.every(f=>f.frame.visible));
+assert.equal(captureOverlay._pillBox.visible,true);assert.equal(captureOverlay._cursorLayer.visible,true);
 assert.equal(Gio.File.records.at(-1).deleted,true);
+Shell.Screenshot.prototype.screenshot=originalScreenshot;captureOverlay.destroy();
 
 // Clipboard read pending at cancellation must not allow the later clipboard write.
 clipboard.writes.length=0; clipboard.slow=true;
@@ -279,5 +307,5 @@ await new Promise(r=>setTimeout(r,10));
 assert.equal(sessRan,1); assert.equal(sw.find(m=>m.id===1).error.code,'inactive'); assert.equal(sw.find(m=>m.id===2).ok,true);
 sess.disable();
 
-const v2Checks=await runV2Scenarios();
+const v2Checks=[...await runV2Scenarios(),...await runV21Scenarios()];
 console.log(JSON.stringify({ok:true,checks:['op-session','paint-timeout','screenshot-cancel','typing-estimate','paste-cancel','clipboard-ownership','timeout-queue','timeout-fail-closed','stale-generation','overlay-exception','session-ack','session-ping-pong',...pathChecks,...safetyChecks,...v2Checks],bugs:pasteCancelBug?[pasteCancelBug]:[]}));
