@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from PIL import Image
+from tests.temp_paths import socket_temp_base
 
 ROOT = Path(__file__).resolve().parents[1]
 # Polling ceilings: generous so a loaded machine does not flake; every wait returns as
@@ -29,7 +30,7 @@ def available():
 class ExtensionHeadlessTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.TemporaryDirectory(prefix="pcpilot-ext-test-")
+        cls.tmp = tempfile.TemporaryDirectory(prefix="pcp-x-", dir=socket_temp_base())
         cls.dir = Path(cls.tmp.name)
         cls.socket = cls.dir / "pcpilot.sock"
         cls.shell_log = open(cls.dir / "shell.log", "w+")
@@ -701,7 +702,7 @@ class FreshHotCornerRegression(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.tmp=tempfile.TemporaryDirectory(prefix="pcpilot-ext-fresh-")
+        cls.tmp=tempfile.TemporaryDirectory(prefix="pcp-f-", dir=socket_temp_base())
         cls.dir=Path(cls.tmp.name); cls.socket=cls.dir/"pcpilot.sock"
         cls.desktop=cls.dir/"data/applications/pcpilot-fresh.desktop"
         cls.desktop.parent.mkdir(parents=True)

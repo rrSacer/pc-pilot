@@ -24,6 +24,7 @@ from pathlib import Path
 from PIL import Image
 from pcpilot import evdev
 from tests.daemon_testlib import AgentClient, DaemonProcess, FakeDevice, wait_until
+from tests.temp_paths import socket_temp_base
 
 ROOT = Path(__file__).resolve().parents[1]
 SHELL = ROOT / "dev/headless-shell.sh"
@@ -112,7 +113,7 @@ class MCPClient:
 class RealStackTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.TemporaryDirectory(prefix="pcpilot-e2e-")
+        cls.tmp = tempfile.TemporaryDirectory(prefix="pcp-e-", dir=socket_temp_base())
         cls.dir = Path(cls.tmp.name)
         cls.addClassCleanup(cls.tmp.cleanup)
         cls.reports = {}

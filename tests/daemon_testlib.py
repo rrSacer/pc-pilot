@@ -32,6 +32,7 @@ import time
 
 from pcpilot import evdev
 from pcpilot import protocol as P
+from tests.temp_paths import socket_temp_base
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST_PREFIX = "pcpilot-test-"
@@ -256,7 +257,7 @@ class DaemonProcess:
         ``pcpilot.daemon.main`` (fault injection: monkeypatching)."""
         self.preamble = preamble
         self._own_dir = workdir is None
-        self.dir = workdir or tempfile.mkdtemp(prefix="pcpilotd-test-")
+        self.dir = workdir or tempfile.mkdtemp(prefix="pcp-d-", dir=socket_temp_base())
         os.chmod(self.dir, 0o755)  # so the setuid "intruder" client can reach the socket
         self.socket = os.path.join(self.dir, "pcpilot.sock")
         self.config_path = os.path.join(self.dir, "config.json")

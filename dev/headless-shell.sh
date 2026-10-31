@@ -63,7 +63,8 @@ load_env_cmd() {
 cmd_start() {
     local dir="${1:-}"
     if [[ -z "$dir" ]]; then
-        dir="$(mktemp -d /tmp/pcpilot-headless.XXXXXX)"
+        dir="$(python3 "$REPO/tests/temp_paths.py")"
+        touch "$dir/.pcpilot-auto-temp"
     else
         mkdir -p "$dir"
     fi
@@ -152,7 +153,7 @@ EOF
     local -a pre=()
     while IFS= read -r -d '' x; do pre+=("$x"); done < <(user_prefix)
     cd /
-    "${pre[@]}" setsid env -i "${envv[@]}" dbus-run-session -- "$dir/inner.sh" \
+    "${pre[@]}" setsid env -i "${envv[@]}" dbus-run-session -- /bin/bash "$dir/inner.sh" \
         >"$dir/shell.log" 2>&1 </dev/null &
     echo $! >"$dir/shell.pid"
     cd - >/dev/null
@@ -221,6 +222,9 @@ cmd_stop() {
         fusermount3 -uz "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
     done
     rm -f "$dir/shell.pid"
+    if [[ -f "$dir/.pcpilot-auto-temp" ]]; then
+        rm -rf -- "$dir"
+    fi
 }
 
 cmd_status() {
