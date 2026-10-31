@@ -1,10 +1,10 @@
 # PCPilot
 
-PCPilot permite que um agente de IA controle o desktop GNOME com mouse e teclado durante uma sessão visível. O daemon captura a entrada física enquanto a IA trabalha; a extensão mostra uma borda vermelha e um aviso com o nome do agente. **Ctrl+Alt+Esc** encerra a sessão na hora e devolve o controle.
+PCPilot permite que um agente de IA controle o desktop GNOME com mouse e teclado durante uma sessão visível. O daemon captura a entrada física enquanto a IA trabalha; a extensão mostra uma borda fina e um aviso com o nome do agente, no visual de cada IA: Claude em coral, Codex em azul-violeta, Gemini em azul e rosa, e as outras em cinza-azulado. **Ctrl+Alt+Esc** encerra a sessão na hora e devolve o controle.
 
 ## Uso
 
-Depois de instalar, **saia da sessão GNOME e entre novamente uma vez** para carregar a extensão. Então peça ao Claude, por exemplo: **“Abra o Firefox e pesquise por previsão do tempo em São Paulo.”** O agente inicia a sessão quando precisar interagir. A borda vermelha e o aviso permanecem visíveis enquanto ele controla o computador. O Gemini também fica configurado pelo instalador para uso quando estiver instalado.
+Depois de instalar, **saia da sessão GNOME e entre novamente uma vez** para carregar a extensão. Então peça ao Claude, por exemplo: **“Abra o Firefox e pesquise por previsão do tempo em São Paulo.”** O agente inicia a sessão quando precisar interagir. A borda colorida e o aviso permanecem visíveis enquanto ele controla o computador. O Gemini também fica configurado pelo instalador para uso quando estiver instalado.
 
 Uma sessão termina quando o agente conclui, quando você usa Ctrl+Alt+Esc, após **2 minutos sem atividade do agente** ou ao atingir **30 minutos**. Para encerrar por outro terminal ou por SSH:
 
