@@ -97,6 +97,11 @@ export function planPath(from, to, style, opts = {}) {
     const amp = Math.min(opts.drag ? 0.3 : 0.65, dist * 0.0015);
     const cycles = 1.5 + rand() * 1.8;
     const phase = rand() * Math.PI * 2;
+    // Physiological hand tremor: ~9 Hz, a fraction of a pixel (it only shows when it
+    // carries the integer pointer position across a pixel boundary).
+    const tremorAmp = Math.min(opts.drag ? 0.2 : 0.4, dist * 0.001);
+    const tremorCycles = (8 + rand() * 3) * total / 1000;
+    const tremorPhase = rand() * Math.PI * 2;
     const correction = dist > 140 && rand() < 0.65 ? (rand() - 0.5) * Math.min(12, dist * 0.018) : 0;
     const correctionAt = 0.38 + rand() * 0.22;
     const hesitation = opts.drag ? 0.03 + rand() * 0.035 : 0;
@@ -112,6 +117,7 @@ export function planPath(from, to, style, opts = {}) {
         const [x, y] = bezier(from, p1, p2, aim, minJerk(tp / tb));
         const c = minJerk((t - t0) / (1 - t0));
         const w = amp * Math.sin(2 * Math.PI * cycles * t + phase) * Math.sin(Math.PI * t) +
+            tremorAmp * Math.sin(2 * Math.PI * tremorCycles * t + tremorPhase) * Math.sin(Math.PI * t) +
             correction * Math.exp(-Math.pow((t - correctionAt) / 0.13, 2)) * Math.sin(Math.PI * t);
         return [x + fix[0] * c + nx * w, y + fix[1] * c + ny * w];
     };
