@@ -55,21 +55,40 @@ export default class PCPilotExtension extends Extension {
         this._queue = [];
         this._pumping = false;
         this._hotCornersId = 0;
+        // Callbacks from an earlier enable() (or arriving after disable) are ignored.
+        const life = this._life = (this._life ?? 0) + 1;
+        const live = () => this._life === life && this._overlay !== null;
         this._client = new DaemonClient({
-            onMessage: (msg, epoch) => this._onMessage(msg, epoch),
-            onDisconnected: () => this._setInactive('connection_lost'),
+            onMessage: (msg, epoch) => {
+                if (live())
+                    this._onMessage(msg, epoch);
+            },
+            onDisconnected: () => {
+                if (live())
+                    this._setInactive('connection_lost');
+            },
         });
         this._client.start();
     }
 
     disable() {
-        this._client.stop();
+        this._life++;
+        const client = this._client;
         this._client = null;
+        try {
+            client?.stop();
+        } catch (e) {
+            console.error(`pcpilot: client stop failed: ${e.message}`);
+        }
         this._setInactive(null);
         this._ops = null;
-        this._input.destroy();
+        try {
+            this._input?.destroy();
+        } catch (e) {
+            console.error(`pcpilot: input cleanup failed: ${e.message}`);
+        }
         this._input = null;
-        this._overlay.destroy();
+        this._overlay?.destroy();
         this._overlay = null;
     }
 

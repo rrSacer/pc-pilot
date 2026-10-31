@@ -192,6 +192,16 @@ export class AICursor {
         this._effects = new Set(); // ripples / hints in flight
         layer.add_child(this._trail);
         layer.add_child(this._arrow);
+        // The layer can be destroyed under us (stage teardown): drop the actors, keep the
+        // inhibit bookkeeping so release() still gives the real cursor back.
+        this._layerDestroyId = layer.connect('destroy', () => this._forgetActors());
+    }
+
+    _forgetActors() {
+        this._trail?.clear();
+        this._effects.clear();
+        this._arrow = this._trail = null;
+        this._layer = null;
     }
 
     get engaged() {
@@ -275,17 +285,20 @@ export class AICursor {
         }
     }
 
+    // Idempotent.
     destroy() {
         this.release();
+        if (this._layer && this._layerDestroyId)
+            this._layer.disconnect(this._layerDestroyId);
+        this._layerDestroyId = 0;
         this._arrow?.destroy();
         this._trail?.destroy();
-        this._arrow = this._trail = null;
-        this._layer = null;
+        this._forgetActors();
     }
 
     // Follow the pointer (called on pointer motion and by the motion engine).
     sync(trail = true) {
-        if (!this._engaged)
+        if (!this._engaged || !this._layer)
             return;
         const [x, y] = global.get_pointer();
         this._arrow.set_position(Math.round(x - PAD * this._scale), Math.round(y - PAD * this._scale));
@@ -310,7 +323,7 @@ export class AICursor {
     }
 
     ripple() {
-        if (!this._engaged)
+        if (!this._engaged || !this._layer)
             return;
         const [x, y] = global.get_pointer();
         const size = Math.round(30 * this._scale);
@@ -328,7 +341,7 @@ export class AICursor {
 
     // dir: 1 = down/right, -1 = up/left
     scrollHint(dir) {
-        if (!this._engaged)
+        if (!this._engaged || !this._layer)
             return;
         const [x, y] = global.get_pointer();
         const icon = new St.Icon({

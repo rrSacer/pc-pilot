@@ -61,6 +61,9 @@ export class Overlay {
         this._pulseHigh = true;
 
         this._group = new St.Widget({name: 'pcpilotOverlay', reactive: false, visible: false});
+        // Anyone may destroy our actors (the shell disposes the whole stage on logout, while
+        // the daemon link can still report a loss): from then on the overlay is inert.
+        this._group.connect('destroy', () => this._forget());
         Main.layoutManager.addTopChrome(this._group);
 
         this._frames = [];
@@ -120,15 +123,28 @@ export class Overlay {
             this._cursor?.engage();
     }
 
+    // Idempotent; also safe after the shell destroyed our actors itself.
     destroy() {
         this._cursor?.destroy(); // gives the real cursor back first
         this._cursor = null;
-        this._stopPulse();
+        const group = this._group;
+        this._forget();
+        group?.destroy();
+    }
+
+    // Drops every actor reference, timer and signal (the actors are gone or going).
+    _forget() {
+        this._cursor?.release();
+        this._active = false;
+        if (this._pulseId)
+            GLib.source_remove(this._pulseId);
+        this._pulseId = 0;
         if (this._toastId)
             GLib.source_remove(this._toastId);
         this._toastId = 0;
-        Main.layoutManager.disconnect(this._monitorsId);
-        this._group.destroy();
+        if (this._monitorsId)
+            Main.layoutManager.disconnect(this._monitorsId);
+        this._monitorsId = 0;
         this._group = null;
         this._frames = [];
     }
@@ -143,6 +159,8 @@ export class Overlay {
     }
 
     _build() {
+        if (!this._group)
+            return;
         for (const f of this._frames) {
             if (this._pill.get_parent() === f.inner)
                 f.inner.remove_child(this._pill);
@@ -206,6 +224,8 @@ export class Overlay {
 
     // Shows the overlay; resolves once a frame containing it has been painted.
     show(label, hotkey) {
+        if (!this._group)
+            return Promise.resolve(false);
         if (this._toastId) {
             GLib.source_remove(this._toastId);
             this._toastId = 0;
@@ -238,7 +258,8 @@ export class Overlay {
                 GLib.source_remove(this._toastId);
             this._toastId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, TOAST_MS, () => {
                 this._toastId = 0;
-                this._toast.visible = false;
+                if (this._group)
+                    this._toast.visible = false;
                 this._sync();
                 return GLib.SOURCE_REMOVE;
             });
@@ -248,6 +269,8 @@ export class Overlay {
     }
 
     setStatus(text) {
+        if (!this._group)
+            return;
         this._status = String(text ?? '').slice(0, 200);
         this._sync();
     }
@@ -270,7 +293,7 @@ export class Overlay {
     }
 
     _startPulse() {
-        if (this._pulseId)
+        if (this._pulseId || !this._group)
             return;
         this._pulseId = GLib.timeout_add(GLib.PRIORITY_LOW, PULSE_MS, () => {
             this._pulseHigh = !this._pulseHigh;
@@ -289,6 +312,8 @@ export class Overlay {
         if (this._pulseId)
             GLib.source_remove(this._pulseId);
         this._pulseId = 0;
+        if (!this._group)
+            return;
         for (const f of this._frames) {
             f.glow.remove_all_transitions();
             f.glow.opacity = 255;
