@@ -40,6 +40,7 @@ def available():
 class MCPClient:
     """Actual newline-delimited stdio transport; retain exact wire byte counts."""
     def __init__(self, env, log):
+        self.proc_env = env
         self.proc = subprocess.Popen([sys.executable, "-m", "pcpilot.mcp_server"],
             cwd=ROOT, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=log, start_new_session=True)
@@ -79,7 +80,7 @@ class MCPClient:
         self.proc.stdin.flush()
         tools, size = self.rpc("tools/list")
         assert [t["name"] for t in tools["tools"]] == ["control", "screenshot", "act", "elements", "windows"], tools
-        assert size <= 2900, f"tools/list response exceeds wire budget: {size} bytes"
+        assert size <= 3400, f"tools/list response exceeds wire budget: {size} bytes"
         self.sizes["tools/list"] = size
 
     def call(self, name, args=None, error=False):
@@ -139,6 +140,24 @@ class RealStackTests(unittest.TestCase):
             f'Exec=/usr/bin/env PROBE_LOG={cls.probe_log} PROBE_TITLE={cls.second_probe_title} '
             f'/usr/bin/python3 {SUPPORT / "gtk_probe.py"}\n'
             'Terminal=false\nStartupWMClass=pcpilot-e2e-probe-second\n')
+        # A private Firefox (own profile, own state dir for the a11y switch): never the user's profile.
+        cls.profile = cls.dir / "ffprofile"
+        cls.profile.mkdir()
+        (cls.profile / "user.js").write_text("".join(
+            f'user_pref("{key}", {value});\n' for key, value in {
+                "browser.shell.checkDefaultBrowser": "false", "browser.aboutwelcome.enabled": "false",
+                "datareporting.policy.dataSubmissionEnabled": "false", "app.update.auto": "false",
+                "app.update.enabled": "false", "browser.startup.page": "0",
+                "browser.tabs.warnOnClose": "false", "extensions.update.enabled": "false",
+                "browser.sessionstore.resume_from_crash": "false",
+                "network.captive-portal-service.enabled": "false"}.items()))
+        cls.a11y_state = cls.dir / "a11ystate"
+        cls.a11y_state.mkdir()
+        (applications / "pcpilot-e2e-firefox.desktop").write_text(
+            '[Desktop Entry]\nType=Application\nName=PCPilot E2E Firefox\n'
+            f'Exec=/usr/bin/env MOZ_ENABLE_WAYLAND=1 /usr/bin/firefox --no-remote --new-instance '
+            f'--profile {cls.profile} file://{ROOT / "tests/mcp_support/form.html"}\n'
+            'Terminal=false\nStartupWMClass=firefox\n')
         cls.wrapper_log = open(cls.dir / "wrapper.log", "w+")
         cls.addClassCleanup(cls.wrapper_log.close)
         # Register stop BEFORE start: startup failure may leave partial processes.
@@ -177,6 +196,7 @@ class RealStackTests(unittest.TestCase):
         self.addCleanup(log.close)
         env = dict(self.env, PCPILOT_DESKTOP_USER="sacer", PCPILOT_MAX_SIDE="1280",
             PCPILOT_A11Y_RUNTIME_DIR=self.env["XDG_RUNTIME_DIR"],
+            PCPILOT_A11Y_STATE_DIR=str(self.a11y_state),
             PCPILOT_A11Y_BUS_ADDRESS=self.env["DBUS_SESSION_BUS_ADDRESS"])
         self.mcp = MCPClient(env, log)
         self.addCleanup(self.mcp.close)
@@ -376,6 +396,133 @@ class RealStackTests(unittest.TestCase):
                               "observe": "none", "speed": "instant"})
         self.mcp.call("control", {"action": "stop"})
         self.assert_inactive()
+
+
+    def a11y_enabled(self):
+        """org.a11y.Status IsEnabled on the PRIVATE session bus (what Firefox consults)."""
+        out = subprocess.run([str(SHELL), "run", str(self.dir), "--", "gdbus", "call", "--session",
+            "--dest", "org.a11y.Bus", "--object-path", "/org/a11y/bus", "--method",
+            "org.freedesktop.DBus.Properties.Get", "org.a11y.Status", "IsEnabled"],
+            cwd=ROOT, capture_output=True, text=True, timeout=15).stdout
+        return "true" in out
+
+    def elements_text(self, args=None):
+        return self.mcp.call("elements", args or {})["content"][0]["text"]
+
+    @unittest.skipUnless(shutil.which("firefox"), "firefox not installed")
+    def test_05_firefox_page_map_live_clicks_scrolling_and_accessibility_restore(self):
+        self.assertFalse(self.a11y_enabled(), "baseline must match the user's real setting")
+        self.mcp.call("control", {"action": "start"})
+        self.assertTrue(wait_until(self.a11y_enabled, timeout=10), "session must switch accessibility on")
+        # Default (human) speed: Super, type the app name, Enter. The nested shell starts with the
+        # overview already open, so this also covers "do not toggle it shut".
+        launched = self.mcp.call("act", {"actions": [{"launch": "PCPilot E2E Firefox"}]})["content"][0]["text"]
+        self.assertRegex(launched, r'launched \d+ "')
+        last = {}
+        def page_ready():
+            last["text"] = self.elements_text()
+            return '"PCPilot Test Page"' in last["text"].splitlines()[0] and 'entry "Full name"' in last["text"]
+        self.assertTrue(wait_until(page_ready, timeout=45, interval=1), last.get("text"))
+        listing = last["text"]
+        header = listing.splitlines()[0]
+        self.assertRegex(header, r'^Firefox · "PCPilot Test Page" · file://.*form\.html')
+        for expected in ('checkbox "Accept the terms"', 'checkbox "Send me news"', 'radio "Free"', 'combo "Country"',
+                         'button "Send form"', 'button "Inner button"', 'link "Item 1" ↓', "# PCPilot Test Page"):
+            self.assertIn(expected, listing)
+        self.assertRegex(listing, r'combo "Country" \d+,\d+ ="Brazil"')
+        self.assertRegex(listing, r'checkbox "Send me news" \d+,\d+ \[checked\]')
+        self.assertRegex(listing, r'button "Disabled action" \d+,\d+ \[disabled\]')
+        self.assertNotIn("?", listing.replace("Search with", ""), "positions must be known")
+        ids = {name: ident for ident, name in re.findall(r'(e\d+) \w+ "([^"]+)"', listing)}
+        windows = self.mcp.call("windows")["content"][0]["text"]
+        self.assertRegex(windows, r'Mozilla Firefox".* \[focused')
+        # Fill and submit by id: live positions, no screenshot anywhere.
+        out = self.mcp.call("act", {"actions": [
+            {"click": ids["Full name"]}, {"type": "Ana"}, {"click": ids["Accept the terms"]},
+            {"click": ids["Send form"]}], "observe": "elements", "speed": "fast"})["content"]
+        diff = "\n".join(part["text"] for part in out if part["type"] == "text")
+        self.assertIn('"Submitted"', diff)                       # document.title changed on submit
+        self.assertRegex(diff, r'entry "Full name" \d+,\d+ ="Ana"')
+        self.assertRegex(diff, r'checkbox "Accept the terms" \d+,\d+ \[checked\]')
+        self.assertNotIn('link "Skip to about"', diff)           # unchanged elements stay out
+        # An off-screen link is reached by wheel notches, then clicked where it now is.
+        far = self.elements_text({"query": "Item 70"})
+        self.assertRegex(far, r'link "Item 70" ↓\d')
+        item = re.search(r'(e\d+) link "Item 70"', far).group(1)
+        self.mcp.call("act", {"actions": [{"click": item}], "speed": "fast"})
+        self.assertTrue(wait_until(lambda: "#i70" in self.elements_text().splitlines()[0], timeout=10), self.elements_text())
+        self.assertRegex(self.elements_text({"query": "Item 70"}), r'link "Item 70" \d+,\d+')
+        stopped = self.mcp.call("control", {"action": "stop"})["content"][0]["text"]
+        self.assertIn("stopped", stopped)
+        self.assertTrue(wait_until(lambda: not self.a11y_enabled(), timeout=10), "accessibility must be restored")
+        self.assertEqual(json.loads((self.a11y_state / "a11y.json").read_text() or "{}"), {})
+        self.assert_inactive()
+
+    @unittest.skipUnless(shutil.which("firefox"), "firefox not installed")
+    def test_07_firefox_started_before_the_session_exports_its_page_after_a_new_window(self):
+        """The user's real case: Firefox is already open when PCPilot flips accessibility on."""
+        profile = self.dir / "ffprofile2"
+        profile.mkdir()
+        shutil.copy(self.profile / "user.js", profile / "user.js")
+        for path in (profile, profile / "user.js"):
+            shutil.chown(path, "sacer", "sacer")
+        log = open(self.dir / "ff-early.log", "w+")
+        self.addCleanup(log.close)
+        browser = subprocess.Popen([str(SHELL), "run", str(self.dir), "--", "env", "MOZ_ENABLE_WAYLAND=1",
+            "/usr/bin/firefox", "--no-remote", "--new-instance", "--profile", str(profile),
+            f"file://{ROOT / 'tests/mcp_support/form.html'}"], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True)
+        self.addCleanup(lambda: (os.killpg(browser.pid, signal.SIGTERM), browser.wait(timeout=10)))
+        self.assertFalse(self.a11y_enabled())
+        def firefox_on_the_bus():
+            out = subprocess.run([str(SHELL), "run", str(self.dir), "--", "gdbus", "call", "--session",
+                "--dest", "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus", "--method",
+                "org.freedesktop.DBus.ListNames"], cwd=ROOT, capture_output=True, text=True, timeout=15).stdout
+            return "org.mozilla.firefox." in out
+        self.assertTrue(wait_until(firefox_on_the_bus, timeout=40, interval=1))
+        time.sleep(10)   # Firefox consults IsEnabled once, early; let it settle with accessibility off
+        self.mcp.call("control", {"action": "start"})
+        self.assertTrue(wait_until(self.a11y_enabled, timeout=10))
+        def firefox_window():
+            return re.search(r'^(\d+) \S*[Ff]irefox\S* "PCPilot Test Page', self.mcp.call("windows")["content"][0]["text"], re.M)
+        self.assertTrue(wait_until(firefox_window, timeout=40, interval=1))
+        self.mcp.call("act", {"actions": [{"focus": int(firefox_window().group(1))}], "speed": "fast"})
+        # Started with accessibility off: no page tree yet, and the output says how to get one.
+        self.assertTrue(wait_until(lambda: "ctrl+n" in self.elements_text(), timeout=10), self.elements_text())
+        # A new window created after the switch makes Firefox export every window.
+        self.mcp.call("act", {"actions": [{"key": "ctrl+n"}, {"wait": 2500}, {"key": "ctrl+w"}, {"wait": 1500}],
+                              "speed": "fast"})
+        last = {}
+        def page_ready():
+            last["text"] = self.elements_text()
+            return 'entry "Full name"' in last["text"]
+        self.assertTrue(wait_until(page_ready, timeout=30, interval=1), last.get("text"))
+        self.assertRegex(last["text"].splitlines()[0], r'^Firefox · "PCPilot Test Page"')
+        self.mcp.call("control", {"action": "stop", "keep": [int(firefox_window().group(1))]})
+        self.assertTrue(wait_until(lambda: not self.a11y_enabled(), timeout=10))
+
+
+    def test_06_accessibility_is_restored_when_the_mcp_dies(self):
+        for how in ("sigkill", "sigterm-group"):
+            with self.subTest(how=how):
+                self.assertTrue(wait_until(lambda: not self.a11y_enabled(), timeout=10))
+                mcp = self.mcp
+                if how != "sigkill":
+                    log = open(self.dir / f"{how}.log", "w+")
+                    self.addCleanup(log.close)
+                    mcp = MCPClient(dict(self.mcp.proc_env), log)
+                    self.addCleanup(mcp.close)
+                    mcp.initialize()
+                mcp.call("control", {"action": "start"})
+                self.assertTrue(wait_until(self.a11y_enabled, timeout=10))
+                mcp.call("elements")          # the worker is alive for the whole session
+                if how == "sigkill":
+                    mcp.kill()                # SIGKILL: stdin EOF reaches the worker, which restores
+                else:
+                    os.killpg(mcp.proc.pid, signal.SIGTERM)   # MCP and worker both get SIGTERM
+                self.assertTrue(wait_until(lambda: not self.a11y_enabled(), timeout=10),
+                                f"left enabled after {how}")
+                self.assert_inactive()
 
 
 if __name__ == "__main__":

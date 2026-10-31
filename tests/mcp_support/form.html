@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>PCPilot Test Page</title>
+<style>body{font:16px sans-serif;margin:0}header,nav,main,footer{padding:12px 24px}
+.item{height:44px;border-bottom:1px solid #ddd}iframe{width:600px;height:120px}</style></head>
+<body>
+<header><h1>PCPilot Test Page</h1><a href="#about" id="skip">Skip to about</a></header>
+<nav aria-label="Main"><a href="#form">Form</a> <a href="#list">List</a> <a href="#frame">Frame</a>
+<button type="button" id="menu" aria-expanded="false" aria-haspopup="true">Menu</button></nav>
+<main>
+<h2 id="form">Sign up</h2>
+<form id="signup" onsubmit="document.title='Submitted';return false">
+<p><label for="name">Full name</label> <input id="name" name="name" type="text"></p>
+<p><label for="email">Email address</label> <input id="email" name="email" type="email" placeholder="you@example.com"></p>
+<p><label for="pw">Password</label> <input id="pw" name="pw" type="password"></p>
+<p><label><input type="checkbox" id="terms" name="terms"> Accept the terms</label>
+   <label><input type="checkbox" id="news" name="news" checked> Send me news</label></p>
+<fieldset><legend>Plan</legend>
+<label><input type="radio" name="plan" value="free" checked> Free</label>
+<label><input type="radio" name="plan" value="pro"> Pro</label></fieldset>
+<p><label for="country">Country</label>
+<select id="country" name="country"><option>Brazil</option><option>Portugal</option><option>Japan</option></select></p>
+<p><label for="bio">Biography</label><br><textarea id="bio" name="bio" rows="3" cols="40"></textarea></p>
+<p><button type="submit" id="send">Send form</button> <button type="button" id="off" disabled>Disabled action</button></p>
+</form>
+<h2 id="frame">Embedded frame</h2>
+<iframe title="Inner" srcdoc="&lt;button id='inner'&gt;Inner button&lt;/button&gt;"></iframe>
+<h2 id="list">Long list</h2>
+<ul id="items"></ul>
+<h2 id="about">About</h2><p>Footer follows.</p>
+</main>
+<footer><a href="https://example.com/end" id="end">End of page link</a></footer>
+<script>
+var ul=document.getElementById('items');
+for(var i=1;i<=80;i++){var li=document.createElement('li');li.className='item';
+ li.innerHTML='<a href="#i'+i+'">Item '+i+'</a>';ul.appendChild(li);}
+document.getElementById('menu').addEventListener('click',function(){
+ var e=this.getAttribute('aria-expanded')==='true';this.setAttribute('aria-expanded',e?'false':'true');});
+</script></body></html>
