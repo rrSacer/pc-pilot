@@ -45,6 +45,9 @@ export function windowInfo(w) {
         buffer: rect(b),
         focused: w.has_focus(),
         minimized: w.minimized,
+        maximized: w.is_maximized(),
+        fullscreen: w.is_fullscreen(),
+        monitor: w.get_monitor(),
         workspace: w.is_on_all_workspaces() ? -1 : (w.get_workspace()?.index() ?? -1),
     };
 }

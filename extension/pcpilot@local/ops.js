@@ -189,6 +189,7 @@ export class Ops {
         this.session = new SessionState();
         this._handlers = {
             'screen.info': this._screenInfo,
+            'desktop.info': this._desktopInfo,
             'screenshot': this._screenshot,
             'pointer.move': this._pointerMove,
             'pointer.click': this._pointerClick,
@@ -225,16 +226,49 @@ export class Ops {
 
     // ---- screen ----
 
-    _screenInfo() {
+    _monitors() {
         const lm = Main.layoutManager;
+        return lm.monitors.map(m => ({
+            index: m.index,
+            x: m.x, y: m.y, width: m.width, height: m.height,
+            scale: m.geometry_scale,
+            primary: m.index === lm.primaryIndex,
+        }));
+    }
+
+    _screenInfo() {
         return {
             width: global.screen_width,
             height: global.screen_height,
-            monitors: lm.monitors.map(m => ({
-                x: m.x, y: m.y, width: m.width, height: m.height,
-                scale: m.geometry_scale,
-                primary: m.index === lm.primaryIndex,
-            })),
+            monitors: this._monitors(),
+        };
+    }
+
+    // org.gnome.desktop.interface color-scheme as "dark" | "light" | "default" | null.
+    _colorScheme() {
+        try {
+            const id = 'org.gnome.desktop.interface';
+            if (!Gio.SettingsSchemaSource.get_default()?.lookup(id, true))
+                return null;
+            const v = new Gio.Settings({schema_id: id}).get_string('color-scheme');
+            return {'prefer-dark': 'dark', 'prefer-light': 'light', default: 'default'}[v] ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    // Everything the agent needs to know about the desktop in one cheap, read-only call
+    // (no input, no animation, nothing to wait for).
+    _desktopInfo() {
+        const wm = global.workspace_manager;
+        const [px, py] = global.get_pointer();
+        return {
+            workspace: {active: wm.get_active_workspace_index(), count: wm.get_n_workspaces()},
+            overview: Main.overview.visible === true,
+            pointer: {x: px, y: py},
+            focus: global.display.focus_window?.get_id() ?? null,
+            scheme: this._colorScheme(),
+            monitors: this._monitors(),
         };
     }
 
