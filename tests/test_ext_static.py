@@ -159,10 +159,10 @@ class FakeDaemonNewOpsForwardingTests(unittest.TestCase):
                     seen.append((msg["op"], msg.get("args")))
                     ui_sock.sendall(P.encode(P.ok(msg["id"], canned.get(msg["op"], {}))))
 
+        self.assertTrue(read_msg().get("ok"))  # the hello reply, before the worker owns the socket
         ut = threading.Thread(target=ui_worker, daemon=True)
         ut.start()
         self.addCleanup(lambda: (stop.set(), ut.join(timeout=2)))
-        self.assertTrue(read_msg().get("ok"))
         agent = AgentClient(sock_path)
         self.addCleanup(agent.close)
         agent.call("session.begin", {})
