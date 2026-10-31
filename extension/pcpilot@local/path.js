@@ -1,7 +1,8 @@
 // Human-like pointer trajectories. Pure math, no GNOME imports.
 //
-// human: a quick ballistic phase followed by deliberate homing, a curved reach,
-//        occasional corrections, a small overshoot and subpixel hand tremor.
+// human: a quick ballistic submovement followed by a slow corrective one (asymmetric
+//        speed), a curved reach, occasional mid-path corrections, a small overshoot and
+//        subpixel hand tremor.
 // fast:  straight line, minimum-jerk timing, ~100-180 ms.
 // instant: no path (the caller jumps).
 
@@ -42,13 +43,15 @@ export function fittsDuration(dist, rand = Math.random) {
     return clamp(base * (0.92 + rand() * 0.16) * HUMAN_SPEED_MULTIPLIER, 500, MAX_GLIDE_MS);
 }
 
-// Peak velocity early in the reach; more time is spent guiding the last few pixels.
-function reachProgress(t) {
-    return minJerk(1 - Math.pow(1 - clamp(t, 0, 1), 1.65));
-}
-
 // Returns {duration, at(ms) -> [x, y]}; at(duration) is exactly `to`.
 // opts: {drag: bool (gentler, no overshoot), duration: ms override, rand: () => [0,1)}
+//
+// A human reach is two overlapping minimum-jerk submovements. A fast ballistic one covers
+// most of the distance (peak speed about a third of the way in); a slower corrective one
+// starts before it ends and does the homing, so the last stretch is a visible, decaying
+// creep instead of a dead stop. The ballistic one is aimed a little short of the target
+// (the correction creeps in) or, on long free moves, a few pixels past it (the correction
+// pulls back), and slightly off-line (the correction also fixes that).
 export function planPath(from, to, style, opts = {}) {
     const rand = opts.rand ?? Math.random;
     const dx = to[0] - from[0], dy = to[1] - from[1];
@@ -67,26 +70,30 @@ export function planPath(from, to, style, opts = {}) {
     const total = Math.round(clamp(opts.duration ?? fittsDuration(dist, rand) * (opts.drag ? 1.28 : 1),
         120, MAX_GLIDE_MS));
 
-    // Long free moves overshoot a little past the target, then correct.
-    const overshoot = !opts.drag && dist > 400 && rand() < 0.7;
-    let end = to, mainMs = total, corrMs = 0;
-    if (overshoot) {
-        const ov = clamp(dist * (0.003 + rand() * 0.005), 3, 10);
-        const side = (rand() - 0.5) * ov * 0.6;
-        end = [to[0] + ux * ov + nx * side, to[1] + uy * ov + ny * side];
-        corrMs = Math.round(total * (0.16 + rand() * 0.06));
-        mainMs = Math.max(100, total - corrMs);
-    }
+    // Time split: the ballistic submovement lasts `tb` of the total, the corrective one
+    // starts `lead` before it ends.
+    const tb = 0.64 + rand() * 0.1;
+    const t0 = tb - (0.2 + rand() * 0.1);
+    // Where the ballistic one is aimed, relative to the target along/across the direction.
+    const overshoot = !opts.drag && dist > 400 && rand() < 0.6;
+    const along = overshoot
+        ? clamp(dist * (0.003 + rand() * 0.005), 3, 10)
+        : -dist * (opts.drag ? 0.01 + rand() * 0.015 : 0.015 + rand() * 0.03);
+    const across = (rand() - 0.5) * Math.min(opts.drag ? 3 : 8, dist * 0.012);
+    const aim = [to[0] + ux * along + nx * across, to[1] + uy * along + ny * across];
+    const fix = [to[0] - aim[0], to[1] - aim[1]]; // what the corrective submovement adds
 
     // Bow: perpendicular offset of the control points, random side and size.
     const bowScale = opts.drag ? 0.04 : 0.08 + rand() * 0.1;
     const bow = clamp(dist * bowScale, 0, 120) * (rand() < 0.5 ? -1 : 1);
-    const p1 = [from[0] + dx * 0.3 + nx * bow * (0.8 + rand() * 0.4),
-        from[1] + dy * 0.3 + ny * bow * (0.8 + rand() * 0.4)];
-    const p2 = [from[0] + dx * 0.7 + nx * bow * (0.6 + rand() * 0.4),
-        from[1] + dy * 0.7 + ny * bow * (0.6 + rand() * 0.4)];
+    const ax = aim[0] - from[0], ay = aim[1] - from[1];
+    const p1 = [from[0] + ax * 0.3 + nx * bow * (0.8 + rand() * 0.4),
+        from[1] + ay * 0.3 + ny * bow * (0.8 + rand() * 0.4)];
+    const p2 = [from[0] + ax * 0.7 + nx * bow * (0.6 + rand() * 0.4),
+        from[1] + ay * 0.7 + ny * bow * (0.6 + rand() * 0.4)];
 
-    // Wobble: a couple of tiny oscillations across the path, zero at both ends.
+    // Wobble: a couple of tiny oscillations across the path, zero at both ends, plus (on
+    // longer moves) a small mid-path course correction.
     const amp = Math.min(opts.drag ? 0.3 : 0.65, dist * 0.0015);
     const cycles = 1.5 + rand() * 1.8;
     const phase = rand() * Math.PI * 2;
@@ -95,22 +102,20 @@ export function planPath(from, to, style, opts = {}) {
     const hesitation = opts.drag ? 0.03 + rand() * 0.035 : 0;
 
     const at = ms => {
-        if (ms >= mainMs + corrMs)
+        if (ms >= total)
             return [to[0], to[1]];
-        if (ms < mainMs) {
-            const t = clamp(ms / mainMs, 0, 1);
-            // A shallow hesitation within a drag without stopping or backing up.
-            const s = reachProgress(t - hesitation * Math.sin(2 * Math.PI * t) * Math.sin(Math.PI * t));
-            const [x, y] = bezier(from, p1, p2, end, s);
-            const w = amp * Math.sin(2 * Math.PI * cycles * t + phase) * Math.sin(Math.PI * t) +
-                correction * Math.exp(-Math.pow((t - correctionAt) / 0.13, 2)) * Math.sin(Math.PI * t);
-            if (ms <= 0)
-                return [from[0], from[1]];
-            return [x + nx * w, y + ny * w];
-        }
-        return lerp(end, to, minJerk((ms - mainMs) / corrMs));
+        if (ms <= 0)
+            return [from[0], from[1]];
+        const t = ms / total;
+        // A shallow hesitation within a drag without stopping or backing up.
+        const tp = clamp(t - hesitation * Math.sin(2 * Math.PI * t) * Math.sin(Math.PI * t), 0, 1);
+        const [x, y] = bezier(from, p1, p2, aim, minJerk(tp / tb));
+        const c = minJerk((t - t0) / (1 - t0));
+        const w = amp * Math.sin(2 * Math.PI * cycles * t + phase) * Math.sin(Math.PI * t) +
+            correction * Math.exp(-Math.pow((t - correctionAt) / 0.13, 2)) * Math.sin(Math.PI * t);
+        return [x + fix[0] * c + nx * w, y + fix[1] * c + ny * w];
     };
-    return {duration: mainMs + corrMs, at};
+    return {duration: total, at};
 }
 
 // Bursts of typing, word/punctuation pauses and occasional thinking gaps. The total
