@@ -157,7 +157,7 @@ export default class PCPilotExtension extends Extension {
         this._token = token;
         this._sessionUp = true;
         this._suspendHotCorners();
-        const shown = await this._overlay.show(msg.label, msg.hotkey);
+        const shown = await this._overlay.show(msg.label, msg.hotkey, msg.theme);
         if (gen !== this._gen || !this._client || this._client.epoch !== epoch)
             return; // superseded while waiting for the paint
         if (!shown) {
@@ -218,6 +218,7 @@ export default class PCPilotExtension extends Extension {
             GLib.file_set_contents(GLib.build_filenamev([dir, 'test-state.json']), JSON.stringify({
                 active: this._active,
                 session: this._session,
+                theme: this._overlay?.themeId ?? 'neutral',
                 cursor_inhibited: this._overlay?.cursor?.inhibited ?? false,
                 cursor_engaged: this._overlay?.cursor?.engaged ?? false,
                 unfocus_inhibited: this._overlay?.cursor?.unfocusInhibited ?? false,

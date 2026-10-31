@@ -19,16 +19,16 @@ import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
 
+import {paintBadge, verticalGradient} from './paint.js';
+import {rgb, themeFor, withAlpha} from './theme.js';
+
 const TRAIL_MS = 400;
 const TRAIL_MAX_POINTS = 64;
-const FADE_MS = 300;
 const RIPPLE_MS = 380;
 const HINT_MS = 450;
 // Arrow geometry (px at scale 1); the hotspot is the tip at (PAD, PAD).
 const PAD = 3;
 const ARROW = [[0, 0], [0, 19], [4.6, 14.9], [7.9, 22.6], [11.1, 21.2], [7.9, 13.7], [13.8, 13.7]];
-const FILL = [1.0, 0.18, 0.33]; // brand red/magenta
-const TRAIL_RGB = [1.0, 0.27, 0.23];
 
 function nowMs() {
     return GLib.get_monotonic_time() / 1000;
@@ -36,13 +36,19 @@ function nowMs() {
 
 const Arrow = GObject.registerClass(
 class PCPilotArrow extends St.DrawingArea {
-    _init(scale) {
+    _init(scale, theme) {
         this._scale = scale;
+        this._theme = theme;
         super._init({
             reactive: false,
-            width: Math.ceil((14 + PAD * 2 + 3) * scale),
+            width: Math.ceil(34 * scale),
             height: Math.ceil((23 + PAD * 2 + 3) * scale),
         });
+    }
+
+    setTheme(theme) {
+        this._theme = theme;
+        this.queue_repaint();
     }
 
     vfunc_repaint() {
@@ -66,24 +72,32 @@ class PCPilotArrow extends St.DrawingArea {
         cr.fill();
         // body + thin white outline
         path(0, 0);
-        cr.setSourceRGBA(...FILL, 1);
+        cr.setSource(verticalGradient(PAD * s, (PAD + 23) * s, this._theme.cursor.fill));
         cr.fillPreserve();
         cr.setLineWidth(1.4 * s);
-        cr.setSourceRGBA(1, 1, 1, 0.95);
+        cr.setSourceRGBA(...rgb(this._theme.cursor.outline), 0.95);
         cr.stroke();
+        paintBadge(cr, 24 * s, 20 * s, 6.5 * s, this._theme,
+            {ring: this._theme.cursor.outline});
         cr.$dispose?.();
     }
 });
 
 const Trail = GObject.registerClass(
 class PCPilotTrail extends St.DrawingArea {
-    _init() {
+    _init(theme) {
         super._init({reactive: false, visible: false});
         this._points = []; // {x, y, t} in stage coords, oldest first
         this._origin = [0, 0];
         this._head = null;
         this._timeline = null;
+        this._theme = theme;
         this.connect('destroy', () => this._stopTicking());
+    }
+
+    setTheme(theme) {
+        this.clear();
+        this._theme = theme;
     }
 
     add(x, y) {
@@ -101,6 +115,7 @@ class PCPilotTrail extends St.DrawingArea {
 
     clear() {
         this._points = [];
+        this._head = null;
         this._stopTicking();
         this.visible = false;
     }
@@ -162,7 +177,7 @@ class PCPilotTrail extends St.DrawingArea {
             const life = 1 - Math.min(1, (now - pts[i].t) / TRAIL_MS);
             if (life <= 0)
                 continue;
-            cr.setSourceRGBA(...TRAIL_RGB, 0.8 * life);
+            cr.setSourceRGBA(...rgb(this._theme.trail), 0.65 * life);
             cr.setLineWidth(1.2 + 4.8 * life);
             cr.moveTo(pts[i - 1].x - this._origin[0], pts[i - 1].y - this._origin[1]);
             cr.lineTo(pts[i].x - this._origin[0], pts[i].y - this._origin[1]);
@@ -173,8 +188,7 @@ class PCPilotTrail extends St.DrawingArea {
 });
 
 export class AICursor {
-    // layer: a non-reactive actor covering the stage (inside the overlay group, so it is
-    // hidden from screenshots together with the border).
+    // layer: non-reactive, hidden only for the offscreen screenshot render.
     constructor(layer, onChange = null) {
         this._layer = layer;
         this._onChange = onChange;
@@ -185,9 +199,10 @@ export class AICursor {
         this._engaged = false;
         this._positionId = 0;
         this._scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+        this._theme = themeFor();
 
-        this._trail = new Trail();
-        this._arrow = new Arrow(this._scale);
+        this._trail = new Trail(this._theme);
+        this._arrow = new Arrow(this._scale, this._theme);
         this._arrow.visible = false;
         this._effects = new Set(); // ripples / hints in flight
         layer.add_child(this._trail);
@@ -216,6 +231,17 @@ export class AICursor {
         return this._unfocusInhibited;
     }
 
+    setTheme(theme) {
+        this._theme = theme;
+        if (!this._layer)
+            return;
+        this._trail.setTheme(theme);
+        this._arrow.setTheme(theme);
+        for (const e of this._effects)
+            e.destroy();
+        this._effects.clear();
+    }
+
     // Hide the real cursor and show ours (idempotent).
     engage() {
         if (this._engaged || !this._layer)
@@ -237,9 +263,9 @@ export class AICursor {
         this._onChange?.();
     }
 
-    // Give the real cursor back. Immediate unless fade: (then ours fades out over FADE_MS,
-    // while the real one is already visible).
-    release({fade = false} = {}) {
+    // Immediate on every end/abort path. The cosmetic fade runs while still active in
+    // Overlay.finish(), never as an untracked animation after control was released.
+    release() {
         // The real cursor comes back first, whatever happens below.
         if (this._inhibited) {
             this._inhibited = false;
@@ -270,19 +296,7 @@ export class AICursor {
             e.destroy();
         this._effects.clear();
         this._arrow.remove_all_transitions();
-        if (fade && this._arrow.visible) {
-            this._arrow.ease({
-                opacity: 0,
-                duration: FADE_MS,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                onStopped: () => {
-                    if (!this._engaged && this._arrow)
-                        this._arrow.visible = false;
-                },
-            });
-        } else {
-            this._arrow.visible = false;
-        }
+        this._arrow.visible = false;
     }
 
     // Idempotent.
@@ -329,7 +343,7 @@ export class AICursor {
         const size = Math.round(30 * this._scale);
         const ring = new St.Widget({
             reactive: false, width: size, height: size,
-            style: `border: ${Math.round(2 * this._scale)}px solid rgba(255,46,84,0.9);` +
+            style: `border: ${Math.round(2 * this._scale)}px solid ${withAlpha(this._theme.ripple, 0.9)};` +
                 `border-radius: ${size}px;`,
             scale_x: 0.35, scale_y: 0.35,
         });
@@ -348,7 +362,7 @@ export class AICursor {
             reactive: false,
             icon_name: dir > 0 ? 'pan-down-symbolic' : 'pan-up-symbolic',
             icon_size: 16,
-            style: 'color: rgba(255,46,84,0.95);',
+            style: `color: ${withAlpha(this._theme.ripple, 0.95)};`,
             opacity: 230,
         });
         const off = 22 * this._scale;
