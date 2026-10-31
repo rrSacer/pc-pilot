@@ -38,6 +38,7 @@ ACK_TIMEOUT_S = 2.0
 UI_TIMEOUT_S = 20.0
 PING_INTERVAL_S = 2.0
 LEASE_TIMEOUT_S = 6.0  # no pong for this long -> session ends (reason ui_timeout)
+THEMES = frozenset({"claude", "codex", "gemini", "neutral"})  # as pcpilot/daemon.py validates
 
 
 class Conn:
@@ -58,6 +59,7 @@ class FakeDaemon:
         self.path = path
         self.sticky = sticky
         self.label = label
+        self.theme = "neutral"
         self.hotkey = hotkey
         self.log = log or (lambda *a: None)
         self.ui = None
@@ -185,15 +187,17 @@ class FakeDaemon:
             self.pending.pop(rid, None)
             raise P.ProtocolError(P.E_UI_TIMEOUT, f"{op} timed out")
 
-    async def send_state(self, active, reason=None, label=None, wait_ack=True):
+    async def send_state(self, active, reason=None, label=None, wait_ack=True, theme=None):
         if self.ui is None:
             raise P.ProtocolError(P.E_UI_UNAVAILABLE, "no ui")
         if active:
             self.session += 1
+            # Like the daemon: the theme belongs to the session; missing/unknown = neutral.
+            self.theme = theme if isinstance(theme, str) and theme in THEMES else "neutral"
             self.ack_waiter = asyncio.get_running_loop().create_future()
             t0 = time.monotonic()
             self.ui.send(P.event("state", active=True, session=self.session,
-                                 label=label or self.label, hotkey=self.hotkey))
+                                 label=label or self.label, theme=self.theme, hotkey=self.hotkey))
             if not wait_ack:
                 return {"session": self.session}
             try:
@@ -261,7 +265,7 @@ class FakeDaemon:
             if self.active and self.owner is not conn and not self.sticky:
                 raise P.ProtocolError(P.E_BUSY, "another agent owns the session")
             if not self.active:
-                r = await self.send_state(True, label=args.get("label"))
+                r = await self.send_state(True, label=args.get("label"), theme=args.get("theme"))
                 self.active = True
                 self.log(f"session active (ack {r.get('ack_ms')} ms)")
             self.owner = conn
@@ -281,7 +285,7 @@ class FakeDaemon:
             return {}
         if op == "fake.state":
             r = await self.send_state(bool(args.get("active")), args.get("reason"),
-                                      args.get("label"), args.get("wait_ack", True))
+                                      args.get("label"), args.get("wait_ack", True), args.get("theme"))
             self.active = bool(args.get("active"))
             self.owner = conn if self.active else None
             return r
