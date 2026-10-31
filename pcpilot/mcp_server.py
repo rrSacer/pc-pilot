@@ -21,10 +21,12 @@ from contextlib import contextmanager
 from PIL import Image
 
 from . import protocol
+from .a11y_worker import alias as role_alias
 
 VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
-INSTRUCTIONS = ("Prefer elements, shortcuts and launch; batch act actions. Observe only when needed. "
-                "Coordinates are global scaled screen pixels (longest side <=1280 by default). "
+INSTRUCTIONS = ("Query, don't look: windows = desktop state, elements = UI/web page map (click by id; it "
+                "auto-scrolls), screenshot only as a last resort. Batch act actions; observe:elements "
+                "returns changes only. Coordinates are scaled screen pixels (longest side <=1280). "
                 "End every task with control stop. Idle sessions auto-release after ~12s. "
                 "USER_TOOK_CONTROL: stop and wait for the user; "
                 "resume only on their explicit request. Close tabs/files you opened (ctrl+w) before stop; "
@@ -36,6 +38,14 @@ IDLE_AUTOSTOP_S = 12
 ACT_BUDGET_S = 30
 HUMAN_BATCH_LIMIT = 12
 STYLED_ACTIONS = {"click", "double_click", "right_click", "move", "drag", "scroll", "type", "window", "focus"}
+TYPE_CHUNK = {"human": 240, "fast": 1000, "instant": 1000}
+SCROLL_OP_NOTCHES = 15      # notches per pointer.scroll op (the extension's per-op guard)
+SCROLL_STEPS = 6            # locate/scroll rounds before giving up on an off-screen element
+SCROLL_SETTLE_S = .35
+NOTCH_PX = 60               # first guess of logical pixels per wheel notch, then calibrated
+TARGET_BAND = .42           # where in the viewport an element is brought before its click
+BROWSERS = ("firefox", "chrom", "brave", "vivaldi", "opera", "epiphany", "librewolf", "zen", "edge")
+REGISTRY_CAP = 800
 
 
 class BatchBudgetReached(Exception):
@@ -70,17 +80,17 @@ TOOLS = [
      "inputSchema": schema({"action": enum("start", "stop", "status"), "resume": {"type": "boolean"},
                             "keep": {"type": "array", "items": {"type": ["string", "integer"]}, "maxItems": 200},
                             "cleanup": {"type": "boolean"}}, ["action"])},
-    {"name": "screenshot", "description": "Scaled screen; region [x,y,w,h] zooms. Prefer elements.",
+    {"name": "screenshot", "description": "Last resort; prefer windows/elements. Region [x,y,w,h] zooms.",
      "inputSchema": schema({"region": FOUR})},
-    {"name": "act", "description": "Batch; click:[x,y] or eID; scroll:[dy] or [x,y,dy]. Window:[id,fit], [id,resize,w,h], [id,move,x,y].",
+    {"name": "act", "description": "Batch; click:[x,y] or eID (scrolls to it); scroll:[dy] or [x,y,dy]. Window:[id,fit], [id,resize,w,h], [id,move,x,y]. observe:elements = changes only.",
      "inputSchema": schema({"actions": {"type": "array", "minItems": 1, "maxItems": 100,
           "items": {**schema(ACTION_VALUES), "minProperties": 1, "maxProperties": 1}},
                             "observe": enum("none", "screenshot", "elements"),
                             "speed": enum("human", "fast", "instant")}, ["actions"])},
-    {"name": "elements", "description": "Visible interactive elements; prefer to screenshots. ? = position unknown.",
-     "inputSchema": schema({"query": {"type": "string"}, "window": {"type": ["string", "integer"]},
+    {"name": "elements", "description": "UI/web page map: role, name, value, x,y. ↓N/↑N = N screens to scroll (click does it). Browsers: URL, tabs, focus. query also searches browser chrome; role filters.",
+     "inputSchema": schema({"query": {"type": "string"}, "role": {"type": "string"}, "window": {"type": ["string", "integer"]},
                             "max": {"type": "integer", "minimum": 1, "maximum": 200}})},
-    {"name": "windows", "description": "Windows with ids, scaled bounds; * = AI-opened, cleaned on stop.", "inputSchema": schema()},
+    {"name": "windows", "description": "Desktop state: workspace, monitors, overview, pointer; windows with id, scaled bounds, flags; * = AI-opened, cleaned on stop.", "inputSchema": schema()},
 ]
 
 
@@ -116,6 +126,15 @@ class DaemonClient:
         self.disconnected = False
         self.label = "IA"
         self.theme = "neutral"
+        self.on_end = None  # called (any thread) when the session ends outside our own stop
+
+    def _ended(self):
+        callback = self.on_end
+        if callback is not None:
+            try:
+                callback()
+            except Exception as exc:
+                print(f"pcpilot session end hook: {exc}", file=sys.stderr)
 
     def connect(self):
         if self.closed:
@@ -150,6 +169,7 @@ class DaemonClient:
                             self.active = False
                             if msg.get("reason") in {"user_hotkey", "user_release"}:
                                 self.aborted = True
+                        self._ended()
                     elif "id" in msg:
                         with self.lock:
                             pending = self.pending.get(msg["id"])
@@ -173,6 +193,7 @@ class DaemonClient:
             with self.lock:
                 for waiter, _op, _args in self.pending.values():
                     waiter.put({"ok": False, "error": {"code": "disconnected", "message": "Daemon disconnected"}})
+            self._ended()
 
     def check_abort(self):
         if self.closed:
@@ -328,49 +349,57 @@ class AccessibilityWorker:
     def __init__(self):
         self.process = None
         self.lock = threading.RLock()
+        self.io_lock = threading.Lock()
         self.closed = False
         self.cancelled = False
         self.busy = False
+        self.held = False  # this worker switched org.a11y.Status IsEnabled on
 
-    def start(self):
+    def _spec(self):
         user = desktop_identity()
         runtime = desktop_runtime(user)
         env = {"HOME": user.pw_dir, "USER": user.pw_name, "LOGNAME": user.pw_name,
                "PATH": "/usr/bin:/bin", "LANG": os.environ.get("LANG", "C.UTF-8"),
                "XDG_RUNTIME_DIR": runtime,
                "DBUS_SESSION_BUS_ADDRESS": os.environ.get("PCPILOT_A11Y_BUS_ADDRESS", f"unix:path={runtime}/bus")}
+        if os.environ.get("PCPILOT_A11Y_STATE_DIR"):
+            env["PCPILOT_A11Y_STATE_DIR"] = os.environ["PCPILOT_A11Y_STATE_DIR"]
         env.update({key: value for key, value in os.environ.items() if re.fullmatch(r"LC_[A-Z_]+", key)})
         command = ["/usr/bin/python3", "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "a11y_worker.py")]
         if os.geteuid() != user.pw_uid:
             command = ["/usr/bin/setpriv", f"--reuid={user.pw_uid}", f"--regid={user.pw_gid}", "--init-groups", *command]
+        return command, env
+
+    def start(self):
+        command, env = self._spec()
         with self.lock:
             if self.closed or self.cancelled:
                 raise protocol.ProtocolError("cancelled", "AT-SPI request cancelled")
             self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             stderr=sys.stderr, env=env, bufsize=0)
 
-    def snapshot(self, windows, query="", window="focused", maximum=60):
+    def request(self, payload, timeout=15, *, force=False):
         with self.lock:
-            if self.closed or self.cancelled:
+            if (self.closed or self.cancelled) and not force:
                 raise protocol.ProtocolError("cancelled", "AT-SPI request cancelled")
             self.busy = True
         try:
-            if self.process is None or self.process.poll() is not None:
-                self.start()
-            with self.lock:
-                process = self.process
-                if self.closed or self.cancelled or process is None:
-                    raise protocol.ProtocolError("cancelled", "AT-SPI request cancelled")
-            process.stdin.write(protocol.encode({"windows": windows, "query": query,
-                                                 "window": window, "max": maximum}))
-            process.stdin.flush()
-            ready, _, _ = select.select([process.stdout], [], [], 15)
-            if not ready:
-                raise TimeoutError("AT-SPI timed out")
-            reply = protocol.decode(process.stdout.readline(protocol.MAX_LINE + 1))
+            with self.io_lock:
+                if self.process is None or self.process.poll() is not None:
+                    self.start()
+                with self.lock:
+                    process = self.process
+                    if (self.closed or self.cancelled) and not force or process is None:
+                        raise protocol.ProtocolError("cancelled", "AT-SPI request cancelled")
+                process.stdin.write(protocol.encode(payload))
+                process.stdin.flush()
+                ready, _, _ = select.select([process.stdout], [], [], timeout)
+                if not ready:
+                    raise TimeoutError("AT-SPI timed out")
+                reply = protocol.decode(process.stdout.readline(protocol.MAX_LINE + 1))
             if "error" in reply:
                 raise protocol.ProtocolError("a11y_unavailable", reply["error"])
-            return reply["elements"]
+            return reply
         except (OSError, ValueError, TimeoutError):
             self._stop_process()
             raise
@@ -378,15 +407,70 @@ class AccessibilityWorker:
             with self.lock:
                 self.busy = False
 
-    def _stop_process(self):
+    def snapshot(self, windows, query="", window="focused", maximum=60, role=""):
+        return self.request({"windows": windows, "query": query, "window": window,
+                             "max": maximum, "role": role})
+
+    def locate(self, ref, windows):
+        return self.request({"op": "locate", "ref": ref, "windows": windows}, timeout=8)
+
+    def acquire(self):
+        reply = self.request({"op": "acquire"}, timeout=10)
+        self.held = reply.get("enabled") is not None
+        return reply
+
+    def release(self):
+        """Hand org.a11y.Status IsEnabled back; a dead worker is covered by --recover."""
+        if not self.held:
+            return
+        self.held = False
+        try:
+            self.request({"op": "release"}, timeout=6, force=True)
+        except (protocol.ProtocolError, OSError, ValueError, TimeoutError):
+            self._recover()
+
+    def _recover(self):
+        """Fire-and-forget: a fresh worker undoes a switch its dead predecessor left on."""
+        try:
+            command, env = self._spec()
+            subprocess.Popen([*command, "--recover"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=sys.stderr, env=env, start_new_session=True)
+        except (OSError, protocol.ProtocolError, subprocess.SubprocessError) as exc:
+            print(f"pcpilot a11y recover: {exc}", file=sys.stderr)
+
+    def _stop_process(self, graceful=False):
         with self.lock:
             process, self.process = self.process, None
-            if process:
-                if process.poll() is None:
+            if not process:
+                return
+            killed = process.poll() is not None  # already dead: nobody released the switch
+            closed_stdin = False
+            if process.poll() is None:
+                if graceful:
+                    # EOF on stdin makes the worker restore accessibility and exit.
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
+                    closed_stdin = True
+                    try:
+                        process.wait(timeout=4)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        killed = True
+                else:
                     process.kill()
-                process.wait(timeout=2)
-                process.stdin.close()
-                process.stdout.close()
+                    killed = True
+            process.wait(timeout=2)
+            for stream in ((process.stdout,) if closed_stdin else (process.stdin, process.stdout)):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            if self.held:
+                self.held = False
+                if killed:
+                    self._recover()
 
     def cancel(self):
         with self.lock:
@@ -401,7 +485,7 @@ class AccessibilityWorker:
     def close(self):
         with self.lock:
             self.closed = True
-        self._stop_process()
+        self._stop_process(graceful=True)
 
 
 class Server:
@@ -411,7 +495,15 @@ class Server:
         self.max_side = int(os.environ.get("PCPILOT_MAX_SIDE", "1280"))
         if self.max_side < 1:
             raise ValueError("PCPILOT_MAX_SIDE must be positive")
-        self.elements = {}
+        self.elements = {}   # id -> row; ids stay valid for the session and re-resolve live
+        self.keys = {}       # (role, name, k-th) -> id, so a re-listed element keeps its id
+        self.next_id = 1
+        self.view = None     # last rendered snapshot, for observe diffs
+        self.notch_px = {}
+        self.notes = []
+        self.typed_note = None
+        self.a11y_lock = threading.Lock()
+        self.a11y_state = "off"
         self.scale_x = self.scale_y = 1.0
         self.width = self.height = self.model_width = self.model_height = 0
         self.cancelled = threading.Event()  # EOF / signal: terminal
@@ -429,6 +521,47 @@ class Server:
         if not math.isfinite(self.autostop_s) or self.autostop_s < 0:
             raise ValueError("PCPILOT_AUTOSTOP_S must be finite and nonnegative")
         self.idle_thread = None
+        self.daemon.on_end = self._on_daemon_end
+
+    def _on_daemon_end(self):
+        threading.Thread(target=self._a11y_off, name="pcpilot-a11y-off", daemon=True).start()
+
+    def _a11y_on(self):
+        """Firefox exports its page only while org.a11y.Status IsEnabled; hold it per session."""
+        if getattr(self.worker, "acquire", None) is None:
+            return
+        with self.a11y_lock:
+            if self.a11y_state != "off":
+                return
+            self.a11y_state = "pending"
+        threading.Thread(target=self._a11y_acquire, name="pcpilot-a11y-on", daemon=True).start()
+
+    def _a11y_acquire(self):
+        with self.a11y_lock:
+            if self.a11y_state != "pending":
+                return
+            try:
+                self.worker.acquire()
+                self.a11y_state = "on"
+            except (protocol.ProtocolError, OSError, ValueError, TimeoutError) as exc:
+                print(f"pcpilot a11y acquire: {exc}", file=sys.stderr)
+                self.a11y_state = "off"
+
+    def _a11y_off(self):
+        release = getattr(self.worker, "release", None)
+        with self.a11y_lock:
+            was, self.a11y_state = self.a11y_state, "off"
+            if release is not None and was != "off":
+                try:
+                    release()
+                except (protocol.ProtocolError, OSError, ValueError, TimeoutError, subprocess.SubprocessError) as exc:
+                    print(f"pcpilot a11y release: {exc}", file=sys.stderr)
+
+    def reset_elements(self):
+        self.elements.clear()
+        self.keys.clear()
+        self.next_id = 1
+        self.view = None
 
     def _idle_watchdog(self):
         while not self.cancelled.is_set():
@@ -486,15 +619,71 @@ class Server:
         return {"x": min(self.width - 1, round(x / self.scale_x)),
                 "y": min(self.height - 1, round(y / self.scale_y))}
 
-    def click_point(self, value):
+    def check_target(self, value):
+        """Preflight only: the id exists. Position is resolved live at click time."""
         if isinstance(value, str):
             element = self.elements.get(value)
             if element is None:
                 bad(f"unknown element {value}; call elements first")
-            if element.get("x") is None:
+            if element.get("ref") is None and element.get("x") is None:
                 bad(f"element {value} has no reliable position; take a screenshot")
-            return {"x": element["x"], "y": element["y"]}
+            return None
         return self.point(value)
+
+    def element_point(self, ident, style, deadline):
+        """Current click point of an element id; scrolls it into view like a person would."""
+        element = self.elements.get(ident)
+        if element is None:
+            bad(f"unknown element {ident}; call elements first")
+        ref = element.get("ref")
+        if ref is None:
+            if element.get("x") is None:
+                bad(f"element {ident} has no reliable position; take a screenshot")
+            return {"x": element["x"], "y": element["y"]}
+        pending = None  # (y before the last scroll, notches sent, app) -> calibrates px per notch
+        stalled = 0
+        for step in range(SCROLL_STEPS + 1):
+            windows = self.daemon.call("ui.window.list")["windows"]
+            located = self.worker.locate(ref, windows)
+            state = located.get("state")
+            if pending is not None and number(located.get("y")):
+                before, sent, app = pending
+                moved = before - located["y"]
+                if abs(moved) < 3:
+                    stalled += 1
+                else:
+                    stalled = 0
+                    if moved * sent > 0 and 8 <= abs(moved / sent) <= 600:
+                        self.notch_px[app] = abs(moved / sent)
+                pending = None
+                if stalled >= 2 and state != "in":
+                    bad(f"{ident}: the page does not scroll; call elements or take a screenshot")
+            if state == "in":
+                x, y = located.get("x"), located.get("y")
+                if not (number(x) and number(y) and 0 <= x < self.width and 0 <= y < self.height):
+                    bad(f"{ident} is off the screen; call elements or take a screenshot")
+                return {"x": round(x), "y": round(y)}
+            if state not in {"above", "below"} or not located.get("vp") or step == SCROLL_STEPS:
+                why = {"gone": "is gone", "side": "is sideways off the page"}.get(state, "has no reliable position")
+                bad(f"{ident} {why}; call elements or take a screenshot")
+            vx, vy, vw, vh = located["vp"]
+            app = next((w.get("app_id") for w in windows if str(w.get("id")) == str(element.get("wid"))), "")
+            delta = located["y"] - (vy + vh * TARGET_BAND)
+            notches = round(delta / self.notch_px.get(app, NOTCH_PX)) or (1 if delta > 0 else -1)
+            notches = max(-3 * SCROLL_OP_NOTCHES, min(3 * SCROLL_OP_NOTCHES, notches))
+            anchor = {"x": min(self.width - 1, max(0, round(vx + vw / 2))),
+                      "y": min(self.height - 1, max(0, round(vy + vh * .55)))}
+            remaining = notches
+            while remaining:
+                self.daemon.check_abort()
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise BatchBudgetReached
+                chunk = max(-SCROLL_OP_NOTCHES, min(SCROLL_OP_NOTCHES, remaining))
+                self.daemon.call("ui.pointer.scroll", {**anchor, "dx": 0, "dy": chunk, "style": style})
+                remaining -= chunk
+            pending = (located["y"], notches, app)
+            time.sleep(SCROLL_SETTLE_S)
+        bad(f"{ident} could not be scrolled into view; call elements or take a screenshot")
 
     def screenshot(self, args):
         self.screen()
@@ -533,28 +722,129 @@ class Server:
             note += " global coords"
         return [{"type": "image", "mimeType": "image/png", "data": encoded}, text(note)]
 
-    def list_elements(self, args):
+    def register(self, rows):
+        """Give each row a session-stable id (same role, name and occurrence keeps its id)."""
+        seen = {}
+        out = []
+        for row in rows:
+            row = dict(row)
+            base = (row["role"], row["name"])
+            occurrence = seen.get(base, 0)
+            seen[base] = occurrence + 1
+            key = base + (occurrence,)
+            ident = self.keys.get(key)
+            if ident is None:
+                ident = f"e{self.next_id}"
+                self.next_id += 1
+                self.keys[key] = ident
+            # A listed point must be on screen, whatever AT-SPI claims for the node.
+            if row.get("x") is not None and not (0 <= row["x"] < self.width and 0 <= row["y"] < self.height):
+                row["x"] = row["y"] = None
+            row["id"] = ident
+            self.elements.pop(ident, None)
+            self.elements[ident] = row
+            out.append(row)
+        while len(self.elements) > REGISTRY_CAP:
+            stale = next(iter(self.elements))
+            del self.elements[stale]
+            for key in [k for k, v in self.keys.items() if v == stale]:
+                del self.keys[key]
+        return out
+
+    def row_text(self, item):
+        vis = item.get("vis", "in")
+        if vis != "in":
+            dist = f"{item.get('dist', 0):.1f}".rstrip("0").rstrip(".") if vis != "side" else ""
+            position = {"above": "↑", "below": "↓", "side": "→"}.get(vis, "?") + dist
+        elif item.get("x") is None:
+            position = "?"
+        else:
+            px = min(self.model_width - 1, round(item["x"] * self.scale_x))
+            py = min(self.model_height - 1, round(item["y"] * self.scale_y))
+            position = f"{px},{py}"
+        line = f'{item["id"]} {role_alias(item["role"])} {json.dumps(item["name"], ensure_ascii=False)} {position}'
+        if item.get("value"):
+            line += " =" + json.dumps(item["value"], ensure_ascii=False)
+        states = " ".join(item.get("states", []))
+        return line + (f" [{states}]" if states else "")
+
+    def page_text(self, page, rows):
+        tabs = page.get("tabs") or []
+        bits = [page.get("app") or "page", json.dumps(page.get("title", ""), ensure_ascii=False)]
+        if page.get("url"):
+            bits.append(page["url"][:140])
+        if len(tabs) > 1:
+            index = next((i for i, tab in enumerate(tabs, 1) if tab[1]), 0)
+            bits.append(f"tab {index}/{len(tabs)}")
+        if page.get("loading"):
+            bits.append("loading")
+        if page.get("notready"):
+            bits.append("page not ready: wait, or key ctrl+n then ctrl+w once if this browser predates PCPilot")
+        address = page.get("address")
+        if address and address != page.get("url"):
+            bits.append("addr " + json.dumps(address[:100], ensure_ascii=False))
+        focus = page.get("focus")
+        if focus:
+            ident = next((row["id"] for row in rows if row.get("ref") == focus.get("ref")), None)
+            bits.append("focus " + (ident or f'{role_alias(focus["role"])} {json.dumps(focus["name"], ensure_ascii=False)}'))
+        text_ = " · ".join(bits)
+        if len(tabs) > 1:
+            text_ += "\ntabs: " + " | ".join(("*" if tab[1] else "") + f"{i} {tab[0][:30]}"
+                                             for i, tab in enumerate(tabs[:12], 1))
+        return text_
+
+    def list_elements(self, args, diff=False):
         self.screen()
         windows = self.daemon.call("ui.window.list")["windows"]
-        snapshot = self.worker.snapshot(windows, args.get("query", ""), args.get("window", "focused"), args.get("max", 60))
+        if args.get("window", "focused") == "focused" and not any(w.get("focused") for w in windows):
+            return [text("No focused window: pass window:<id> (see windows) or focus one.")]
+        reply = self.worker.snapshot(windows, args.get("query", ""), args.get("window", "focused"),
+                                     args.get("max", 60), args.get("role", ""))
         self.daemon.check_abort()
-        self.elements = {f"e{i}": dict(item) for i, item in enumerate(snapshot, 1)}
-        # A visible window may extend off-screen. Never offer an off-screen
-        # center as a click target, even if AT-SPI calls the node visible.
-        for item in self.elements.values():
-            if item.get("x") is not None and not (
-                    0 <= item["x"] < self.width and 0 <= item["y"] < self.height):
-                item["x"] = item["y"] = None
-        lines = []
-        for ident, item in self.elements.items():
-            if item.get("x") is None:
-                position = "?"
-            else:
-                px = min(self.model_width - 1, round(item["x"] * self.scale_x))
-                py = min(self.model_height - 1, round(item["y"] * self.scale_y))
-                position = f"{px},{py}"
-            states = " ".join(item.get("states", []))
-            lines.append(f'{ident} {item["role"]} {json.dumps(item["name"], ensure_ascii=False)} {position}' + (f" [{states}]" if states else ""))
+        if isinstance(reply, list):
+            reply = {"elements": reply}
+        if not reply.get("elements") and not reply.get("page") and not args.get("query") and not args.get("role"):
+            focused = next((w for w in windows if w.get("focused")), {})
+            if reply.get("absent") or any(part in str(focused.get("app_id", "")).casefold() for part in BROWSERS):
+                return [text("No accessibility tree for this window. A browser started before PCPilot exports "
+                             "its page only after a new window: key ctrl+n then ctrl+w once, then elements again; or screenshot.")]
+        rows = self.register(reply.get("elements", []))
+        page = reply.get("page")
+        header = self.page_text(page, rows) if page else ""
+        focused = next((w.get("id") for w in windows if w.get("focused")), None)
+        scope = (focused, args.get("window", "focused"), args.get("query", ""), args.get("role", ""))
+        signature = {row["id"]: (tuple(row.get("states", [])), row.get("value"), row.get("vis", "in") == "in")
+                     for row in rows}
+        previous, self.view = self.view, {"scope": scope, "sig": signature, "header": header}
+        if diff and previous is not None and previous["scope"] == scope:
+            lines = [header] if header and header != previous["header"] else []
+            for row in rows:
+                before = previous["sig"].get(row["id"])
+                now = signature[row["id"]]
+                if before is None or before[:2] != now[:2] or (now[2] and not before[2]):
+                    lines.append(self.row_text(row))
+            gone = sum(1 for ident, sig in previous["sig"].items()
+                       if ident not in signature or (sig[2] and not signature[ident][2]))
+            if gone:
+                lines.append(f"-{gone} gone/off-screen")
+            return [text("\n".join(lines) or "no change")]
+        lines = [header] if header else []
+        if page:
+            merged = [(h["o"], h) for h in reply.get("headings", [])]
+            merged += [(row.get("o", 0) if not row.get("chrome") else 10 ** 9, row) for row in rows]
+            merged.sort(key=lambda pair: pair[0])
+            for _order, item in merged:
+                if "id" in item:
+                    lines.append(self.row_text(item))
+                else:
+                    hint = ""
+                    if item.get("vis") in {"above", "below"}:
+                        hint = f' {"↑" if item["vis"] == "above" else "↓"}{item["dist"]:g}'
+                    lines.append("#" * max(1, min(6, item.get("level") or 1)) + " " + item["name"][:80] + hint)
+            if page.get("extra"):
+                lines.append(f'+{page["extra"]} more (query/role/max)')
+        else:
+            lines += [self.row_text(row) for row in rows]
         return [text("\n".join(lines) or "No elements")]
 
     def action(self, action, style="human", deadline=None):
@@ -574,9 +864,16 @@ class Server:
         if deadline is not None and time.monotonic() >= deadline:
             raise BatchBudgetReached
         if name in {"click", "double_click", "right_click"}:
-            return self.daemon.call("ui.pointer.click", {**self.click_point(value),
+            target = self.element_point(value, style, deadline) if isinstance(value, str) else self.point(value)
+            return self.daemon.call("ui.pointer.click", {**target,
                         "button": "right" if name == "right_click" else "left", "count": 2 if name == "double_click" else 1,
                         "style": style})
+        if name == "type":
+            return self.type_text(value, style, deadline)
+        if name == "launch" and style == "human":
+            return self.note_launch(self.human_launch(value, deadline))
+        if name == "open" and style == "human":
+            return self.human_open(value, deadline)
         if name == "move":
             return self.daemon.call("ui.pointer.move", {**self.point(value), "style": style})
         if name == "drag":
@@ -599,14 +896,196 @@ class Server:
                 arguments.update(self.point(value[2:]))
             return self.daemon.call("ui.window.action", arguments)
         op, arguments = {
-            "type": ("key.type", {"text": value}), "key": ("key.press", {"keys": value}),
+            "key": ("key.press", {"keys": value}),
             "launch": ("app.launch", {"app": value}), "open": ("open_uri", {"uri": value}),
             "focus": ("window.action", {"id": value, "action": "activate"}),
             "clipboard_set": ("clipboard.set", {"text": value}), "clipboard_get": ("clipboard.get", {}),
         }[name]
-        if name in {"type", "focus"}:
+        if name in {"launch", "open", "focus"} and style != "human":
             arguments["style"] = style
-        return self.daemon.call(f"ui.{op}", arguments)
+        elif name == "focus":
+            arguments["style"] = style
+        result = self.daemon.call(f"ui.{op}", arguments)
+        return self.note_launch(result) if name == "launch" else result
+
+    def note_launch(self, result):
+        window = result.get("window") if isinstance(result, dict) else None
+        if isinstance(window, dict) and "id" in window:
+            self.notes.append(f'launched {window["id"]} {json.dumps(self.window_label(window), ensure_ascii=False)}')
+        return result
+
+    # --- text, launch and open: person-like orchestration over extension primitives
+    def type_text(self, value, style, deadline):
+        pieces = self.split_text(value, TYPE_CHUNK.get(style, 240))
+        done = 0
+        for index, piece in enumerate(pieces):
+            if index and deadline is not None and time.monotonic() >= deadline:
+                self.typed_note = f"typed {done}/{len(value)} chars"
+                raise BatchBudgetReached
+            self.type_piece(piece, style)
+            done += len(piece)
+        return {}
+
+    @staticmethod
+    def split_text(value, limit):
+        """Equal-ish pieces <= limit, cut at spaces. Above 120 chars the extension types briskly,
+        so for long text every piece stays above that and nothing is left to crawl at 137 ms/char."""
+        if len(value) <= limit + (limit // 12 if limit < 1000 else 0):   # 241..260: still one fitted op
+            return [value]
+        count = -(-len(value) // limit)
+        pieces = []
+        rest = value
+        for left in range(count, 1, -1):
+            ideal = -(-len(rest) // left)
+            low = max(121 if limit > 120 else 1, ideal - 15)
+            cut = rest.rfind(" ", low, ideal + 1)
+            cut = cut + 1 if cut != -1 else ideal
+            pieces.append(rest[:cut])
+            rest = rest[cut:]
+        pieces.append(rest)
+        return pieces
+
+    def type_piece(self, piece, style):
+        try:
+            self.daemon.call("ui.key.type", {"text": piece, "style": style})
+        except protocol.ProtocolError as exc:
+            # The extension refuses text it cannot finish inside its op guard: halve it.
+            if exc.code != "bad_args" or len(piece) < 24:
+                raise
+            half = piece.rfind(" ", 0, len(piece) // 2 + 1)
+            half = half + 1 if half > 4 else len(piece) // 2
+            self.type_piece(piece[:half], style)
+            self.type_piece(piece[half:], style)
+
+    def pause(self, seconds):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            self.daemon.check_abort()
+            time.sleep(min(.05, max(0, end - time.monotonic())))
+
+    def desktop_info(self):
+        try:
+            return self.daemon.call("ui.desktop.info") or {}
+        except protocol.ProtocolError as exc:
+            if exc.code != "unknown_op":
+                raise
+        try:
+            return {"pointer": self.daemon.call("ui.pointer.position")}
+        except protocol.ProtocolError as exc:
+            if exc.code != "unknown_op":
+                raise
+            return {}
+
+    def human_launch(self, name, deadline):
+        """Super, type the app name, Enter: the way a person opens an app."""
+        try:
+            apps = self.daemon.call("ui.app.search", {"query": name}).get("apps")
+        except protocol.ProtocolError as exc:
+            if exc.code != "unknown_op":
+                raise
+            apps = None
+        if apps is not None and not apps:
+            # A desktop id or an unknown name cannot be typed into the overview: the programmatic
+            # launch resolves ids and reports unknown apps itself.
+            return self.daemon.call("ui.app.launch", {"app": name, "style": "fast"})
+        label = (apps[0].get("name") if apps else None) or name
+        before = {w["id"] for w in self.daemon.call("ui.window.list")["windows"]}
+        overview = self.desktop_info().get("overview")  # None: an extension that cannot tell
+        if overview is not True:   # never toggle an already open overview shut
+            try:
+                self.daemon.call("ui.key.press", {"keys": "super"})
+            except protocol.ProtocolError as exc:
+                if exc.code not in {"bad_args", "unknown_op", "failed"}:
+                    raise
+                return self.daemon.call("ui.app.launch", {"app": name, "style": "fast"})
+            if overview is None:
+                self.pause(.7)
+            else:
+                end = time.monotonic() + 1.5
+                while time.monotonic() < end and self.desktop_info().get("overview") is not True:
+                    self.pause(.15)
+                if self.desktop_info().get("overview") is not True:
+                    return self.daemon.call("ui.app.launch", {"app": name, "style": "fast"})
+        else:
+            self.pause(.2)
+        self.type_text(label, "human", deadline)
+        self.pause(.4)
+        self.daemon.call("ui.key.press", {"keys": "Return"})
+        wanted = label.casefold()
+        end = time.monotonic() + 8
+        while time.monotonic() < end:
+            self.pause(.4)
+            windows = self.daemon.call("ui.window.list")["windows"]
+            fresh = [w for w in windows if w["id"] not in before and not w.get("minimized")]
+            running = [w for w in windows if w.get("focused") and wanted in
+                       f'{w.get("app_id", "")} {w.get("title", "")}'.casefold()]
+            found = (fresh or running or [None])[0]
+            if found:
+                self.notes.append(f'launched {found["id"]} {json.dumps(self.window_label(found), ensure_ascii=False)}')
+                return {}
+        try:
+            self.daemon.call("ui.key.press", {"keys": "Escape"})
+        except protocol.ProtocolError:
+            pass
+        raise protocol.ProtocolError("failed", f"launch {name}: no window appeared; take a screenshot")
+
+    def human_open(self, uri, deadline):
+        """Ctrl+L, type the address, Enter in the focused browser; otherwise the default handler."""
+        if "\n" in uri or "\r" in uri:
+            bad("open: address must be a single line")
+        windows = self.daemon.call("ui.window.list")["windows"]
+        focused = next((w for w in windows if w.get("focused")), None)
+        if not focused or not any(part in str(focused.get("app_id", "")).casefold() for part in BROWSERS):
+            return self.daemon.call("ui.open_uri", {"uri": uri, "style": "fast"})
+        self.daemon.call("ui.key.press", {"keys": "ctrl+l"})
+        self.pause(.3)
+        self.type_text(uri, "human", deadline)
+        self.pause(.25)
+        self.daemon.call("ui.key.press", {"keys": "Return"})
+        return {}
+
+    def windows_text(self):
+        self.screen()
+        rows = self.daemon.call("ui.window.list")["windows"]
+        info = self.desktop_info()
+        header = []
+        workspace = info.get("workspace")
+        count = workspace.get("count") if isinstance(workspace, dict) else None
+        if isinstance(workspace, dict) and number(workspace.get("active")):
+            header.append(f'ws {workspace["active"] + 1}/{count}')
+        monitors = info.get("monitors") if isinstance(info.get("monitors"), list) else []
+        if monitors:
+            parts = []
+            for index, mon in enumerate(monitors):
+                size = f'{round(mon["width"] * self.scale_x)}x{round(mon["height"] * self.scale_y)}'
+                if len(monitors) > 1:
+                    size = f'{index}:{size}+{round(mon["x"] * self.scale_x)}+{round(mon["y"] * self.scale_y)}'
+                if number(mon.get("scale")) and mon["scale"] != 1:
+                    size += f'@{mon["scale"]:g}'
+                parts.append(size + ("*" if len(monitors) > 1 and mon.get("primary") else ""))
+            header.append("mon " + " ".join(parts))
+        if "overview" in info:
+            header.append("overview " + ("on" if info["overview"] else "off"))
+        pointer = info.get("pointer")
+        if isinstance(pointer, dict) and number(pointer.get("x")) and number(pointer.get("y")):
+            header.append(f'ptr {round(pointer["x"] * self.scale_x)},{round(pointer["y"] * self.scale_y)}')
+        if info.get("scheme"):
+            header.append(str(info["scheme"]))
+        lines = [" · ".join(header)] if header else []
+        for w in rows:
+            bounds = ",".join(str(round(w[k] * (self.scale_x if k in {"x", "width"} else self.scale_y)))
+                              for k in ("x", "y", "width", "height"))
+            line = f'{w["id"]} {"* " if w.get("ai") else ""}{w.get("app_id", "?")} {json.dumps(w["title"], ensure_ascii=False)} {bounds}'
+            if isinstance(count, int) and count > 1 and number(w.get("workspace")):
+                line += " w*" if w["workspace"] < 0 else f' w{w["workspace"] + 1}'
+            if len(monitors) > 1 and number(w.get("monitor")) and w["monitor"] >= 0:
+                line += f' m{w["monitor"]}'
+            flags = [name for name, key in (("focused", "focused"), ("min", "minimized"), ("max", "maximized"),
+                                            ("full", "fullscreen")) if w.get(key)]
+            if w.get("new") and not w.get("ai"):
+                flags.append("new")  # AI-opened windows already carry the * prefix
+            lines.append(line + (f' [{" ".join(flags)}]' if flags else ""))
+        return "\n".join(lines) or "No windows"
 
     def window_size(self, value):
         width, height = vector(value, 2)
@@ -695,13 +1174,19 @@ class Server:
         return (title or app.removesuffix(".desktop").rsplit(".", 1)[-1] or "window")[:100]
 
     def stop(self, args):
+        try:
+            return self._stop_session(args)
+        finally:
+            self._a11y_off()
+
+    def _stop_session(self, args):
         # Never auto-begin to tidy up; a previous abort/cancel prohibits *all*
         # further sends, including session.end. Inactive stop is entirely local.
         # Cancellation may replace the owner while an idle wrapup is unwinding.
         # Never end that new connection's session from the old cleanup.
         daemon = self.daemon
         daemon.check_abort()
-        self.elements.clear()
+        self.reset_elements()
         if not daemon.active:
             return [text("stopped")]
         wrapup = None
@@ -778,6 +1263,7 @@ class Server:
             action = args["action"]
             if action == "start":
                 self.daemon.begin(args.get("resume", False))
+                self._a11y_on()
                 return [text("active")]
             if action == "stop":
                 return self.stop(args)
@@ -788,24 +1274,21 @@ class Server:
                 self.daemon.check_abort()
             return [text(json.dumps(status, separators=(",", ":")))]
         self.daemon.ensure()
+        self._a11y_on()
         if name == "screenshot":
             return self.screenshot(args)
         if name == "elements":
             return self.list_elements(args)
         if name == "windows":
-            self.screen()
-            rows = []
-            for w in self.daemon.call("ui.window.list")["windows"]:
-                bounds = ",".join(str(round(w[k] * (self.scale_x if k in {"x", "width"} else self.scale_y)))
-                                  for k in ("x", "y", "width", "height"))
-                rows.append(f'{w["id"]} {"* " if w.get("ai") else ""}{w.get("app_id", "?")} {json.dumps(w["title"], ensure_ascii=False)} {bounds}' + (" [focused]" if w.get("focused") else ""))
-            return [text("\n".join(rows) or "No windows")]
+            return [text(self.windows_text())]
         self.screen()
+        self.notes = []
+        self.typed_note = None
         # Preflight all coordinates and ids before executing the batch.
         for action in args["actions"]:
             key, value = next(iter(action.items()))
             if key in ("click", "double_click", "right_click"):
-                self.click_point(value)
+                self.check_target(value)
             elif key == "move" or (key == "scroll" and len(value) == 3):
                 self.point(value[:2])
             elif key == "drag":
@@ -817,8 +1300,9 @@ class Server:
                 elif value[1] == "move":
                     self.point(value[2:])
         style = args.get("speed", "human")
+        requested = style
         downgraded = (style == "human" and
-                      sum(next(iter(action)) in STYLED_ACTIONS for action in args["actions"]) > HUMAN_BATCH_LIMIT)
+                      sum(next(iter(action)) in STYLED_ACTIONS - {"type"} for action in args["actions"]) > HUMAN_BATCH_LIMIT)
         if downgraded:
             style = "fast"
         clipboard = []
@@ -829,7 +1313,9 @@ class Server:
                 if time.monotonic() >= deadline:
                     break
                 try:
-                    result = self.action(action, style, deadline)
+                    # Typing is what people watch: a long batch never turns it into a pasted blob.
+                    result = self.action(action, "human" if "type" in action and requested == "human" else style,
+                                         deadline)
                 except BatchBudgetReached:
                     break
                 completed += 1
@@ -838,6 +1324,9 @@ class Server:
             self.daemon.check_abort()
             partial = completed != len(args["actions"])
             note = f"partial: {completed}/{len(args['actions'])} done, budget" if partial else f"ok {completed}"
+            if self.typed_note:
+                note += f" · {self.typed_note}"
+            note += "".join(f" · {item}" for item in self.notes)
             if downgraded:
                 note += " · speed fast (batch)"
             observation = args.get("observe", "none")
@@ -848,7 +1337,7 @@ class Server:
             if observation == "screenshot":
                 content += self.screenshot({})
             elif observation == "elements":
-                content += self.list_elements({})
+                content += self.list_elements({}, diff=True)
             return content
         except protocol.ProtocolError as exc:
             raise protocol.ProtocolError(exc.code, f"after {completed} actions: {exc.message}") from exc
@@ -912,6 +1401,7 @@ class Server:
             if self.request_cancelled.is_set() and not self.cancelled.is_set():
                 label, theme, aborted = self.daemon.label, self.daemon.theme, self.daemon.aborted
                 self.daemon = DaemonClient()
+                self.daemon.on_end = self._on_daemon_end
                 self.daemon.label = label
                 self.daemon.theme = theme
                 # Request cancellation does not create a user abort, and it
@@ -937,6 +1427,10 @@ class Server:
             with self.idle_condition:
                 self.idle_deadline = None
                 self.idle_condition.notify_all()
+            if request_id is not None or getattr(self.worker, "held", False):
+                # The owner session is over: switch accessibility back (a killed worker is
+                # covered by its own EOF handling and by the --recover safety net).
+                self._on_daemon_end()
             if request_id is None:
                 self.worker.close()
             elif hasattr(self.worker, "cancel"):
