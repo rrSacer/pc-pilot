@@ -128,7 +128,7 @@ fi
 cat <<'EOF'
 
 Instalação concluída. Saia da sessão GNOME e entre novamente uma vez para carregar a extensão.
-Teste: sudo pcpilot status; em seguida peça ao Claude para abrir o Firefox. A tela deve mostrar a borda vermelha e o aviso.
+Teste: sudo pcpilot status; em seguida peça ao Claude para abrir o Firefox. A tela deve mostrar a borda colorida da IA e o aviso.
 Ctrl+Alt+Esc devolve o controle imediatamente.
 Emergência por outro terminal ou SSH: sudo pcpilot release ou sudo systemctl stop pcpilot.
 EOF
