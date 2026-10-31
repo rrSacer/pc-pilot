@@ -42,7 +42,7 @@ def on_activate(app):
         getattr(box, f"set_margin_{m}")(12)
 
     entry = Gtk.Entry()
-    entry.connect("changed", lambda e: log(ev="entry", text=e.get_text()))
+    entry.connect("changed", lambda e: log(ev="entry", text=e.get_text(), t=time.monotonic()))
     box.append(entry)
 
     tv = Gtk.TextView()
@@ -76,7 +76,7 @@ def on_activate(app):
     area.add_controller(area_click)
     scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.BOTH_AXES |
                                        Gtk.EventControllerScrollFlags.DISCRETE)
-    scroll.connect("scroll", lambda c, dx, dy: (log(ev="scroll", dx=dx, dy=dy), False)[1])
+    scroll.connect("scroll", lambda c, dx, dy: (log(ev="scroll", dx=dx, dy=dy, t=time.monotonic()), False)[1])
     area.add_controller(scroll)
     box.append(area)
 

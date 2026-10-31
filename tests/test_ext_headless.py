@@ -828,25 +828,25 @@ class ExtensionHeadlessTests(unittest.TestCase):
 
         jump(100, 100)
         long_move = timed("ui.pointer.move", {"x": 1500, "y": 800})
-        self.assertTrue(1.3 <= long_move <= 3.4, long_move)  # ~1.7 km/s peak, slow homing
+        self.assertTrue(4.0 <= long_move <= 6.2, long_move)  # 1.5k px: ~5 s (cap 5.5 s), slow homing
         jump(300, 300)
         short_move = timed("ui.pointer.move", {"x": 380, "y": 360})
-        self.assertTrue(.45 <= short_move <= 1.4, short_move)
+        self.assertTrue(.8 <= short_move <= 1.7, short_move)
         jump(100, 100)
         fast = timed("ui.pointer.move", {"x": 1500, "y": 800, "style": "fast"})
         self.assertTrue(.08 <= fast <= .5, fast)
         jump(100, 100)
         self.assertLess(timed("ui.pointer.move", {"x": 1500, "y": 800, "style": "instant"}), .15)
         hover = timed("ui.pointer.click", {})  # at the current position: hover, then press
-        self.assertTrue(.15 <= hover <= .9, hover)
+        self.assertTrue(.2 <= hover <= .8, hover)  # hover 200-450 ms, then press
         jump(100, 100)
         far_click = timed("ui.pointer.click", {"x": 1700, "y": 900})
-        self.assertTrue(1.6 <= far_click <= 6, far_click)  # glide + hover + press
+        self.assertTrue(4.8 <= far_click <= 8, far_click)  # glide (cap 5.5 s) + hover + press
         area = layout["widgets"]["area"]
         x, y = win["x"] + area[0] + 40, win["y"] + area[1] + 40
         jump(x, y)
         drag = timed("ui.pointer.drag", {"from": {"x": x, "y": y}, "to": {"x": x + 300, "y": y + 20}})
-        self.assertTrue(.9 <= drag <= 5, drag)
+        self.assertTrue(1.2 <= drag <= 7, drag)
 
     def test_wrapup_returns_to_origin_fades_and_resumes(self):
         a = self._agent(); self.addCleanup(self._end_client, a)
@@ -894,6 +894,215 @@ class ExtensionHeadlessTests(unittest.TestCase):
         self.assertGreater(self._count_near(back.crop(self.PILL_BOX), self._rgba(theme("gemini")["pill"]["bg"]), 12), 4000)
         self.assertTrue(close(back.getpixel((1, 540)), rim_color("gemini", 1, 540), 16))
         self.assertTrue(all(not w["new"] for w in a.call("ui.window.list")["windows"]), "fresh snapshot")
+
+    # ---- v2.2: slower arcs, wheel notches, character-by-character typing, mouse-driven windows ----
+
+    @staticmethod
+    def _measure(label, **kv):
+        """Print a measurement line when PCPILOT_PRINT_MEASURES is set (before/after comparisons)."""
+        if os.environ.get("PCPILOT_PRINT_MEASURES"):
+            print(f"MEASURE {label} " + " ".join(f"{k}={v}" for k, v in kv.items()), flush=True)
+
+    def _probe(self, a):
+        layout = next(r for r in reversed(self._wait_probe(lambda rs: any(x.get("ev") == "layout" for x in rs)))
+                      if r.get("ev") == "layout")
+        win = next(w for w in a.call("ui.window.list")["windows"] if w["title"] == layout["title"])
+        return layout, win
+
+    def _rows_of(self, ev, since=0, **match):
+        rows = [r for r in self._rows() if r.get("ev") == ev and all(r.get(k) == v for k, v in match.items())]
+        return rows[since:]
+
+    def test_human_pointer_path_is_a_slow_arc_in_real_events(self):
+        a = self._begin(); self.addCleanup(self._end_client, a)
+        _, win = self._probe(a)
+        a.call("ui.window.action", {"id": win["id"], "action": "activate", "style": "instant"})
+        a.call("ui.window.action", {"id": win["id"], "action": "fullscreen"})
+        self.addCleanup(lambda: a.call("ui.window.action", {"id": win["id"], "action": "unfullscreen"}))
+        self._wait_probe(lambda _: next(w for w in a.call("ui.window.list")["windows"]
+                                        if w["id"] == win["id"])["width"] == 1920)
+        time.sleep(.6)  # let GTK resize to the fullscreen surface
+
+        def reach(start, end, style="human"):
+            a.call("ui.pointer.move", {"x": start[0], "y": start[1], "style": "instant"}); time.sleep(.4)
+            mark = len(self._rows_of("motion", source="window"))
+            t0 = time.monotonic()
+            a.call("ui.pointer.move", {"x": end[0], "y": end[1], "style": style}, timeout=30)
+            call_s = time.monotonic() - t0
+            time.sleep(.3)
+            rows = self._rows_of("motion", mark, source="window")
+            self.assertGreaterEqual(len(rows), 4, rows)
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            length = (dx * dx + dy * dy) ** .5
+            dev = max(abs((r["x"] - start[0]) * dy - (r["y"] - start[1]) * dx) / length for r in rows)
+            span = rows[-1]["t"] - rows[0]["t"]
+            self._measure("move", dist=round(length), call_s=round(call_s, 2), event_span_s=round(span, 2),
+                          max_perp_dev_px=round(dev, 1), dev_pct=round(100 * dev / length, 1), events=len(rows))
+            return length, call_s, dev
+
+        for start, end, lo, hi in (((600, 500), (680, 560), .8, 1.7), ((600, 500), (840, 680), 1.3, 2.3),
+                                   ((150, 150), (1100, 870), 3.0, 5.7)):
+            length, call_s, dev = reach(start, end)
+            self.assertTrue(lo <= call_s <= hi, (length, call_s))  # too fast fails here
+            self.assertGreaterEqual(dev, .045 * length, (length, dev))  # a straight line fails here
+            self.assertLessEqual(dev, .17 * length + 3, (length, dev))
+        # fast stays a short straight stroke.
+        length, call_s, dev = reach((150, 150), (1100, 870), "fast")
+        self.assertLess(call_s, .6); self.assertLess(dev, 2.5)
+
+    def test_scroll_is_irregular_bursts_of_discrete_notches(self):
+        a = self._begin(); self.addCleanup(self._end_client, a)
+        layout, win = self._probe(a)
+        a.call("ui.window.action", {"id": win["id"], "action": "activate", "style": "instant"})
+        area = layout["widgets"]["area"]
+        x, y = win["x"] + area[0] + 60, win["y"] + area[1] + 60
+        a.call("ui.pointer.move", {"x": x, "y": y, "style": "instant"}); time.sleep(.3)
+        mark = len(self._rows_of("scroll"))
+        t0 = time.monotonic()
+        res = a.call("ui.pointer.scroll", {"x": x, "y": y, "dy": 14}, timeout=30)
+        call_s = time.monotonic() - t0
+        self._wait_probe(lambda rs: sum(1 for r in rs if r.get("ev") == "scroll") - mark >= res["notches"])
+        rows = self._rows_of("scroll", mark)
+        self.assertEqual(len(rows), res["notches"])
+        self.assertTrue(all(abs(r["dy"]) == 1 and r["dx"] == 0 for r in rows), "one discrete notch per event")
+        self.assertEqual(sum(r["dy"] for r in rows), 14)
+        self.assertEqual(res["net"], {"dx": 0, "dy": 14})
+        self.assertEqual(res["anchor"], {"x": x, "y": y})
+        ts = [r["t"] for r in rows]
+        gaps = [round(1000 * (b - a_), 0) for a_, b in zip(ts, ts[1:])]
+        pauses = [g for g in gaps if g >= 240]; quick = [g for g in gaps if g < 240]
+        self._measure("scroll", call_s=round(call_s, 2), notches=len(rows), gaps_ms=gaps)
+        self.assertGreaterEqual(len(pauses), 2, gaps)  # "looking" pauses between bursts
+        self.assertLessEqual(max(pauses), 1200, gaps)
+        self.assertGreaterEqual(len(quick), 7, gaps)  # the notches themselves come in quick bursts
+        self.assertGreaterEqual(min(quick), 40, gaps)
+        mean = sum(gaps) / len(gaps)
+        sd = (sum((g - mean) ** 2 for g in gaps) / len(gaps)) ** .5
+        self.assertGreater(sd / mean, .6, gaps)  # not a regular rhythm
+        self.assertTrue(2.0 <= call_s <= 14.5, call_s)
+        # The other wheel directions, fast: back to back.
+        mark = len(self._rows_of("scroll"))
+        a.call("ui.pointer.scroll", {"x": x, "y": y, "dy": -2, "dx": 2, "style": "fast"})
+        self._wait_probe(lambda rs: sum(1 for r in rs if r.get("ev") == "scroll") - mark >= 4)
+
+    def test_typing_lands_character_by_character(self):
+        a = self._begin(); self.addCleanup(self._end_client, a)
+        layout, win = self._probe(a)
+        a.call("ui.window.action", {"id": win["id"], "action": "activate", "style": "instant"})
+        entry = layout["widgets"]["entry"]
+        a.call("ui.pointer.click", {"x": win["x"] + entry[0] + 30, "y": win["y"] + entry[1] + 10, "style": "fast"})
+
+        def fresh():
+            a.call("ui.key.press", {"keys": "ctrl+a"}); a.call("ui.key.press", {"keys": "BackSpace"})
+            time.sleep(.3)
+            return len(self._rows_of("entry"))
+
+        def check(text, method=None, per=2, mean_lo=60, mean_hi=300):
+            mark = fresh()
+            args = {"text": text}
+            if method:
+                args["method"] = method
+            t0 = time.monotonic()
+            res = a.call("ui.key.type", args, timeout=30)
+            call_s = time.monotonic() - t0
+            time.sleep(.4)
+            rows = self._rows_of("entry", mark)
+            texts = [r["text"] for r in rows]
+            self.assertEqual(texts[-1], text, texts)
+            steps = [len(b) - len(a_) for a_, b in zip([""] + texts, texts)]
+            self.assertTrue(all(1 <= n <= per for n in steps), steps)  # never more than 2 characters at once
+            for a_, b in zip([""] + texts, texts):
+                self.assertTrue(b.startswith(a_))
+            self.assertGreaterEqual(len(rows), .8 * len(text), texts)
+            ts = [r["t"] for r in rows]
+            gaps = [1000 * (y - x) for x, y in zip(ts, ts[1:])]
+            self._measure("typing", method=res["method"], chars=len(text), commits=len(rows),
+                          call_s=round(call_s, 2), gaps_ms=[round(g) for g in gaps])
+            self.assertTrue(mean_lo <= sum(gaps) / len(gaps) <= mean_hi, gaps)
+            self.assertGreaterEqual(max(gaps), 150, gaps)  # word pauses
+            self.assertLessEqual(max(gaps), 1500, gaps)
+            return res
+
+        self.assertEqual(check("Olá, tudo bem? Sim.", "im")["method"], "im")
+        self.assertEqual(check("Abc def 123 xyz.", "keyval")["method"], "keyval")
+        # Only the exotic characters would be pasted, one at a time.
+        res = check("ação é", "clipboard", per=1, mean_lo=100, mean_hi=900)
+        self.assertEqual(res["method"], "clipboard")
+        # fast / instant keep the old behaviour: it lands at once.
+        for style in ("fast", "instant"):
+            mark = fresh()
+            a.call("ui.key.type", {"text": "Tudo de uma vez só", "style": style})
+            time.sleep(.4)
+            rows = self._rows_of("entry", mark)
+            self.assertEqual(rows[-1]["text"], "Tudo de uma vez só")
+            self.assertLessEqual(len(rows), 2, rows)
+
+    def test_desktop_info_window_fields_and_keyboard_launch_through_the_overview(self):
+        a = self._begin(); self.addCleanup(self._end_client, a)
+        info = a.call("ui.desktop.info")
+        self.assertEqual(sorted(info), ["focus", "monitors", "overview", "pointer", "scheme", "workspace"])
+        self.assertTrue(info["workspace"]["count"] >= 1 and 0 <= info["workspace"]["active"] < info["workspace"]["count"])
+        self.assertIsInstance(info["overview"], bool)  # the nested shell may still show its startup overview
+        if info["overview"]:
+            a.call("ui.window.action", {"id": self._probe(a)[1]["id"], "action": "activate", "style": "instant"})
+            self._wait_probe(lambda _: a.call("ui.desktop.info")["overview"] is False, 8)
+        self.assertIn(info["scheme"], ("dark", "light", "default", None))
+        screen = a.call("ui.screen.info")
+        self.assertEqual([{k: m[k] for k in ("x", "y", "width", "height", "scale", "primary")} for m in screen["monitors"]],
+                         [{k: m[k] for k in ("x", "y", "width", "height", "scale", "primary")} for m in info["monitors"]])
+        self.assertEqual([m["index"] for m in info["monitors"]], list(range(len(info["monitors"]))))
+        pos = a.call("ui.pointer.position")
+        self.assertEqual(info["pointer"], {"x": pos["x"], "y": pos["y"]})
+        _, win = self._probe(a)
+        row = next(w for w in a.call("ui.window.list")["windows"] if w["id"] == win["id"])
+        self.assertIs(row["maximized"], False); self.assertIs(row["fullscreen"], False)
+        self.assertEqual(row["monitor"], 0)
+        # Keyboard-only launch, the way a person does it: Super, type the name, Enter.
+        before = {w["id"] for w in a.call("ui.window.list")["windows"]}
+        a.call("ui.key.press", {"keys": "super"})
+        self._wait_probe(lambda _: a.call("ui.desktop.info")["overview"] is True, 8)
+        self.assertEqual(a.call("ui.key.type", {"text": "calc"})["method"], "keyval")  # real keys in the shell's UI
+        a.call("ui.key.press", {"keys": "Return"})
+        calc = None
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and calc is None:
+            calc = next((w for w in a.call("ui.window.list")["windows"]
+                         if w["id"] not in before and "alc" in (w["app_id"] + w["title"])), None)
+            time.sleep(.3)
+        self.assertIsNotNone(calc, a.call("ui.window.list"))
+        self.assertTrue(calc["new"]); self.assertFalse(a.call("ui.desktop.info")["overview"])
+        closed = a.call("ui.window.action", {"id": calc["id"], "action": "close"})
+        self.assertEqual(closed["via"], "programmatic")  # the shell cannot locate a client-drawn button
+        pos = a.call("ui.pointer.position")  # but the pointer went to the title bar first
+        self.assertTrue(calc["x"] <= pos["x"] <= calc["x"] + calc["width"] and calc["y"] <= pos["y"] <= calc["y"] + 40, (pos, calc))
+        self._wait_probe(lambda _: all(w["id"] != calc["id"] for w in a.call("ui.window.list")["windows"]))
+
+    def test_window_actions_are_driven_by_the_pointer(self):
+        a = self._begin(); self.addCleanup(self._end_client, a)
+        _, probe = self._probe(a)
+        other = a.call("ui.app.launch", {"app": "pcpilot-wrapup.desktop", "wait_ms": LAUNCH_WAIT_MS, "style": "fast"})["window"]
+        self.addCleanup(lambda: [a.call("ui.window.action", {"id": other["id"], "action": "close", "style": "instant"})]
+                        if any(w["id"] == other["id"] for w in a.call("ui.window.list")["windows"]) else None)
+        self.assertTrue(next(w for w in a.call("ui.window.list")["windows"] if w["id"] == other["id"])["focused"])
+        # Move the other window out of the way so both title bars are reachable.
+        a.call("ui.window.action", {"id": other["id"], "action": "move", "x": 1000, "y": 500, "style": "instant"})
+        mark = len(self._rows_of("motion", source="window"))
+        res = a.call("ui.window.action", {"id": probe["id"], "action": "activate"}, timeout=30)
+        self.assertEqual(res["via"], "pointer")
+        now = next(w for w in a.call("ui.window.list")["windows"] if w["id"] == probe["id"])
+        self.assertTrue(now["focused"])
+        pos = a.call("ui.pointer.position")  # on its title bar, where the click landed
+        self.assertTrue(now["x"] < pos["x"] < now["x"] + now["width"] and now["y"] <= pos["y"] <= now["y"] + 30, (pos, now))
+        self.assertGreater(len(self._rows_of("motion", mark, source="window")), 3, "the pointer glided onto it")
+        # Already focused: nothing happens.
+        self.assertEqual(a.call("ui.window.action", {"id": probe["id"], "action": "activate"})["via"], "focused")
+        # Close the other window with its real button, located by the caller (here: the usual GTK spot).
+        o = next(w for w in a.call("ui.window.list")["windows"] if w["id"] == other["id"])
+        res = a.call("ui.window.action", {"id": other["id"], "action": "close",
+                                          "at": {"x": o["x"] + o["width"] - 22, "y": o["y"] + 23}}, timeout=30)
+        self._measure("close_at", via=res["via"])
+        self._wait_probe(lambda _: all(w["id"] != other["id"] for w in a.call("ui.window.list")["windows"]))
+        self.assertIn(res["via"], ("pointer", "programmatic"))
 
 
 @unittest.skipUnless(available(), "requires root, gnome-shell, and uid 1000 sacer")
