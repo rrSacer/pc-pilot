@@ -414,6 +414,9 @@ class AccessibilityWorker:
     def locate(self, ref, windows):
         return self.request({"op": "locate", "ref": ref, "windows": windows}, timeout=8)
 
+    def button(self, window, action, windows):
+        return self.request({"op": "button", "window": window, "action": action, "windows": windows}, timeout=8)
+
     def acquire(self):
         reply = self.request({"op": "acquire"}, timeout=10)
         self.held = reply.get("enabled") is not None
@@ -894,6 +897,10 @@ class Server:
                 arguments.update(self.window_size(value[2:]))
             elif value[1] == "move":
                 arguments.update(self.point(value[2:]))
+            elif style == "human" and value[1] in {"close", "minimize", "maximize", "unmaximize"}:
+                at = self.window_button(value[0], value[1])
+                if at:
+                    arguments["at"] = at   # the real button: the pointer goes there and clicks it
             return self.daemon.call("ui.window.action", arguments)
         op, arguments = {
             "key": ("key.press", {"keys": value}),
@@ -1086,6 +1093,20 @@ class Server:
                 flags.append("new")  # AI-opened windows already carry the * prefix
             lines.append(line + (f' [{" ".join(flags)}]' if flags else ""))
         return "\n".join(lines) or "No windows"
+
+    def window_button(self, window, action):
+        """Logical-pixel centre of the window's own button, or None (the extension then uses the title bar)."""
+        locate = getattr(self.worker, "button", None)
+        if locate is None:
+            return None
+        windows = self.daemon.call("ui.window.list")["windows"]
+        try:
+            found = locate(window, action, windows)
+        except (protocol.ProtocolError, OSError, ValueError, TimeoutError):
+            return None   # AT-SPI trouble must never block closing a window
+        if isinstance(found, dict) and found.get("found") and number(found.get("x")) and number(found.get("y")):
+            return {"x": round(found["x"]), "y": round(found["y"])}
+        return None
 
     def window_size(self, value):
         width, height = vector(value, 2)
