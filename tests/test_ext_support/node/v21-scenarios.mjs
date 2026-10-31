@@ -271,6 +271,7 @@ export async function runV21Scenarios() {
                     const surface = over(bg, backdrop);
                     assert.ok(contrast(hex(t.pill.text), surface) >= 7, `${name}: pill text contrast`);
                     assert.ok(contrast(over(rgba(t.pill.muted), surface), surface) >= 4.5, `${name}: muted contrast`);
+                    assert.ok(contrast(hex(t.pill.accent), surface) >= 7, `${name}: accent contrast`);
                 }
             }
             assert.equal(new Set(THEME_NAMES.map(n => THEMES[n].rim[0])).size, 4);
@@ -297,6 +298,11 @@ export async function runV21Scenarios() {
                 assert.ok(e._overlay._frames.every(f => f.strips.every(s => s._theme.id === want.id)));
                 assert.ok(e._overlay._pill.style.includes(want.pill.bg), 'pill carries the theme background');
                 assert.ok(e._overlay._pill.style.includes(want.pill.border), 'pill carries the theme border');
+                // Whatever the look, the safety sentence and the way back stay spelled out.
+                const markup = e._overlay._pillText.markup;
+                assert.ok(markup.includes('está controlando seu PC') && markup.includes('Ctrl+Alt+Esc') &&
+                    markup.includes('para retomar'), 'pill states who controls and how to take over');
+                assert.ok(markup.includes(want.pill.accent), 'the hotkey wears the theme accent');
                 assert.equal(c._trail._points.length, 0, 'no trail from the previous look');
                 // Something happening in this session, then the next theme replaces it all.
                 const pos = global.get_pointer();

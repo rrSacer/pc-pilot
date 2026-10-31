@@ -213,8 +213,10 @@ export class Overlay {
         if (!this._group)
             return;
         const esc = text => GLib.markup_escape_text(String(text), -1);
+        // The way back is the one thing to remember: the hotkey wears the theme's accent.
         this._pillText.clutter_text.set_markup(`<b>${esc(this._label)} está controlando seu PC</b>` +
-            `  ·  <span alpha="80%">${esc(this._hotkey)} para retomar</span>`);
+            `  ·  <span foreground="${this._theme.pill.accent}"><b>${esc(this._hotkey)}</b></span>` +
+            '<span alpha="80%"> para retomar</span>');
         this._pillStatus.text = this._status;
         this._pillStatus.visible = this._status !== '';
         for (const f of this._frames)
