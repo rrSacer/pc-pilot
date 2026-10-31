@@ -391,6 +391,7 @@ class DeviceSet:
         self.caps = {}  # rdev -> Captured
         self.closed = False
         self._open_errors = set()
+        self._capture_errors = {}
 
     def candidates(self):
         out = {}
@@ -617,6 +618,7 @@ class DeviceSet:
             if not missed:
                 cap.state = "grabbed"
                 log.info("grabbed %s", cap.label())
+                self._capture_errors.pop(cap.info.rdev, None)
                 return True
             regrabs += 1
             log.info("%s: %s pressed while grabbing, reconciling (%d)", cap.label(), sorted(missed), regrabs)
@@ -671,7 +673,9 @@ class DeviceSet:
 
     def _fail(self, cap, why):
         cap.state = "failed"
-        log.warning("not capturing %s: %s", cap.label(), why)
+        if self._capture_errors.get(cap.info.rdev) != why:
+            self._capture_errors[cap.info.rdev] = why
+            log.warning("not capturing %s: %s", cap.label(), why)
         try:
             cap.dev.ungrab()
         except OSError:
@@ -693,6 +697,7 @@ class DeviceSet:
             del self.caps[cap.info.rdev]
         self._close_cap(cap)
         log.info("dropped %s: %s", cap.label(), why)
+        self._capture_errors.pop(cap.info.rdev, None)
         self.d.devices_changed(self.s)
 
     def _close_cap(self, cap):

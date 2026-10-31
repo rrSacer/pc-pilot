@@ -11,7 +11,7 @@ import time
 import unittest
 
 from pcpilot import evdev, protocol as P
-from pcpilot.daemon import ConfigError, Hotkey, load_config
+from pcpilot.daemon import ConfigError, DeviceSet, Hotkey, load_config
 from tests.daemon_testlib import AgentClient, CompositorView, DaemonProcess, FakeDevice, FakeUI, UIError, intruder_connect, wait_until
 
 
@@ -66,6 +66,52 @@ class DaemonCase(unittest.TestCase):
 
 
 class SessionTests(DaemonCase):
+    def test_failed_capture_warning_dedupes_until_reason_change_or_device_reappears(self):
+        class Loop:
+            def create_task(self, coro):
+                coro.close()
+                return type("Done", (), {"done": lambda self: True})()
+
+        class Daemon:
+            cfg = {}
+            loop = Loop()
+            def devices_changed(self, _session): pass
+
+        class Device:
+            def ungrab(self): pass
+
+        daemon = Daemon()
+        ds = DeviceSet(daemon, object())
+        info = type("Info", (), {"rdev": (1, 2), "name": "Keyboard"})()
+        cap = type("Cap", (), {"info": info, "label": lambda self: "Keyboard",
+                                "dev": Device(), "state": "failed", "task": None})()
+        ds.caps[info.rdev] = cap
+        with self.assertLogs("pcpilotd", level="WARNING") as records:
+            ds._fail(cap, "reason A")
+            ds._fail(cap, "reason A")
+            ds._fail(cap, "reason B")
+        self.assertEqual(len(records.output), 2)
+
+        # A failed acquisition is scheduled again on every scan. After that
+        # device disappears, its reason cache is cleared so a return can warn.
+        cap.task = type("Done", (), {"done": lambda self: True})()
+        ds.candidates = lambda: {info.rdev: info}
+        ds.scan()
+        self.assertEqual(cap.state, "acquiring")
+        cap.state = "failed"
+        ds.scan()
+        self.assertEqual(cap.state, "acquiring")
+        ds._fail(cap, "reason B")
+        ds.candidates = lambda: {}
+        ds._close_cap = lambda _cap: None
+        ds._drop(cap, "removed")
+        returned = type("Cap", (), {"info": info, "label": lambda self: "Keyboard",
+                                     "dev": Device(), "state": "failed", "task": None})()
+        ds.caps[info.rdev] = returned
+        with self.assertLogs("pcpilotd", level="WARNING") as records:
+            ds._fail(returned, "reason B")
+        self.assertEqual(len(records.output), 1)
+
     def test_grab_effective_and_exclusive_reader(self):
         k, p = self.device(), self.device("pointer")
         d = self.start(); ui = self.ui_connect(); a = self.agent()
