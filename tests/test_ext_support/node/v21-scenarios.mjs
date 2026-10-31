@@ -15,7 +15,7 @@ import {cursorTracker, seatUnfocus} from './scenarios.mjs';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // Deterministic generator (LCG): reproducible "random" paths.
-function seeded(seed) {
+export function seeded(seed) {
     let s = seed >>> 0;
     return () => {
         s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
@@ -86,15 +86,17 @@ export async function runV21Scenarios() {
     setTimeoutScale(1); // real time: a 320 ms fade must last 320 ms
 
     try {
-        // ---- A1/A2: human reaches take a human amount of time and have a human shape ----
+        // ---- A1/A2: human reaches are slow, arc-shaped and hand-like ----
         {
             const a = [100, 100];
             const at = (dist, seed) => {
                 const b = [a[0] + dist * 0.8, a[1] + dist * 0.6];
                 return {b, p: planPath(a, b, 'human', {rand: seeded(seed)})};
             };
-            const ranges = [[40, 500, 950], [150, 500, 950], [800, 1400, 2400], [1000, 1400, 2400],
-                [1300, 1400, 2400], [1900, 2000, MAX_GLIDE_MS]];
+            // [distance, min ms, max ms]: 100 px ~ 0.9-1.1 s, 300 px ~ 1.4-1.7 s,
+            // 1000-1300 px ~ 3.0-4.5 s, capped at MAX_GLIDE_MS.
+            const ranges = [[40, 650, 1000], [100, 850, 1100], [300, 1300, 1800], [1000, 3000, 3700],
+                [1300, 3700, 4500], [1900, 5000, MAX_GLIDE_MS], [3000, MAX_GLIDE_MS, MAX_GLIDE_MS]];
             for (const [dist, lo, hi] of ranges) {
                 for (let seed = 1; seed <= 60; seed++) {
                     const {b, p} = at(dist, seed);
@@ -113,47 +115,81 @@ export async function runV21Scenarios() {
             }
             assert.equal(planPath(a, [1100, 700], 'instant').duration, 0);
             // Even a cross-screen click (glide + hover + press) is far inside the 18 s guard.
-            assert.ok(MAX_GLIDE_MS + 400 + 200 < 6000);
+            assert.ok(MAX_GLIDE_MS + 450 + 200 < 7000);
 
-            // Shape of a 1000 px move over many hands.
-            const N = 120, dist = 1000, step = 5;
+            // Shape of reaches over many hands: a real arc, accelerating then a long, slow
+            // homing, hesitations that never stop the hand, a few px of settle, exact landing.
+            const N = 120, step = 5;
             const mean = xs => xs.reduce((sum, v) => sum + v, 0) / xs.length;
-            let overshoots = 0, slowTails = 0, earlyPeaks = 0, homing = 0, creeping = 0;
-            for (let seed = 1; seed <= N; seed++) {
-                const {b, p} = at(dist, seed);
-                const ux = (b[0] - a[0]) / dist, uy = (b[1] - a[1]) / dist;
-                const samples = [];
-                for (let ms = 0; ms < p.duration; ms += step)
-                    samples.push(p.at(ms));
-                samples.push(p.at(p.duration));
-                const speeds = samples.slice(1).map((q, i) =>
-                    Math.hypot(q[0] - samples[i][0], q[1] - samples[i][1]));
-                const peakAt = speeds.indexOf(Math.max(...speeds)) / speeds.length;
-                const first = mean(speeds.slice(0, Math.floor(speeds.length / 2)));
-                const lastQuarter = mean(speeds.slice(Math.floor(speeds.length * 0.75)));
-                const maxOver = Math.max(...samples.map(([x, y]) => (x - b[0]) * ux + (y - b[1]) * uy));
-                const maxDev = Math.max(...samples.map(([x, y]) => Math.abs((x - a[0]) * uy - (y - a[1]) * ux)));
-                assert.ok(maxOver <= 12, `overshoot ${maxOver}px`);
-                assert.ok(maxDev <= 130, `strays ${maxDev}px from the straight line`);
-                assert.ok(Math.max(...speeds) <= 25, `jumps ${Math.max(...speeds)}px in one ${step} ms sample`);
-                if (peakAt >= 0.25 && peakAt <= 0.5)
-                    earlyPeaks++;
-                if (lastQuarter < 0.35 * first)
-                    slowTails++;
-                if (maxOver > 0.5)
-                    overshoots++;
-                const q = samples[Math.floor(samples.length * 0.75)];
-                const tail = Math.hypot(b[0] - q[0], b[1] - q[1]);
-                if (tail >= 2)
-                    homing++; // slow homing: the last quarter still travels (an overshoot settles by a few px)
-                if (tail > 0.5)
-                    creeping++;
+            for (const dist of [100, 300, 1000]) {
+                let overshoots = 0, slowTails = 0, earlyPeaks = 0, creeping = 0, sides = 0, slowdowns = 0, esses = 0;
+                for (let seed = 1; seed <= N; seed++) {
+                    const {b, p} = at(dist, seed);
+                    const ux = (b[0] - a[0]) / dist, uy = (b[1] - a[1]) / dist;
+                    const samples = [];
+                    for (let ms = 0; ms < p.duration; ms += step)
+                        samples.push(p.at(ms));
+                    samples.push(p.at(p.duration));
+                    const speeds = samples.slice(1).map((q, i) =>
+                        Math.hypot(q[0] - samples[i][0], q[1] - samples[i][1]));
+                    const peakAt = speeds.indexOf(Math.max(...speeds)) / speeds.length;
+                    const first = mean(speeds.slice(0, Math.floor(speeds.length / 2)));
+                    const lastQuarter = mean(speeds.slice(Math.floor(speeds.length * 0.75)));
+                    const maxOver = Math.max(...samples.map(([x, y]) => (x - b[0]) * ux + (y - b[1]) * uy));
+                    const across = samples.map(([x, y]) => (x - a[0]) * uy - (y - a[1]) * ux);
+                    const maxDev = Math.max(...across.map(Math.abs));
+                    // THE regression: a straight line fails this. 6-14 % of the distance, +-1.5 px
+                    // for tremor.
+                    assert.ok(maxDev >= dist * 0.06 - 1.5 && maxDev <= dist * 0.14 + 2.5,
+                        `${dist}px seed ${seed}: perpendicular deviation ${maxDev.toFixed(1)}px is not an arc`);
+                    assert.ok(maxOver <= 12, `overshoot ${maxOver}px`);
+                    // Speed ceiling: 1000 px/s-ish peaks; never a jump.
+                    assert.ok(Math.max(...speeds) * 1000 / step <= 1700,
+                        `too fast: ${Math.max(...speeds) * 1000 / step} px/s`);
+                    // Never a teleport: no 5 ms sample jumps more than a few px.
+                    assert.ok(Math.max(...speeds) <= 9, `jumps ${Math.max(...speeds)}px in one ${step} ms sample`);
+                    if (peakAt >= 0.15 && peakAt <= 0.5)
+                        earlyPeaks++;
+                    if (lastQuarter < 0.35 * first)
+                        slowTails++;
+                    if (maxOver > 0.5)
+                        overshoots++;
+                    const q = samples[Math.floor(samples.length * 0.75)];
+                    if (Math.hypot(b[0] - q[0], b[1] - q[1]) > 0.5)
+                        creeping++;
+                    if (across.some(v => v > 0.3 * maxDev) && across.some(v => v < -0.3 * maxDev))
+                        esses++;
+                    sides += Math.sign(across[Math.floor(across.length / 2)] || 0);
+                    // Hesitation: somewhere mid-flight the speed sags well below its neighbours.
+                    const mid = speeds.slice(Math.floor(speeds.length * 0.15), Math.floor(speeds.length * 0.85));
+                    const win = 12;
+                    let sag = false;
+                    for (let i = win; i + win < mid.length && !sag; i++) {
+                        const here = mean(mid.slice(i - 3, i + 3));
+                        const around = Math.max(mean(mid.slice(i - win, i - 6)), mean(mid.slice(i + 6, i + win)));
+                        sag = here < 0.7 * around;
+                    }
+                    if (sag)
+                        slowdowns++;
+                }
+                assert.ok(earlyPeaks >= N * 0.95, `${dist}px: peak speed early in ${earlyPeaks}/${N}`);
+                assert.ok(slowTails >= N * 0.95, `${dist}px: slow final quarter in ${slowTails}/${N}`);
+                assert.ok(creeping >= N * 0.95, `${dist}px: not a dead stop in ${creeping}/${N}`);
+                assert.ok(Math.abs(sides) <= N * 0.4, `${dist}px: arcs bend to both sides (${sides}/${N})`);
+                if (dist > 120)
+                    assert.ok(esses >= N * 0.08 && esses <= N * 0.6, `${dist}px: some S-curves (${esses}/${N})`);
+                assert.ok(slowdowns >= N * 0.5, `${dist}px: hesitations visible in ${slowdowns}/${N}`);
+                if (dist > 400)
+                    assert.ok(overshoots >= N * 0.15 && overshoots < N, `overshoot in ${overshoots}/${N} reaches`);
             }
-            assert.ok(earlyPeaks >= N * 0.95, `peak speed early in ${earlyPeaks}/${N}`);
-            assert.ok(slowTails >= N * 0.95, `slow final quarter in ${slowTails}/${N}`);
-            assert.ok(homing >= N * 0.6, `still homing (>=2px) in the last quarter in ${homing}/${N}`);
-            assert.ok(creeping >= N * 0.95, `not a dead stop (>0.5px) in the last quarter in ${creeping}/${N}`);
-            assert.ok(overshoots >= N * 0.15 && overshoots < N, `overshoot in ${overshoots}/${N} reaches`);
+
+            // Landing: the last pixels settle (no snap), and the end point is exact.
+            for (let seed = 1; seed <= 30; seed++) {
+                const {b, p} = at(600, seed);
+                const settling = Math.hypot(...[0, 1].map(i => p.at(p.duration - 120)[i] - b[i]));
+                assert.ok(settling < 12, `lands within ${settling}px 120 ms before the end`);
+                assert.deepEqual(p.at(p.duration + 50), b);
+            }
 
             // 'fast' stays a straight line.
             const fast = planPath(a, [1100, 700], 'fast');

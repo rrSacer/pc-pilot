@@ -46,6 +46,9 @@ const sources = {
   launch_uris_as_manager(_u,_c,_f,_x,cb){if(this.emitPid)cb(this,this.pid)} launch_uris(){}}
  const Gio={Cancellable,File,SocketClient,DataInputStream,OutputStream,InputStream,AppInfo,DesktopAppInfo,
  SpawnFlags:{SEARCH_PATH:1},_promisify(){},FileCreateFlags:{PRIVATE:0},IOErrorEnum:{CANCELLED:1}};
+ Gio.Settings=class Settings{static schemas=new Set(['org.gnome.desktop.interface','org.gnome.desktop.wm.preferences']);static values={};static broken=false;
+  constructor(p){this.schema=p.schema_id} get_string(k){if(Settings.broken)throw new Error('settings broken');return Settings.values[k]??'default'}};
+ Gio.SettingsSchemaSource={get_default:()=>({lookup:id=>Gio.Settings.schemas.has(id)?{}:null})};
  Gio.File.new_for_path=p=>new File(p);Gio.File.new_for_uri=u=>new File(u); export {Gio}; export default Gio;`,
  clutter:`const timelines=[]; const C={BUTTON_PRIMARY:1,BUTTON_MIDDLE:2,BUTTON_SECONDARY:3,ButtonState:{PRESSED:1,RELEASED:0},
  InputDeviceType:{POINTER_DEVICE:1,KEYBOARD_DEVICE:2},KeyState:{PRESSED:1,RELEASED:0},ScrollSource:{WHEEL:0},
@@ -56,7 +59,7 @@ const sources = {
   start(){this.t0=Date.now();this.id=setInterval(()=>{(this.handlers['new-frame']??[]).forEach(f=>f());
    if(this.duration>0&&Date.now()-this.t0>=this.duration){this.stop();(this.handlers.completed??[]).forEach(f=>f())}},16)}
   stop(){clearInterval(this.id);this.id=0;this.stopped=true}},
- KEY_Control_L:0xffe3,KEY_Shift_L:0xffe1,KEY_v:118,KEY_Return:13};
+ KEY_Control_L:0xffe3,KEY_Shift_L:0xffe1,KEY_v:118,KEY_Return:13,KEY_Tab:9,unicode_to_keysym:cp=>cp};
  export {timelines}; export default C;`,
  st:`${actor} const St={Widget,Label,BoxLayout,Icon,DrawingArea,ClipboardType:{CLIPBOARD:0},
  ThemeContext:{get_for_stage:()=>({scale_factor:1})},Clipboard:{get_default:()=>clipboard}};

@@ -6,12 +6,12 @@ import Clutter from 'gi://Clutter';
 import {Ops} from '../../../extension/pcpilot@local/ops.js';
 import {Token} from '../../../extension/pcpilot@local/input.js';
 import {clampToMonitors,onMonitor} from '../../../extension/pcpilot@local/windows.js';
-import {planPath,typingCadence,scrollCadence,fittsDuration,HUMAN_SPEED_MULTIPLIER,MAX_GLIDE_MS} from '../../../extension/pcpilot@local/path.js';
+import {planPath,typingCadence,scrollPlan,scrollPlanMs,fittsDuration,HUMAN_SPEED_MULTIPLIER,MAX_GLIDE_MS,SCROLL_BUDGET_MS} from '../../../extension/pcpilot@local/path.js';
 import {themeFor,THEMES,DEFAULT_THEME} from '../../../extension/pcpilot@local/theme.js';
 import {FRAME} from '../../../extension/pcpilot@local/paint.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {seatUnfocus,cursorTracker} from './scenarios.mjs';
-import {recordOpacity} from './v21-scenarios.mjs';
+import {recordOpacity,seeded} from './v21-scenarios.mjs';
 import {Overlay} from '../../../extension/pcpilot@local/overlay.js';
 
 export async function runV2Scenarios() {
@@ -24,13 +24,28 @@ export async function runV2Scenarios() {
   assert.equal(themeFor(bad).id,DEFAULT_THEME);
  assert.equal(FRAME.line,4);assert.equal(FRAME.glow,20);
  assert.ok(THEMES.claude.glow && THEMES.codex.glow && THEMES.gemini.glow && THEMES.neutral.glow);
- assert.equal(HUMAN_SPEED_MULTIPLIER,1);assert.equal(MAX_GLIDE_MS,3200);
- for(const [distance,lo,hi] of [[50,500,900],[150,500,900],[800,1400,2400],[1300,1400,2400]]) {
+ assert.equal(HUMAN_SPEED_MULTIPLIER,1);assert.equal(MAX_GLIDE_MS,5500);
+ for(const [distance,lo,hi] of [[50,650,1100],[100,800,1100],[300,1200,1800],[800,2400,3300],[1300,3800,4400]]) {
   const ms=fittsDuration(distance,()=>0.5);assert.ok(ms>=lo&&ms<=hi,`distance=${distance}, duration=${ms}`);
  }
- const cadence=scrollCadence(100,'human',()=>0.5);
- assert.ok(cadence.every(n=>n>0));assert.ok(cadence.reduce((a,b)=>a+b,0)<18000);
- assert.ok(new Set(cadence).size>1,'human scroll cadence should vary');
+ // Wheel bursts: net notches preserved, 1-5 notches per burst (8 for huge counts), the
+ // op budget is never exceeded, and the rhythm is irregular (bursts + longer pauses).
+ for(let seed=1;seed<=80;seed++){
+  for(const count of [1,2,3,6,15,30,50]){
+   const plan=scrollPlan(count,seeded(seed*7+count));
+   assert.equal(plan.reduce((a,b)=>a+b.notches.reduce((x,y)=>x+y,0),0),count,`net notches ${count}`);
+   assert.ok(plan.every(b=>b.notches.length>=1&&b.notches.length<=(count>24?8:5)&&b.gaps.length===b.notches.length-1));
+   assert.ok(plan.every((b,i)=>(i===plan.length-1)===(b.pause===0)),'pause between bursts only');
+   assert.ok(scrollPlanMs(plan)<=SCROLL_BUDGET_MS,`plan ${count} too long: ${scrollPlanMs(plan)}`);
+  }
+ }
+ {
+  const plan=scrollPlan(15,seeded(3));
+  assert.ok(plan.length>=3);assert.ok(plan.slice(0,-1).every(b=>b.pause>=250&&b.pause<=900));
+  assert.ok(new Set(plan.flatMap(b=>b.gaps)).size>3,'gaps vary');
+  assert.ok(scrollPlan(50,seeded(5),3000).reduce((a,b)=>a+b.notches.length,0)>=50);
+  assert.ok(scrollPlanMs(scrollPlan(50,seeded(5),3000))<=3500,'a tight budget is honoured (floors aside)');
+ }
  let wins=[],createdCb=null,winEvents=[],nextSignal=1,pointer=[100,100],nowOffset=0,workspace=0;
  const display={focus_window:null,sort_windows_by_stacking:a=>a,
   connect(_sig,cb){createdCb=cb;return nextSignal++},disconnect(){createdCb=null}};
@@ -55,7 +70,7 @@ export async function runV2Scenarios() {
   has_focus(){return display.focus_window===this} is_override_redirect(){return false} get_window_type(){return 0}
   is_on_all_workspaces(){return false} get_workspace(){return {index:()=>this.workspaceIndex}} is_maximized(){return this.maximized} is_fullscreen(){return this.fullscreen}
   find_root_ancestor(){let w=this;while(w.parent)w=w.parent;return w}
-  allows_move(){return true} allows_resize(){return true} get_work_area_current_monitor(){return {x:0,y:0,width:1000,height:800}}
+  get_monitor(){return 0} allows_move(){return true} allows_resize(){return true} get_work_area_current_monitor(){return {x:0,y:0,width:1000,height:800}}
   unmaximize(){this.maximized=false} maximize(){this.maximized=true} unmake_fullscreen(){this.fullscreen=false} make_fullscreen(){this.fullscreen=true}
   unminimize(){this.minimized=false} minimize(){this.minimized=true} activate(){display.focus_window=this;}
   move_resize_frame(_user,x,y,width,height){winEvents.push(['move_resize_frame',this.id,x,y,width,height]);Object.assign(this,{x,y,width,height})}
@@ -91,10 +106,10 @@ export async function runV2Scenarios() {
   const instant=planPath(a,b,'instant');assert.equal(instant.duration,0);assert.deepEqual(instant.at(0),b);
   const drag=planPath(a,b,'human',{drag:true,rand:()=>0.73});
   assert.ok(drag.duration<=MAX_GLIDE_MS);assert.deepEqual(drag.at(drag.duration),b);
-  assert.ok(drag.duration/p.duration>1.27&&drag.duration/p.duration<1.29);
-  assert.ok(p.duration>=1400&&p.duration<=2400,`long human move duration=${p.duration}`);
+  assert.ok(drag.duration/p.duration>1.19&&drag.duration/p.duration<1.21);
+  assert.ok(p.duration>=3000&&p.duration<=4500,`long human move duration=${p.duration}`);
   const short=planPath(a,[a[0]+100,a[1]],'human',{rand:()=>0.73});
-  assert.ok(short.duration>=500&&short.duration<=900,`short human move duration=${short.duration}`);
+  assert.ok(short.duration>=800&&short.duration<=1150,`short human move duration=${short.duration}`);
  }
 
  // Wrapup returns focus and pointer to the snapshot home, remains safe to repeat,
@@ -482,7 +497,7 @@ export async function runV2Scenarios() {
  // R6: randomized integer cadence is bounded for long inputs and rounding boundaries.
  {
   for(const n of [44,45,63,64,6000,20000])for(const value of [0.01,0.5,0.75,0.99]){
-   const out=typingCadence(Array(n).fill('a'),4000,()=>value);
+   const out=typingCadence(Array(n).fill('a'),4000,()=>value).gaps;
    assert.ok(out.every(Number.isInteger));assert.ok(out.reduce((a,b)=>a+b,0)<=4000,`n=${n}, rand=${value}`);
   }
  }

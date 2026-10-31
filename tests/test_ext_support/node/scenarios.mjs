@@ -12,6 +12,7 @@ import {glide} from '../../../extension/pcpilot@local/motion.js';
 import Clutter, {timelines} from 'gi://Clutter';
 import {runV2Scenarios} from './v2-scenarios.mjs';
 import {runV21Scenarios} from './v21-scenarios.mjs';
+import {runV22Scenarios} from './v22-scenarios.mjs';
 
 let afterPaint = null;
 const virtualEvents=[];
@@ -33,17 +34,17 @@ const rand=()=>0.75;
 const from=[100,100],to=[1400,800];
 const human=planPath(from,to,'human',{rand});
 assert.deepEqual(human.at(0),from); assert.deepEqual(human.at(human.duration),to);
-assert.ok(human.duration>=1400 && human.duration<=2400);
+assert.ok(human.duration>=3500 && human.duration<=5500);
 const fast=planPath(from,to,'fast',{rand}); assert.ok(fast.duration>=100&&fast.duration<=180);
 const spatialDeviation=path=>Math.max(...Array.from({length:99},(_,i)=>{
  const [x,y]=path.at(path.duration*(i+1)/100);
  return Math.abs((to[0]-from[0])*(from[1]-y)-(from[0]-x)*(to[1]-from[1]))/Math.hypot(to[0]-from[0],to[1]-from[1]);
 }));
-assert.ok(spatialDeviation(fast)<1e-8);assert.ok(spatialDeviation(human)>1);
+assert.ok(spatialDeviation(fast)<1e-8);assert.ok(spatialDeviation(human)>0.05*Math.hypot(to[0]-from[0],to[1]-from[1]));
 assert.equal(planPath(from,to,'instant').duration,0);
-assert.ok(fittsDuration(100,rand)>=500&&fittsDuration(100,rand)<=900);
-assert.ok(fittsDuration(1000,rand)>=1400&&fittsDuration(1000,rand)<=2400);
-assert.ok(typingCadence([...('a '.repeat(100))],4000,rand).reduce((a,b)=>a+b,0)<=4000);
+assert.ok(fittsDuration(100,rand)>=800&&fittsDuration(100,rand)<=1100);
+assert.ok(fittsDuration(1000,rand)>=3000&&fittsDuration(1000,rand)<=4500);
+assert.ok(typingCadence([...('a '.repeat(100))],4000,rand).gaps.reduce((a,b)=>a+b,0)<=4000);
 
 // A cancelled glide stops its compositor timeline and emits no later pointer moves.
 const glideToken=new Token();let moves=0;
@@ -307,5 +308,5 @@ await new Promise(r=>setTimeout(r,10));
 assert.equal(sessRan,1); assert.equal(sw.find(m=>m.id===1).error.code,'inactive'); assert.equal(sw.find(m=>m.id===2).ok,true);
 sess.disable();
 
-const v2Checks=[...await runV2Scenarios(),...await runV21Scenarios()];
+const v2Checks=[...await runV2Scenarios(),...await runV21Scenarios(),...await runV22Scenarios()];
 console.log(JSON.stringify({ok:true,checks:['op-session','paint-timeout','screenshot-cancel','typing-estimate','paste-cancel','clipboard-ownership','timeout-queue','timeout-fail-closed','stale-generation','overlay-exception','session-ack','session-ping-pong',...pathChecks,...safetyChecks,...v2Checks],bugs:pasteCancelBug?[pasteCancelBug]:[]}));

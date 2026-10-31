@@ -30,7 +30,9 @@ class ExtensionUnitRegressionTests(unittest.TestCase):
             "wrapup-return-home", "screenshot-frame-only",
             "human-move-timing-range", "human-move-shape", "no-opacity-blink", "border-geometry-symmetric",
             "theme-data-sanity", "theme-switch-clean", "wrapup-fade-smooth", "wrapup-fade-cancel", "wrapup-fade-resume",
-            "spawn-reserved-pid-reaped"}.issubset(result["checks"]))
+            "spawn-reserved-pid-reaped", "v22-window-pointer-actions", "v22-hover-before-click",
+            "v22-scroll-bursts", "v22-scroll-discrete", "v22-typing-per-character", "v22-typing-fits-budget",
+            "v22-typing-clipboard-individual", "v22-desktop-info"}.issubset(result["checks"]))
         self.assertEqual(result.get("bugs", []), [], "extension defect observed by the regression shim")
 
 
