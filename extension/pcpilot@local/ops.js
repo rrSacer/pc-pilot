@@ -215,6 +215,11 @@ export class Ops {
             throw new OpError(E_UNKNOWN_OP, `unknown op: ${op}`);
         if (args === null || typeof args !== 'object' || Array.isArray(args))
             throw new OpError(E_BAD_ARGS, 'args must be an object');
+        // A wrapup fades the overlay while the session is still up. Whatever the agent
+        // asks next in that session, the frame, pill and AI cursor are back first: no op
+        // ever runs behind an invisible safety signal. (No-op while already shown.)
+        if (op !== 'session.wrapup')
+            this._overlay.engageCursor?.();
         return h.call(this, args, token);
     }
 
@@ -265,6 +270,9 @@ export class Ops {
             GLib.PRIORITY_DEFAULT, token.cancellable);
         let ok = false;
         try {
+            // Let prior UI changes settle with every visible actor still on screen.
+            await this._overlay.waitPaint();
+            token.check();
             const shooter = new Shell.Screenshot();
             const capture = async () => {
                 token.check(); // never capture for a session that is over
@@ -276,10 +284,8 @@ export class Ops {
             if (includeOverlay) {
                 await capture();
             } else {
-                await this._overlay.withHidden(async () => {
-                    await this._overlay.waitPaint();
-                    await capture();
-                });
+                // Hidden only while the capture call renders: never visibly off.
+                await this._overlay.withHidden(() => capture());
             }
             await stream.close_async(GLib.PRIORITY_DEFAULT, null);
             token.check();
@@ -396,7 +402,7 @@ export class Ops {
         if (p)
             await this._glideTo(...p, style, token);
         if (style === 'human')
-            await token.sleep(Math.round(randomBetween(40, 110))); // settle before pressing
+            await token.sleep(Math.round(randomBetween(150, 400))); // hover, then press
         for (const k of mods)
             this._input.key(k, true);
         try {
@@ -407,7 +413,7 @@ export class Ops {
                     await token.sleep(40);
                 this._overlay.cursor?.ripple();
                 this._input.button(button, true);
-                await token.sleep(10);
+                await token.sleep(style === 'human' ? Math.round(randomBetween(45, 90)) : 10);
                 this._input.button(button, false);
             }
         } finally {
@@ -427,7 +433,7 @@ export class Ops {
         const given = args.duration_ms !== undefined && args.duration_ms !== null;
         const duration = num(args.duration_ms, 'duration_ms', {min: 0, max: 10000, def: 300});
         await this._glideTo(x1, y1, style, token);
-        await token.sleep(style === 'human' ? Math.round(randomBetween(40, 90)) : 20);
+        await token.sleep(style === 'human' ? Math.round(randomBetween(150, 300)) : 20);
         this._input.button(button, true);
         try {
             await token.sleep(50);
@@ -440,7 +446,7 @@ export class Ops {
                 }
             } else {
                 // A drag is deliberate: gentle bow, no overshoot. An explicit duration_ms is
-                // how long the button stays pressed: the glide may be capped (1.5 s in
+                // how long the button stays pressed: the glide may be capped (3.2 s in
                 // human style, 0 for a drag of < 2 px), the hold never is.
                 const path = planPath([x1, y1], [x2, y2], style,
                     {drag: true, duration: given ? Math.max(duration, 1) : undefined});
@@ -451,7 +457,7 @@ export class Ops {
                     await token.sleep(Math.round(duration - held));
             }
             await this._moveTo(x2, y2, token);
-            await token.sleep(30);
+            await token.sleep(style === 'human' ? Math.round(randomBetween(90, 170)) : 30);
         } finally {
             this._input.button(button, false);
         }
@@ -475,7 +481,7 @@ export class Ops {
         if (p)
             await this._glideTo(...p, style, token);
         if (style === 'human')
-            await token.sleep(Math.round(randomBetween(60, 140)));
+            await token.sleep(Math.round(randomBetween(150, 300)));
         const steps = [
             [Math.abs(dy), dy > 0 ? Clutter.ScrollDirection.DOWN : Clutter.ScrollDirection.UP],
             [Math.abs(dx), dx > 0 ? Clutter.ScrollDirection.RIGHT : Clutter.ScrollDirection.LEFT],
@@ -1134,6 +1140,7 @@ export class Ops {
         });
         try {
             await this._wrapupSteps(keep, closeNew, returnTo, cap, result);
+            await this._overlay.finish?.(cap);
         } catch (e) {
             if (!(capped && !token.cancelled && e instanceof OpError && e.code === E_INACTIVE))
                 throw e; // a real abort (or a bug): the session cleanup takes over
@@ -1141,9 +1148,10 @@ export class Ops {
         } finally {
             if (capId)
                 GLib.source_remove(capId);
+            cap.cancel(); // detach its cancellation listener from the op token
         }
         token.check();
-        this._overlay.cursor?.release({fade: true}); // real cursor back, ours fades out
+        this._overlay.cursor?.release(); // also immediate if the wrapup hit its cap
         return result;
     }
 
@@ -1267,7 +1275,12 @@ export class Ops {
                 home = [f.x + Math.round(f.width / 2), f.y + Math.round(f.height / 2)];
         }
         if (home) {
-            await this._glideTo(...clampToMonitors(...home), 'human', token);
+            // Already home (a repeated wrapup): nothing to glide, and the overlay that the
+            // first one faded out must not pop back for a no-op.
+            const [hx, hy] = clampToMonitors(...home);
+            const [px, py] = global.get_pointer();
+            if (Math.hypot(hx - px, hy - py) >= 1.5)
+                await this._glideTo(hx, hy, 'human', token);
         }
     }
 
