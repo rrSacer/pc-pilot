@@ -24,6 +24,7 @@ import {rgb, themeFor, withAlpha} from './theme.js';
 
 const TRAIL_MS = 400;
 const TRAIL_MAX_POINTS = 64;
+const TRAIL_JUMP_PX = 160; // farther than a hand moves between two frames
 const RIPPLE_MS = 380;
 const HINT_MS = 450;
 // Arrow geometry (px at scale 1); the hotspot is the tip at (PAD, PAD).
@@ -104,6 +105,10 @@ class PCPilotTrail extends St.DrawingArea {
         const last = this._points[this._points.length - 1];
         if (last && Math.abs(last.x - x) < 0.5 && Math.abs(last.y - y) < 0.5)
             return;
+        // A jump (instant moves, fast reaches) is not a stroke: start a new trail instead of
+        // drawing a long line across the screen that then takes 400 ms to fade.
+        if (last && Math.hypot(last.x - x, last.y - y) > TRAIL_JUMP_PX)
+            this._points = [];
         this._points.push({x, y, t: nowMs()});
         if (this._points.length > TRAIL_MAX_POINTS)
             this._points.shift();

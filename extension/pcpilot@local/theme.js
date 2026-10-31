@@ -22,7 +22,7 @@ export const THEMES = {
         glow: '#e07a55',
         glowAlpha: 0.30,
         pill: {
-            bg: 'rgba(38, 35, 32, 0.93)',
+            bg: 'rgba(38, 35, 32, 0.98)',
             border: 'rgba(217, 119, 87, 0.65)',
             text: '#faf6ef',
             muted: 'rgba(250, 246, 239, 0.72)',
@@ -40,7 +40,7 @@ export const THEMES = {
         glow: '#6d6bff',
         glowAlpha: 0.30,
         pill: {
-            bg: 'rgba(12, 12, 14, 0.93)',
+            bg: 'rgba(12, 12, 14, 0.98)',
             border: 'rgba(129, 120, 255, 0.60)',
             text: '#ffffff',
             muted: 'rgba(255, 255, 255, 0.70)',
@@ -58,7 +58,7 @@ export const THEMES = {
         glow: '#8f7ae0',
         glowAlpha: 0.30,
         pill: {
-            bg: 'rgba(19, 19, 22, 0.93)',
+            bg: 'rgba(19, 19, 22, 0.98)',
             border: 'rgba(155, 114, 203, 0.65)',
             text: '#f1f1f4',
             muted: 'rgba(241, 241, 244, 0.72)',
@@ -76,7 +76,7 @@ export const THEMES = {
         glow: '#7f95b5',
         glowAlpha: 0.30,
         pill: {
-            bg: 'rgba(24, 29, 38, 0.93)',
+            bg: 'rgba(24, 29, 38, 0.98)',
             border: 'rgba(148, 163, 184, 0.60)',
             text: '#f8fafc',
             muted: 'rgba(248, 250, 252, 0.72)',
