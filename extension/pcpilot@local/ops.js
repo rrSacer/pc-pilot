@@ -60,6 +60,9 @@ const LAUNCH_OP_BUDGET_MS = 17000;
 // right of centre, away from the title, the window buttons and the back/menu buttons.
 const DRIFT_PX = 5; // how far the pointer wanders from its scroll anchor between bursts
 const TITLE_SPOTS = [0.62, 0.42, 0.8, 0.3, 0.15];
+// Browsers whose title bar IS the tab strip: a click there switches tabs, so they are never
+// clicked to be activated (nor double-clicked to maximize); the pointer only rests there.
+const TABS_IN_TITLEBAR = /(^|[^a-z])(firefox|chromium|chrome|brave|vivaldi|opera|librewolf|waterfox|floorp|msedge|microsoft-edge)([^a-z]|$)/i;
 const TITLEBAR_BUTTON_OFFSET = {close: 26, minimize: 58, maximize: 90, unmaximize: 90};
 const CLOSE_WAIT_MS = 1500;
 const MIN_WINDOW_PX = 80;
@@ -1120,6 +1123,11 @@ export class Ops {
         return (off !== undefined ? this._titleSpot(w, [f.x + f.width - off]) : null) ?? this._titleSpot(w);
     }
 
+    _tabsInTitlebar(w) {
+        return TABS_IN_TITLEBAR.test(
+            `${windowInfo(w).app_id} ${w.get_wm_class() ?? ''} ${w.get_gtk_application_id() ?? ''}`);
+    }
+
     _titlebarDoubleClickMaximizes() {
         try {
             const src = Gio.SettingsSchemaSource.get_default();
@@ -1153,13 +1161,17 @@ export class Ops {
             if (spot) {
                 await this._glideTo(...spot, style, token);
                 await this._hover(style, token);
-                await this._pressRelease(BUTTONS.left, 1, style, token);
-                for (let i = 0; i < 12 && !w.has_focus(); i++)
-                    await token.sleep(40);
-                if (this._fixKeyFocus())
-                    await token.sleep(50);
-                if (w.has_focus())
-                    return 'pointer';
+                // Tab-in-titlebar browsers: a click here could switch a tab, so the pointer
+                // only visits and the activation below is programmatic.
+                if (!this._tabsInTitlebar(w)) {
+                    await this._pressRelease(BUTTONS.left, 1, style, token);
+                    for (let i = 0; i < 12 && !w.has_focus(); i++)
+                        await token.sleep(40);
+                    if (this._fixKeyFocus())
+                        await token.sleep(50);
+                    if (w.has_focus())
+                        return 'pointer';
+                }
             }
         }
         await this._activate(w, token);
@@ -1186,7 +1198,7 @@ export class Ops {
                 at = null; // covered by another window: not a click we can aim
         }
         const doubleClick = !at && (kind === 'maximize' || kind === 'unmaximize') &&
-            this._titlebarDoubleClickMaximizes();
+            !this._tabsInTitlebar(w) && this._titlebarDoubleClickMaximizes();
         const target = at ?? (doubleClick ? this._titleSpot(w) : this._buttonSpot(w, kind));
         if (!target)
             return null;

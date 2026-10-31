@@ -35,14 +35,14 @@ export async function runV22Scenarios() {
     };
     class FakeWindow {
         constructor(id, {x = 100, y = 100, width = 600, height = 400, focused = false, minimized = false,
-            maximized = false, workspaceIndex = 0} = {}) {
-            Object.assign(this, {id, x, y, width, height, minimized, maximized, workspaceIndex, fullscreen: false});
+            maximized = false, workspaceIndex = 0, appId = `app.${id}`} = {}) {
+            Object.assign(this, {id, x, y, width, height, minimized, maximized, workspaceIndex, appId, fullscreen: false});
             if (focused)
                 display.focus_window = this;
         }
         get_id() { return this.id }
         get_title() { return `Window ${this.id}` }
-        get_gtk_application_id() { return `app.${this.id}` }
+        get_gtk_application_id() { return this.appId }
         get_wm_class() { return '' }
         get_pid() { return this.id }
         get_monitor() { return 0 }
@@ -138,6 +138,45 @@ export async function runV22Scenarios() {
                 assert.equal(rr.via, 'programmatic');
                 assert.deepEqual([ofKind('glide'), ofKind('button')], [[], []]);
             }
+        }
+        {
+            // Tab-in-titlebar browsers are never clicked on their title bar (that is the tab
+            // strip): the pointer visits, the activation is programmatic, no double-click either.
+            for (const appId of ['org.mozilla.firefox', 'google-chrome', 'chromium-browser', 'com.brave.Browser',
+                'vivaldi-stable', 'org.mozilla.Firefox.desktop']) {
+                reset();
+                const browser = new FakeWindow(40, {x: 100, y: 100, appId});
+                const other = new FakeWindow(41, {x: 900, y: 100, focused: true});
+                wins = [browser, other];
+                onButton = focusOnClick;
+                const r = await ops._windowAction({id: 40, action: 'activate'}, new Token());
+                assert.equal(r.via, 'programmatic', appId);
+                assert.deepEqual(ofKind('button'), [], `${appId}: no click on a tab strip`);
+                assert.equal(ofKind('glide').length, 1, 'the pointer still visits the window');
+                assert.equal(ofKind('activate').length, 1);
+                const realDouble = ops._titlebarDoubleClickMaximizes;
+                ops._titlebarDoubleClickMaximizes = () => true;
+                log = [];
+                const m = await ops._windowAction({id: 40, action: 'maximize'}, new Token());
+                ops._titlebarDoubleClickMaximizes = realDouble;
+                assert.equal(m.via, 'programmatic');
+                assert.deepEqual(ofKind('button'), [], `${appId}: no double-click on a tab strip`);
+            }
+            // Other apps (even with browser-like substrings) keep the click.
+            for (const appId of ['org.gnome.Chromecast.Viewer.zenity', 'org.gnome.Calculator']) {
+                reset();
+                const w = new FakeWindow(42, {x: 100, y: 100, appId});
+                wins = [w];
+                onButton = focusOnClick;
+                assert.equal((await ops._windowAction({id: 42, action: 'activate'}, new Token())).via, 'pointer', appId);
+            }
+            // An explicit `at` (the caller found the real button) is still honoured on a browser.
+            reset();
+            const ff = new FakeWindow(43, {x: 200, y: 150, focused: true, appId: 'firefox'});
+            wins = [ff];
+            const at = {x: ff.x + ff.width - 24, y: ff.y + 22};
+            onButton = (_b, down) => { if (down && Math.hypot(pointer[0] - at.x, pointer[1] - at.y) < 3) ff.delete() };
+            assert.equal((await ops._windowAction({id: 43, action: 'close', at}, new Token())).via, 'pointer');
         }
         {
             // close with the real button located by the caller: glide, click it, done.
@@ -455,7 +494,7 @@ export async function runV22Scenarios() {
             await ops._keyType({text: 'ação é', style: 'fast', method: 'clipboard'}, new Token());
             assert.deepEqual(pastes, ['ação é']);
             // Too many clipboard characters for one op: refused with a hint, never hangs.
-            await assert.rejects(ops._keyType({text: 'ç'.repeat(100), method: 'clipboard'}, new Token()),
+            await assert.rejects(ops._keyType({text: 'ç'.repeat(120), method: 'clipboard', delay_ms: 100}, new Token()),
                 e => e.code === 'bad_args' && /split/.test(e.message));
             pastes.length = 0;
             await ops._keyType({text: 'ç'.repeat(40), method: 'clipboard'}, new Token());
