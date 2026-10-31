@@ -1507,6 +1507,32 @@ class HumanOrchestrationTests(ServerFixture, unittest.TestCase):
         self.daemon.windows[0]["app_id"] = "firefox"
         self.assertTrue(self.call_tool("act", {"actions": [{"open": "a\nb"}]})["isError"])
 
+    def test_window_buttons_are_passed_to_the_extension_when_found(self):
+        located = []
+        def button(window, action, windows):
+            located.append((window, action))
+            return {"found": True, "x": 1290.4, "y": 62}
+        self.page.button = button
+        self.text_of("act", {"actions": [{"window": [42, "close"]}, {"window": [42, "fit"]}]})
+        closes = self.ops("ui.window.action")
+        self.assertEqual(closes[0], {"id": 42, "action": "close", "style": "human", "at": {"x": 1290, "y": 62}})
+        self.assertNotIn("at", closes[1])           # only close/minimize/maximize use a button
+        self.assertEqual(located, [(42, "close")])
+        self.text_of("act", {"actions": [{"window": [42, "close"]}], "speed": "fast"})
+        self.assertNotIn("at", self.ops("ui.window.action")[-1])    # programmatic styles never look
+        self.assertEqual(len(located), 1)
+
+    def test_a_missing_or_failing_button_lookup_still_closes_the_window(self):
+        self.page.button = lambda *args: {"found": False}
+        self.text_of("act", {"actions": [{"window": [42, "close"]}]})
+        self.assertNotIn("at", self.ops("ui.window.action")[-1])
+        def broken(*args):
+            raise protocol.ProtocolError("a11y_unavailable", "bus gone")
+        self.page.button = broken
+        self.text_of("act", {"actions": [{"window": [42, "minimize"]}]})
+        self.assertEqual(self.ops("ui.window.action")[-1]["action"], "minimize")
+        self.assertNotIn("at", self.ops("ui.window.action")[-1])
+
     def test_focus_forwards_the_style_for_pointer_driven_activation(self):
         self.text_of("act", {"actions": [{"focus": 42}]})
         self.assertEqual(self.ops("ui.window.action")[-1], {"id": 42, "action": "activate", "style": "human"})
@@ -1679,6 +1705,7 @@ def firefox_tree():
     document = web("document web", "Test Page", (26, 108, 1280, 887), url="https://example.test/form", children=[
         web("heading", "Sign up", (50, 120, 400, 30), attrs={"level": "2"}),
         web("link", "Home", (50, 160, 40, 17)),
+        web("button", "Close", (1200, 130, 40, 20)),
         web("entry", "Full name", (50, 200, 200, 22), {"FOCUSED", "FOCUSABLE", "EDITABLE"}, text="Ana"),
         web("password text", "Password", (50, 230, 200, 22), {"EDITABLE"}, text="secret"),
         web("check box", "Accept terms", (50, 260, 14, 14), {"CHECKED"}),
@@ -1699,6 +1726,8 @@ def firefox_tree():
             FakeAtspiNode("page tab list", "", (66, 23, 1000, 44), UP, children=[
                 web("page tab", "Other", (66, 23, 200, 44), {"FOCUSABLE"}),
                 web("page tab", "Test Page", (266, 23, 200, 44), {"FOCUSABLE", "SELECTED"})])]),
+        FakeAtspiNode("tool bar", "Window controls", (1200, 23, 106, 44), UP, children=[
+            web("button", "Close", (1266, 23, 40, 44))]),
         FakeAtspiNode("tool bar", "Navigation", (26, 67, 1280, 40), UP, children=[
             web("button", "Stop", (138, 67, 36, 40)),
             web("combo box", "Search or enter address", (313, 71, 742, 32), {"EDITABLE", "FOCUSABLE"},
@@ -1763,7 +1792,7 @@ class WorkerReaderTests(unittest.TestCase):
         names = [row["name"] for row in reply["elements"]]
         self.assertIn("Item 1", names)
         self.assertNotIn("Above", names)
-        self.assertEqual(reply["page"]["extra"], 1)
+        self.assertEqual(reply["page"]["extra"], 2)
         reply = self.reader().snapshot({"windows": self.WINDOWS, "max": 60, "query": "item"})
         self.assertEqual([row["name"] for row in reply["elements"]], ["Item 1", "Item 2"])
         self.assertEqual(reply["headings"], [])
@@ -1790,6 +1819,17 @@ class WorkerReaderTests(unittest.TestCase):
         self.assertEqual(reader.locate({"ref": 99999, "windows": self.WINDOWS})["state"], "gone")
         node.states.discard("DEFUNCT")
         self.assertEqual(reader.locate({"ref": item["ref"], "windows": []})["state"], "unknown")
+
+    def test_window_button_is_found_in_the_titlebar_only(self):
+        reader = self.reader()
+        close = reader.button({"window": 5, "action": "close", "windows": self.WINDOWS})
+        # (1266 - 26 + 30) + 20, (23 - 23 + 40) + 22: the toolbar one, not the page's own "Close".
+        self.assertEqual(close, {"found": True, "x": 1290, "y": 62})
+        self.assertEqual(reader.button({"window": 5, "action": "minimize", "windows": self.WINDOWS}), {"found": False})
+        self.assertEqual(reader.button({"window": 6, "action": "close", "windows": self.WINDOWS}), {"found": False})
+        self.assertEqual(reader.button({"window": 5, "action": "hide", "windows": self.WINDOWS}), {"found": False})
+        names = {row["name"] for row in reader.snapshot({"windows": self.WINDOWS, "max": 60})["elements"]}
+        self.assertIn("Close", names)    # the page's own button is still a page element
 
     def test_untrusted_frame_geometry_never_yields_a_position(self):
         windows = [dict(self.WINDOWS[0], width=900, height=500)]

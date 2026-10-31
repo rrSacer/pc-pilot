@@ -498,7 +498,12 @@ class RealStackTests(unittest.TestCase):
             return 'entry "Full name"' in last["text"]
         self.assertTrue(wait_until(page_ready, timeout=30, interval=1), last.get("text"))
         self.assertRegex(last["text"].splitlines()[0], r'^Firefox · "PCPilot Test Page"')
-        self.mcp.call("control", {"action": "stop", "keep": [int(firefox_window().group(1))]})
+        # Closing a window: the real Close button is located through AT-SPI and clicked by the pointer.
+        wid = int(firefox_window().group(1))
+        self.mcp.call("act", {"actions": [{"window": [wid, "close"]}]})
+        self.assertTrue(wait_until(lambda: not firefox_window(), timeout=15, interval=1),
+                        self.mcp.call("windows")["content"][0]["text"])
+        self.mcp.call("control", {"action": "stop"})
         self.assertTrue(wait_until(lambda: not self.a11y_enabled(), timeout=10))
 
 
