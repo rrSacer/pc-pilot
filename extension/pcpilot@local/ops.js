@@ -14,10 +14,12 @@ import * as Keyboard from 'resource:///org/gnome/shell/ui/status/keyboard.js';
 import {BUTTONS, Input} from './input.js';
 import {MODIFIER_KEYVALS, charToKeyval, parseChord} from './keys.js';
 import {animate, glide} from './motion.js';
-import {STYLES, minJerk, planPath, scrollAnchor, scrollCadence, typingCadence} from './path.js';
+import {
+    SCROLL_BUDGET_MS, STYLES, minJerk, planPath, scrollAnchor, scrollCadence, scrollPlan, typingCadence,
+} from './path.js';
 import {E_BAD_ARGS, E_FAILED, E_INACTIVE, E_NOT_FOUND, E_UNKNOWN_OP, OpError} from './protocol.js';
 import {SessionState, restoreWindow, sameProp, windowState} from './session.js';
-import {clampToMonitors, findWindow, listWindows, rect, windowInfo} from './windows.js';
+import {clampToMonitors, findWindow, listWindows, onMonitor, rect, windowInfo} from './windows.js';
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot');
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
@@ -41,10 +43,24 @@ const PASTE_SETTLE_MS = 300;
 const CLIPBOARD_READ_MS = 2000;
 // key.type must finish well inside the per-op limit (extension 18s, daemon 20s).
 const MAX_TYPE_MS = 15000;
+// Human typing pastes exotic characters one at a time; if that cannot fit MAX_TYPE_MS it
+// pastes up to this many per paste before giving up with "split the text".
+const MAX_PASTE_GROUP = 8;
 const MAX_LAUNCH_WAIT_MS = 15000;
-const HUMAN_TYPING_EXTRA_MS = 4000;
 const GEOMETRY_MS = {human: 250, fast: 120, instant: 0};
 const WRAPUP_CAP_MS = 8000;
+const WRAPUP_PACE = 0.65; // the wrapup's glide home is brisker than a deliberate reach
+const HOVER_MS = [200, 450]; // a person looks at the target before pressing
+const CHROME_WAIT_MS = 800; // how long a titlebar click gets to take effect
+// Clicking a title bar to activate a window needs up to ~7.5 s (glide, hover, click, focus);
+// a launch only does it when that still fits the 18 s op guard after waiting for the window.
+const POINTER_ACTIVATE_MS = 7500;
+const LAUNCH_OP_BUDGET_MS = 17000;
+// Where on a title bar the pointer rests to activate a window (fractions of the width):
+// right of centre, away from the title, the window buttons and the back/menu buttons.
+const DRIFT_PX = 5; // how far the pointer wanders from its scroll anchor between bursts
+const TITLE_SPOTS = [0.62, 0.42, 0.8, 0.3, 0.15];
+const TITLEBAR_BUTTON_OFFSET = {close: 26, minimize: 58, maximize: 90, unmaximize: 90};
 const CLOSE_WAIT_MS = 1500;
 const MIN_WINDOW_PX = 80;
 
@@ -427,21 +443,15 @@ export class Ops {
         return b;
     }
 
-    async _pointerClick(args, token) {
-        const p = optionalPoint(args);
-        const style = styleOf(args);
-        const button = this._button(args.button);
-        const count = num(args.count, 'count', {min: 1, max: 3, int: true, def: 1});
-        const mods = this._modifiers(args.modifiers);
-        if (p)
-            await this._glideTo(...p, style, token);
+    // Look at the target for a moment before pressing (human style only).
+    async _hover(style, token) {
         if (style === 'human')
-            await token.sleep(Math.round(randomBetween(150, 400))); // hover, then press
-        for (const k of mods)
-            this._input.key(k, true);
+            await token.sleep(Math.round(randomBetween(...HOVER_MS)));
+    }
+
+    // Press and release `count` times at the current pointer position.
+    async _pressRelease(button, count, style, token) {
         try {
-            if (mods.length > 0)
-                await token.sleep(30); // modifiers travel on the keyboard device
             for (let i = 0; i < count; i++) {
                 if (i > 0)
                     await token.sleep(40);
@@ -452,6 +462,25 @@ export class Ops {
             }
         } finally {
             this._input.button(button, false);
+        }
+    }
+
+    async _pointerClick(args, token) {
+        const p = optionalPoint(args);
+        const style = styleOf(args);
+        const button = this._button(args.button);
+        const count = num(args.count, 'count', {min: 1, max: 3, int: true, def: 1});
+        const mods = this._modifiers(args.modifiers);
+        if (p)
+            await this._glideTo(...p, style, token);
+        await this._hover(style, token);
+        for (const k of mods)
+            this._input.key(k, true);
+        try {
+            if (mods.length > 0)
+                await token.sleep(30); // modifiers travel on the keyboard device
+            await this._pressRelease(button, count, style, token);
+        } finally {
             for (const k of [...mods].reverse())
                 this._input.key(k, false);
         }
@@ -467,7 +496,7 @@ export class Ops {
         const given = args.duration_ms !== undefined && args.duration_ms !== null;
         const duration = num(args.duration_ms, 'duration_ms', {min: 0, max: 10000, def: 300});
         await this._glideTo(x1, y1, style, token);
-        await token.sleep(style === 'human' ? Math.round(randomBetween(150, 300)) : 20);
+        await token.sleep(style === 'human' ? Math.round(randomBetween(...HOVER_MS)) : 20);
         this._input.button(button, true);
         try {
             await token.sleep(50);
@@ -507,30 +536,75 @@ export class Ops {
         return clampToMonitors(...scrollAnchor(f));
     }
 
+    // Rest the pointer a few pixels off while the "reader" looks at the page: a short,
+    // tiny glide that stays within DRIFT_PX of `home`.
+    async _scrollDrift(home, pauseMs, token) {
+        const [px, py] = global.get_pointer();
+        const target = clampToMonitors(
+            home[0] + (Math.random() - 0.5) * 2 * DRIFT_PX, home[1] + (Math.random() - 0.5) * 2 * DRIFT_PX);
+        const d = Math.min(Math.max(pauseMs * 0.55, 140), 380);
+        const path = planPath([px, py], target, 'human', {duration: d});
+        if (path.duration > 0)
+            await glide(this._input, path, token);
+        await token.sleep(Math.max(0, Math.round(pauseMs - path.duration)));
+    }
+
+    // pointer.scroll: `dy`/`dx` are wheel notches (> 0 = down/right). Human style rolls
+    // them as irregular bursts (see scrollPlan): discrete notches, one event each, with
+    // "looking" pauses in which the pointer drifts a few px. The whole op stays inside
+    // SCROLL_BUDGET_MS (14 s); past it, the remaining notches go out back to back.
     async _pointerScroll(args, token) {
         const style = styleOf(args);
         const dx = num(args.dx, 'dx', {min: -50, max: 50, int: true, def: 0});
         const dy = num(args.dy, 'dy', {min: -50, max: 50, int: true, def: 0});
+        const started = GLib.get_monotonic_time();
+        const late = () => (GLib.get_monotonic_time() - started) / 1000 > SCROLL_BUDGET_MS;
         const p = optionalPoint(args) ?? this._scrollAnchor();
         if (p)
             await this._glideTo(...p, style, token);
         if (style === 'human')
             await token.sleep(Math.round(randomBetween(150, 300)));
-        const steps = [
-            [Math.abs(dy), dy > 0 ? Clutter.ScrollDirection.DOWN : Clutter.ScrollDirection.UP],
-            [Math.abs(dx), dx > 0 ? Clutter.ScrollDirection.RIGHT : Clutter.ScrollDirection.LEFT],
-        ];
-        for (const [n, dir] of steps) {
-            const gaps = scrollCadence(n, style);
-            if (n > 0)
-                this._overlay.cursor?.scrollHint(
-                    dir === Clutter.ScrollDirection.DOWN || dir === Clutter.ScrollDirection.RIGHT ? 1 : -1);
-            for (let i = 0; i < n; i++) {
-                this._input.scroll(dir);
-                await token.sleep(gaps[i]);
+        const here = this._input.position();
+        const home = p ?? [here.x, here.y];
+        const axes = [
+            [dy, Clutter.ScrollDirection.DOWN, Clutter.ScrollDirection.UP, 'dy'],
+            [dx, Clutter.ScrollDirection.RIGHT, Clutter.ScrollDirection.LEFT, 'dx'],
+        ].filter(([n]) => n !== 0);
+        const totalNotches = Math.abs(dy) + Math.abs(dx);
+        let emitted = 0;
+        const net = {dx: 0, dy: 0};
+        for (const [n, fwd, back, key] of axes) {
+            const count = Math.abs(n), sign = Math.sign(n);
+            // Wheel direction of a notch (+1 = the requested way, -1 = a counter-notch).
+            const wayFor = notch => ((notch > 0) === (sign > 0) ? fwd : back);
+            if (style !== 'human') {
+                this._overlay.cursor?.scrollHint(sign);
+                const gaps = scrollCadence(count);
+                for (let i = 0; i < count; i++) {
+                    this._input.scroll(wayFor(1));
+                    emitted++;
+                    net[key] += sign;
+                    await token.sleep(gaps[i]);
+                }
+                continue;
+            }
+            const elapsed = (GLib.get_monotonic_time() - started) / 1000;
+            const budget = Math.max(2500, SCROLL_BUDGET_MS - elapsed) * count / totalNotches;
+            for (const burst of scrollPlan(count, Math.random, budget)) {
+                this._overlay.cursor?.scrollHint(burst.notches[0] * sign);
+                for (let j = 0; j < burst.notches.length; j++) {
+                    token.check();
+                    this._input.scroll(wayFor(burst.notches[j]));
+                    emitted++;
+                    net[key] += burst.notches[j] * sign;
+                    if (j < burst.gaps.length)
+                        await token.sleep(late() ? 30 : burst.gaps[j]);
+                }
+                if (burst.pause > 0 && !late())
+                    await this._scrollDrift(home, burst.pause, token);
             }
         }
-        return {anchor: p ? {x: p[0], y: p[1]} : null};
+        return {anchor: p ? {x: p[0], y: p[1]} : null, notches: emitted, net};
     }
 
     // ---- keyboard ----
@@ -590,6 +664,17 @@ export class Ops {
         return (cp >= 0x20 && cp <= 0x7e) || typeable.extra.includes(ch);
     }
 
+    // key.type. Pacing by style:
+    //   human   one commit per character (now and then two), 70-190 ms on average with
+    //           jitter, word pauses after spaces/punctuation and the odd 0.5-1 s
+    //           hesitation (path.js typingCadence). Texts over 120 characters switch to a
+    //           brisk 25-60 ms cadence, fitted so the op stays under ~14 s; a text too
+    //           long even for that (~480+ chars) is typed unpaced in plain chunks.
+    //   fast    unpaced chunks (IM: 64 chars per commit, keyvals back to back).
+    //   instant like fast, but an IM run is committed whole.
+    // An explicit delay_ms wins: one commit per character with that fixed gap.
+    // Characters that need the clipboard are pasted one by one in human style (never the
+    // whole string at once; up to MAX_PASTE_GROUP per paste if one by one cannot fit).
     async _keyType(args, token) {
         const text = str(args.text, 'text').replace(/\r\n?/g, '\n');
         if (text.length > MAX_TEXT)
@@ -606,7 +691,11 @@ export class Ops {
         const imFocus = Main.inputMethod?.currentFocus ?? null;
         if (forced === 'im' && !imFocus)
             throw new OpError(E_FAILED, 'no input method focus');
-        const useIm = forced ? forced === 'im' : imFocus !== null;
+        // The shell's own UI (the overview's search entry, dialogs under a modal grab) gets
+        // real key events: after an input-method commit its entry stops reacting to plain
+        // Return/arrow keys, so "Super, type the name, Enter" would never launch anything.
+        const shellUi = Main.modalCount > 0 || Main.overview.visible;
+        const useIm = forced ? forced === 'im' : imFocus !== null && !shellUi;
         const typeable = this._typeableSet();
 
         // Plan runs: [kind, text] with kind im | keyval | clipboard | newline.
@@ -633,18 +722,45 @@ export class Ops {
             push(kind, ch);
         }
 
-        // Per-character pauses: explicit delay_ms wins; else "human" gets a light cadence
-        // (at most HUMAN_TYPING_EXTRA_MS in total); fast/instant type as quickly as possible.
+        // Pacing: explicit delay_ms wins; else human style follows typingCadence.
         const chars = [...text];
-        const cadence = delay === 0 && style === 'human'
-            ? typingCadence(chars, HUMAN_TYPING_EXTRA_MS) : null;
-        let charIndex = 0;
-        const pause = () => (cadence ? cadence[charIndex++] ?? 0 : (charIndex++, delay));
+        const plan = delay === 0 && style === 'human' ? typingCadence(chars) : null;
+        const cadence = plan && plan.profile !== 'bulk' ? plan : null;
+        const paced = delay > 0 || cadence !== null;
+        let ci = 0; // characters consumed so far
+        // [characters in the next commit, pause after it]; `limit` caps an unpaced chunk.
+        const step = (left, limit) => {
+            if (!paced) {
+                const n = Math.min(left, limit);
+                ci += n;
+                return [n, 0];
+            }
+            const n = cadence?.pair[ci] && left >= 2 ? 2 : 1;
+            const gap = cadence ? cadence.gaps[ci] + (n === 2 ? cadence.gaps[ci + 1] : 0) : delay * n;
+            ci += n;
+            return [n, gap];
+        };
+        // The pause for `n` characters committed some other way (pasted).
+        const skip = n => {
+            let gap = 0;
+            for (let i = 0; i < n; i++, ci++)
+                gap += paced ? (cadence ? cadence.gaps[ci] : delay) : 0;
+            return gap;
+        };
+        const imLimit = style === 'instant' ? Infinity : IM_CHUNK;
 
         // Refuse what cannot finish inside the op time limit (the agent should split it).
-        const pastes = runs.filter(r => r[0] === 'clipboard').length;
-        const estimate = chars.length * delay + pastes * (PASTE_SETTLE_MS + 100) +
-            (cadence ? cadence.reduce((a, b) => a + b, 0) : 0);
+        const pasteCost = PASTE_SETTLE_MS + 100;
+        const clipChars = runs.filter(r => r[0] === 'clipboard').reduce((a, r) => a + [...r[1]].length, 0);
+        const gapsTotal = cadence ? cadence.gaps.reduce((a, b) => a + b, 0) : chars.length * delay;
+        let pasteGroup = style === 'human' ? 1 : Infinity;
+        if (pasteGroup === 1 && gapsTotal + clipChars * pasteCost > MAX_TYPE_MS) {
+            const room = Math.max(MAX_TYPE_MS - gapsTotal, pasteCost * 3);
+            pasteGroup = Math.min(MAX_PASTE_GROUP, Math.ceil(clipChars * pasteCost / room));
+        }
+        const pastes = runs.filter(r => r[0] === 'clipboard')
+            .reduce((a, r) => a + Math.ceil([...r[1]].length / pasteGroup), 0);
+        const estimate = gapsTotal + pastes * pasteCost;
         if (estimate > MAX_TYPE_MS) {
             throw new OpError(E_BAD_ARGS,
                 `typing would take ~${Math.ceil(estimate / 1000)}s (max ${MAX_TYPE_MS / 1000}s): ` +
@@ -663,23 +779,25 @@ export class Ops {
             if (kind === 'newline') {
                 await switchTo('key');
                 this._input.tap(Clutter.KEY_Return);
-                await token.sleep(pause());
+                await token.sleep(step(1, 1)[1]);
             } else if (kind === 'im') {
                 methods.add('im');
                 await switchTo('im');
-                await this._typeIm(chunk, pause, cadence !== null || delay > 0, token);
+                await this._typeIm(chunk, step, imLimit, token);
             } else if (kind === 'keyval') {
                 methods.add('keyval');
                 await switchTo('key');
-                await this._typeKeyvals(chunk, pause, cadence !== null || delay > 0, token);
+                await this._typeKeyvals(chunk, step, paced, token);
             } else {
                 methods.add('clipboard');
                 await switchTo('key');
-                await this._paste(chunk, token);
-                let gap = 0;
-                for (const _ of chunk)
-                    gap += pause();
-                await token.sleep(Math.min(gap, 400));
+                const cc = [...chunk];
+                for (let i = 0; i < cc.length; i += pasteGroup) {
+                    token.check();
+                    const part = cc.slice(i, i + pasteGroup);
+                    await this._paste(part.join(''), token);
+                    await token.sleep(Math.min(skip(part.length), 400));
+                }
             }
         }
         let method = 'keyval';
@@ -690,27 +808,31 @@ export class Ops {
         return {method};
     }
 
-    // pause() yields the next per-character delay; paced = commit one character at a time.
-    async _typeIm(text, pause, paced, token) {
+    // step(left, limit) yields [characters, pause after them]: one commit per step.
+    async _typeIm(text, step, limit, token) {
         const chars = [...text];
-        const step = paced ? 1 : IM_CHUNK;
-        for (let i = 0; i < chars.length; i += step) {
+        for (let i = 0; i < chars.length;) {
             token.check();
-            Main.inputMethod.commit(chars.slice(i, i + step).join(''));
-            let gap = 0;
-            for (let j = i; j < Math.min(i + step, chars.length); j++)
-                gap += pause();
+            const [n, gap] = step(chars.length - i, limit);
+            Main.inputMethod.commit(chars.slice(i, i + n).join(''));
+            i += n;
             await token.sleep(gap);
         }
     }
 
-    async _typeKeyvals(text, pause, paced, token) {
-        let n = 0;
-        for (const ch of text) {
+    async _typeKeyvals(text, step, paced, token) {
+        const chars = [...text];
+        let taps = 0;
+        for (let i = 0; i < chars.length;) {
             token.check();
-            this._input.tap(charToKeyval(ch));
-            const gap = pause();
-            if (paced || ++n % KEYVAL_YIELD_EVERY === 0)
+            const [n, gap] = step(chars.length - i, 1);
+            for (let j = 0; j < n; j++) {
+                if (j > 0)
+                    await token.sleep(25); // two quick keys of one burst
+                this._input.tap(charToKeyval(chars[i + j]));
+            }
+            i += n;
+            if (paced || ++taps % KEYVAL_YIELD_EVERY === 0)
                 await token.sleep(gap);
         }
     }
