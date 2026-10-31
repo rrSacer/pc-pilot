@@ -25,6 +25,7 @@ from PIL import Image
 from pcpilot import evdev
 from tests.daemon_testlib import AgentClient, DaemonProcess, FakeDevice, wait_until
 from tests.temp_paths import socket_temp_base
+from tests.test_ext_support.theme_probe import is_frame_pixel
 
 ROOT = Path(__file__).resolve().parents[1]
 SHELL = ROOT / "dev/headless-shell.sh"
@@ -208,7 +209,8 @@ class RealStackTests(unittest.TestCase):
             check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
         with Image.open(path) as image:
             pixel = image.convert("RGB").getpixel((1, 540))
-        return all(abs(a-b) <= 10 for a, b in zip(pixel, (255, 69, 58)))
+        # The frame's 4 px line is themed (the MCP picks the theme from its client's name).
+        return is_frame_pixel(pixel)
 
     def assert_active(self):
         self.assertTrue(self.status()["active"])
