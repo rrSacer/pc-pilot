@@ -36,7 +36,9 @@ class MCPServerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.previous_env = {key: os.environ.get(key) for key in
-                             ("PCPILOT_SOCKET", "PCPILOT_MAX_SIDE", "PCPILOT_DESKTOP_USER", "PCPILOT_A11Y_RUNTIME_DIR")}
+                             ("PCPILOT_SOCKET", "PCPILOT_MAX_SIDE", "PCPILOT_DESKTOP_USER", "PCPILOT_A11Y_RUNTIME_DIR", "PCPILOT_THEME", "PCPILOT_AUTOSTOP_S")}
+        os.environ.pop("PCPILOT_THEME", None)
+        os.environ.pop("PCPILOT_AUTOSTOP_S", None)
         self.daemon = FakeDaemon(self.tmp.name)
         os.environ["PCPILOT_SOCKET"] = self.daemon.path
         os.environ["PCPILOT_MAX_SIDE"] = "1280"
@@ -77,6 +79,165 @@ class MCPServerTests(unittest.TestCase):
         self.assertIn("keep", control_schema)
         self.assertIn("cleanup", control_schema)
         self.assertEqual(self.rpc("initialize", {"protocolVersion": "unknown"})["result"]["protocolVersion"], "2025-06-18")
+
+    def test_initialize_derives_theme_and_friendly_label_and_propagates_on_begin(self):
+        cases = [("claude-code", "claude", "Claude"), ("CODEX", "codex", "Codex"),
+                 ("OpenAI", "codex", "Codex"), ("gemini-cli", "gemini", "Gemini"),
+                 ("Antigravity", "gemini", "Gemini"),
+                 ("other", "neutral", "other")]
+        for name, theme, label in cases:
+            with self.subTest(name=name):
+                self.server = mcp_server.Server(worker=self.worker)
+                self.initialize_info(name)
+                self.call_tool("control", {"action": "start"})
+                begin = [r for r in self.daemon.requests if r["op"] == "session.begin"][-1]
+                self.assertEqual(begin["args"].get("theme"), theme)
+                self.assertEqual(begin["args"].get("label"), label)
+                self.server.close()
+                self.server = mcp_server.Server(worker=self.worker)
+
+    def initialize_info(self, name, title=None):
+        info = {"name": name}
+        if title is not None:
+            info["title"] = title
+        return self.rpc("initialize", {"protocolVersion": "2025-06-18", "clientInfo": info})
+
+    def test_theme_override_is_whitelisted_and_friendly_name_falls_back_to_title(self):
+        os.environ["PCPILOT_THEME"] = "gemini"
+        self.initialize_info("random-client", "Friendly Title")
+        self.call_tool("control", {"action": "start"})
+        args = [r["args"] for r in self.daemon.requests if r["op"] == "session.begin"][-1]
+        self.assertEqual(args.get("theme"), "gemini")
+        self.assertEqual(args.get("label"), "Friendly Title")
+        self.initialize_info("claude-code")
+        self.call_tool("control", {"action": "stop"})
+        self.call_tool("control", {"action": "start"})
+        again = [r["args"] for r in self.daemon.requests if r["op"] == "session.begin"][-1]
+        self.assertEqual(again, args)
+
+    def test_invalid_theme_override_is_ignored_and_missing_identity_uses_ia(self):
+        os.environ["PCPILOT_THEME"] = "purple"
+        self.initialize_info("")
+        self.call_tool("control", {"action": "start"})
+        args = [r["args"] for r in self.daemon.requests if r["op"] == "session.begin"][-1]
+        self.assertEqual(args.get("theme"), "neutral")
+        self.assertEqual(args.get("label"), "IA")
+
+    def test_autostop_idle_wrapup_and_disable_override(self):
+        self.assertEqual(mcp_server.IDLE_AUTOSTOP_S, 12)
+        with mock.patch.dict(os.environ, {"PCPILOT_AUTOSTOP_S": "0"}):
+            self.server = mcp_server.Server(worker=self.worker)
+            self.initialize()
+            self.call_tool("control", {"action": "start"})
+            # The disabled setting must leave an otherwise idle session active.
+            time.sleep(.15)
+            self.assertTrue(self.server.daemon.active)
+            self.server.close()
+        with mock.patch.dict(os.environ, {"PCPILOT_AUTOSTOP_S": ".08"}):
+            self.server = mcp_server.Server(worker=self.worker)
+            self.initialize()
+            self.call_tool("control", {"action": "start"})
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and self.server.daemon.active:
+                time.sleep(.01)
+        self.assertFalse(self.server.daemon.active)
+        ops = [r["op"] for r in self.daemon.requests]
+        self.assertEqual(ops.count("ui.session.wrapup"), 1)
+        self.assertLess(ops.index("ui.session.wrapup"), ops.index("session.end"))
+        wrapup = next(r["args"] for r in self.daemon.requests if r["op"] == "ui.session.wrapup")
+        self.assertEqual(wrapup, {"keep": [], "close_new": False, "return_to": "origin"})
+
+    def test_autostop_waits_for_inflight_wait_and_observation_then_resume_is_reported(self):
+        with mock.patch.dict(os.environ, {"PCPILOT_AUTOSTOP_S": ".08"}):
+            self.server = mcp_server.Server(worker=self.worker)
+            self.initialize()
+            self.call_tool("control", {"action": "start"})
+            started = time.monotonic()
+            result = self.call_tool("act", {"actions": [{"wait": 180}], "observe": "screenshot"})
+            self.assertGreaterEqual(time.monotonic() - started, .17)
+            self.assertEqual(sum(r["op"] == "ui.session.wrapup" for r in self.daemon.requests), 0)
+            self.assertGreaterEqual(len(result["content"]), 2)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and self.server.daemon.active:
+                time.sleep(.01)
+            self.assertFalse(self.server.daemon.active)
+            before = sum(r["op"] == "session.begin" for r in self.daemon.requests)
+            resumed = self.call_tool("windows", {})
+            self.assertIn("session resumed", [c["text"] for c in resumed["content"]])
+            begins = [r["args"] for r in self.daemon.requests if r["op"] == "session.begin"]
+            self.assertEqual(len(begins), before + 1)
+            self.assertEqual(begins[-1].get("theme"), "neutral")
+            again = self.call_tool("windows", {})
+            self.assertNotIn("session resumed", [c["text"] for c in again["content"]])
+
+    def test_autostop_never_sends_cleanup_after_user_abort(self):
+        with mock.patch.dict(os.environ, {"PCPILOT_AUTOSTOP_S": ".06"}):
+            self.server = mcp_server.Server(worker=self.worker)
+            self.initialize()
+            self.call_tool("control", {"action": "start"})
+            self.daemon.emit({"event": "session_ended", "reason": "user_hotkey"})
+            time.sleep(.15)
+            self.assertFalse(any(r["op"] in {"ui.session.wrapup", "session.end"}
+                                 for r in self.daemon.requests))
+            count = len(self.daemon.requests)
+            status = self.call_tool("control", {"action": "status"})
+            self.assertTrue(status["isError"])
+            result = self.call_tool("windows", {})
+            self.assertTrue(result["isError"])
+            self.assertEqual(len(self.daemon.requests), count)
+
+    def test_explicit_stop_cancels_pending_idle_autostop(self):
+        with mock.patch.dict(os.environ, {"PCPILOT_AUTOSTOP_S": ".35"}):
+            self.server = mcp_server.Server(worker=self.worker)
+            self.initialize()
+            self.call_tool("control", {"action": "start"})
+            time.sleep(.04)
+            self.call_tool("control", {"action": "stop"})
+            time.sleep(.4)
+        ops = [r["op"] for r in self.daemon.requests]
+        self.assertEqual(ops.count("ui.session.wrapup"), 1)
+        self.assertEqual(ops.count("session.end"), 1)
+
+    def test_eof_cancels_pending_idle_autostop_with_fake_daemon(self):
+        fake = self.daemon
+        env = dict(os.environ, PCPILOT_SOCKET=fake.path, PCPILOT_DESKTOP_USER=str(os.getuid()),
+                   PCPILOT_A11Y_RUNTIME_DIR=fake.runtime_dir, PCPILOT_AUTOSTOP_S=".12")
+        proc = subprocess.Popen([sys.executable, "-m", "pcpilot.mcp_server"], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, bufsize=1)
+        self.addCleanup(cleanup_process, proc)
+        proc.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n')
+        proc.stdin.flush(); proc.stdout.readline()
+        proc.stdin.write('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"control","arguments":{"action":"start"}}}\n')
+        proc.stdin.flush(); proc.stdout.readline()
+        time.sleep(.03)
+        proc.stdin.close()
+        self.assertEqual(proc.wait(timeout=3), 0, proc.stderr.read())
+        time.sleep(.15)
+        self.assertFalse(any(r["op"] in {"ui.session.wrapup", "session.end"} for r in fake.requests))
+
+    def test_cancelled_idle_wrapup_cannot_end_replacement_owner_session(self):
+        fake = self.daemon
+        fake.wrapup_gate = threading.Event()
+        with mock.patch.dict(os.environ, {"PCPILOT_AUTOSTOP_S": ".04"}):
+            self.server = mcp_server.Server(worker=self.worker)
+            self.initialize()
+            self.server.prepare_request(1)
+            self.call_tool("control", {"action": "start"})
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not any(r["op"] == "ui.session.wrapup" for r in fake.requests):
+                time.sleep(.01)
+            self.assertTrue(any(r["op"] == "ui.session.wrapup" for r in fake.requests))
+            old_owner = self.server.daemon
+            self.server.cancel(1)
+            self.server.prepare_request(2)
+            fake.wrapup_gate.set()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and self.server.daemon is old_owner:
+                time.sleep(.01)
+            self.assertIsNot(self.server.daemon, old_owner)
+            result = self.call_tool("windows", {})
+            self.assertFalse(result.get("isError", False), result)
+            self.assertFalse(any(r["op"] == "session.end" for r in fake.requests))
 
     def test_tools_list_compact_json_rpc_size_stays_under_budget(self):
         self.initialize()

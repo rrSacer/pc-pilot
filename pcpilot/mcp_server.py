@@ -25,12 +25,14 @@ from . import protocol
 VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 INSTRUCTIONS = ("Prefer elements, shortcuts and launch; batch act actions. Observe only when needed. "
                 "Coordinates are global scaled screen pixels (longest side <=1280 by default). "
-                "Call control stop when done. USER_TOOK_CONTROL: stop and wait for the user; "
+                "End every task with control stop. Idle sessions auto-release after ~12s. "
+                "USER_TOOK_CONTROL: stop and wait for the user; "
                 "resume only on their explicit request. Close tabs/files you opened (ctrl+w) before stop; "
                 "use keep if the user wants windows left open. Use speed:fast for bulk work; "
                 "window fit if something opens small.")
 
 WRAPUP_TIMEOUT_S = 10
+IDLE_AUTOSTOP_S = 12
 ACT_BUDGET_S = 30
 HUMAN_BATCH_LIMIT = 12
 STYLED_ACTIONS = {"click", "double_click", "right_click", "move", "drag", "scroll", "type", "window", "focus"}
@@ -64,7 +66,7 @@ ACTION_VALUES = {
     "clipboard_set": {"type": "string"}, "clipboard_get": {"const": True},
 }
 TOOLS = [
-    {"name": "control", "description": "Start/stop/status. Stop cleans up; keep preserves windows. Resume only if user asks.",
+    {"name": "control", "description": "End every task with stop. Idle auto-release ~12s. Stop cleans up; keep preserves windows. Resume only if user asks.",
      "inputSchema": schema({"action": enum("start", "stop", "status"), "resume": {"type": "boolean"},
                             "keep": {"type": "array", "items": {"type": ["string", "integer"]}, "maxItems": 200},
                             "cleanup": {"type": "boolean"}}, ["action"])},
@@ -112,7 +114,8 @@ class DaemonClient:
         self.active = False
         self.closed = False
         self.disconnected = False
-        self.label = "AI"
+        self.label = "IA"
+        self.theme = "neutral"
 
     def connect(self):
         if self.closed:
@@ -214,7 +217,7 @@ class DaemonClient:
     def begin(self, resume=False):
         if not resume:
             self.check_abort()
-        self.call("session.begin", {"label": self.label, "resume": resume})
+        self.call("session.begin", {"label": self.label, "theme": self.theme, "resume": resume})
         self.check_abort()
 
     def ensure(self):
@@ -418,6 +421,52 @@ class Server:
         self.pending_requests = set()
         self.cancelled_requests = set()
         self.initialized = False
+        self.operation_lock = threading.RLock()
+        self.idle_condition = threading.Condition()
+        self.idle_deadline = None
+        self.idle_released = False
+        self.autostop_s = float(os.environ.get("PCPILOT_AUTOSTOP_S", IDLE_AUTOSTOP_S))
+        if not math.isfinite(self.autostop_s) or self.autostop_s < 0:
+            raise ValueError("PCPILOT_AUTOSTOP_S must be finite and nonnegative")
+        self.idle_thread = None
+
+    def _idle_watchdog(self):
+        while not self.cancelled.is_set():
+            with self.idle_condition:
+                if self.cancelled.is_set():
+                    return
+                deadline = self.idle_deadline
+                if deadline is None or deadline > time.monotonic():
+                    self.idle_condition.wait(None if deadline is None else max(0, deadline - time.monotonic()))
+                    continue
+            # Hold the same lock as the entire tool call, including local waits,
+            # image processing and AT-SPI observations. Recheck after acquiring it.
+            with self.operation_lock:
+                with self.idle_condition:
+                    if self.idle_deadline != deadline:
+                        continue
+                    self.idle_deadline = None
+                if (self.cancelled.is_set() or self.request_cancelled.is_set() or
+                        self.daemon.aborted or not self.daemon.active):
+                    continue
+                try:
+                    owner = self.daemon
+                    self.stop({"cleanup": False})
+                    if self.daemon is owner and not owner.closed:
+                        self.idle_released = True
+                except (protocol.ProtocolError, OSError, ValueError, KeyError, TypeError) as exc:
+                    print(f"pcpilot idle cleanup: {exc}", file=sys.stderr)
+
+    def client_identity(self, info):
+        name = str(info.get("name") or "")
+        folded = name.casefold()
+        theme = next((theme for theme, names in (
+            ("claude", ("claude",)), ("codex", ("codex", "openai")),
+            ("gemini", ("gemini", "antigravity"))) if any(part in folded for part in names)), "neutral")
+        self.daemon.label = ({"claude": "Claude", "codex": "Codex", "gemini": "Gemini"}.get(theme)
+                             or str(info.get("title") or name or "IA"))[:80]
+        override = os.environ.get("PCPILOT_THEME", "")
+        self.daemon.theme = override if override in {"claude", "codex", "gemini", "neutral"} else theme
 
     def screen(self):
         info = self.daemon.call("ui.screen.info")
@@ -479,9 +528,9 @@ class Server:
                 encoded = base64.b64encode(output.getvalue()).decode("ascii")
         note = f"{size[0]}x{size[1]}"
         if origin:
-            note += f" zoom region={json.dumps(origin, separators=(',', ':'))}; actions use global screen coordinates"
+            note += f" zoom region={json.dumps(origin, separators=(',', ':'))} actions:global"
         else:
-            note += " global screen coordinates"
+            note += " global coords"
         return [{"type": "image", "mimeType": "image/png", "data": encoded}, text(note)]
 
     def list_elements(self, args):
@@ -648,29 +697,32 @@ class Server:
     def stop(self, args):
         # Never auto-begin to tidy up; a previous abort/cancel prohibits *all*
         # further sends, including session.end. Inactive stop is entirely local.
-        self.daemon.check_abort()
+        # Cancellation may replace the owner while an idle wrapup is unwinding.
+        # Never end that new connection's session from the old cleanup.
+        daemon = self.daemon
+        daemon.check_abort()
         self.elements.clear()
-        if not self.daemon.active:
+        if not daemon.active:
             return [text("stopped")]
         wrapup = None
         failure = None
         try:
-            wrapup = self.daemon.call("ui.session.wrapup", {
+            wrapup = daemon.call("ui.session.wrapup", {
                 "keep": args.get("keep", []), "close_new": args.get("cleanup", True),
                 "return_to": "origin"}, timeout=WRAPUP_TIMEOUT_S)
         except protocol.ProtocolError as exc:
-            if self.daemon.aborted:
+            if daemon.aborted:
                 raise protocol.ProtocolError("user_aborted", "User took control") from exc
             if exc.code in {"user_aborted", "cancelled", "timeout", "disconnected"}:
                 raise
-            self.daemon.check_abort()
+            daemon.check_abort()
             # Older extensions have no wrapup. Other UI failures must still
             # release a live session, with a compact indication of failed cleanup.
             if exc.code != "unknown_op":
                 failure = exc.code
-        self.daemon.check_abort()
-        self.daemon.call("session.end")
-        self.daemon.active = False
+        daemon.check_abort()
+        daemon.call("session.end")
+        daemon.active = False
         parts = ["stopped"]
         if wrapup is not None:
             parts.append(f"closed {len(wrapup.get('closed', []))}")
@@ -692,6 +744,30 @@ class Server:
         return [text(" · ".join(parts))]
 
     def tool(self, name, args):
+        with self.operation_lock:
+            with self.idle_condition:
+                self.idle_deadline = None
+                self.idle_condition.notify_all()
+            try:
+                content = self._tool(name, args)
+                if self.idle_released and self.daemon.active:
+                    content.append(text("session resumed"))
+                    self.idle_released = False
+                if name == "control" and args.get("action") == "stop":
+                    self.idle_released = False
+                return content
+            finally:
+                with self.idle_condition:
+                    if (self.autostop_s and self.daemon.active and not self.daemon.aborted and
+                            not self.cancelled.is_set() and not self.request_cancelled.is_set()):
+                        self.idle_deadline = time.monotonic() + self.autostop_s
+                        if self.idle_thread is None:
+                            self.idle_thread = threading.Thread(target=self._idle_watchdog,
+                                                                name="pcpilot-idle", daemon=True)
+                            self.idle_thread.start()
+                    self.idle_condition.notify_all()
+
+    def _tool(self, name, args):
         if self.cancelled.is_set():
             raise protocol.ProtocolError("cancelled", "MCP input closed")
         if self.request_cancelled.is_set():
@@ -705,6 +781,7 @@ class Server:
                 return [text("active")]
             if action == "stop":
                 return self.stop(args)
+            self.daemon.check_abort()
             status = self.daemon.call("session.status")
             if status.get("aborted"):
                 self.daemon.aborted = True
@@ -794,7 +871,8 @@ class Server:
             info = params.get("clientInfo", {})
             if not isinstance(info, dict):
                 return error(-32602, "Invalid clientInfo")
-            self.daemon.label = str(info.get("name", "AI"))[:80]
+            if not self.initialized:
+                self.client_identity(info)
             version = params.get("protocolVersion")
             self.initialized = True
             result = {"protocolVersion": version if isinstance(version, str) and version in VERSIONS else "2025-06-18",
@@ -832,9 +910,10 @@ class Server:
             # A cancelled request's socket remains closed until that dispatch
             # has unwound. Only the next request can create a new owner.
             if self.request_cancelled.is_set() and not self.cancelled.is_set():
-                label, aborted = self.daemon.label, self.daemon.aborted
+                label, theme, aborted = self.daemon.label, self.daemon.theme, self.daemon.aborted
                 self.daemon = DaemonClient()
                 self.daemon.label = label
+                self.daemon.theme = theme
                 # Request cancellation does not create a user abort, and it
                 # must not erase one already observed from hotkey/release.
                 self.daemon.aborted = aborted
@@ -855,6 +934,9 @@ class Server:
             # Close the owner before touching the worker. No additional action
             # from this batch can send, and pcpilotd releases the session.
             self.daemon.close()
+            with self.idle_condition:
+                self.idle_deadline = None
+                self.idle_condition.notify_all()
             if request_id is None:
                 self.worker.close()
             elif hasattr(self.worker, "cancel"):
