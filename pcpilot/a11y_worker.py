@@ -70,6 +70,11 @@ NODE_CAP = 6000
 SCAN_SECONDS = 9
 REF_CAP = 3000
 OFFSCREEN_PEEK = 10
+BUTTON_NAMES = {
+    "close": {"close", "fechar"}, "minimize": {"minimize", "minimizar"},
+    "maximize": {"maximize", "maximizar", "restore", "restaurar", "unmaximize"},
+}
+BUTTON_NAMES["unmaximize"] = BUTTON_NAMES["maximize"]
 LOCK_ATTEMPTS = 50
 
 
@@ -640,6 +645,68 @@ class Reader:
             result["elements"] = rows[:maximum]
         return result
 
+    # -- window buttons
+    def button(self, request):
+        """Centre of a window's own close/minimize/maximize button, or {"found": false}."""
+        atspi = self.atspi
+        names = BUTTON_NAMES.get(request.get("action"))
+        windows = request.get("windows", [])
+        target = next((w for w in windows if str(w.get("id")) == str(request.get("window"))), None)
+        if names is None or target is None:
+            return {"found": False}
+        desktop = atspi.get_desktop(0)
+        for app_index in range(desktop.get_child_count()):
+            try:
+                app = desktop.get_child_at_index(app_index)
+                if app.get_process_id() != target.get("pid"):
+                    continue
+                tops = [app.get_child_at_index(i) for i in range(min(app.get_child_count(), 100))]
+            except Exception:
+                continue
+            for top in tops:
+                try:
+                    tw = rect(top, atspi.CoordType.WINDOW)
+                    window = match_window(target["pid"], top.get_name() or "", windows, len(tops),
+                                          (tw[2], tw[3]) if tw else None, self.state(top.get_state_set(), "ACTIVE"))
+                    if window is None or str(window["id"]) != str(target["id"]):
+                        continue
+                    found = self.find_button(top, tw, window, names)
+                except Exception:
+                    continue
+                if found:
+                    return {"found": True, "x": found[0], "y": found[1]}
+        return {"found": False}
+
+    def find_button(self, top, tw, window, names):
+        atspi = self.atspi
+        best = None
+        queue = [(top, 0)]
+        visited = 0
+        while queue and visited < 800:
+            node, depth = queue.pop(0)
+            visited += 1
+            try:
+                role = (node.get_role_name() or "").lower()
+                if role in {"button", "push button"} and (node.get_name() or "").strip().casefold() in names:
+                    states = node.get_state_set()
+                    box = global_rect(rect(node, atspi.CoordType.WINDOW), tw, window)
+                    if (box and self.state(states, "VISIBLE") and self.state(states, "SHOWING")
+                            and box[1] - window["y"] <= 80 and box[0] + box[2] / 2 > window["x"] + window["width"] / 2):
+                        # Firefox also reports a "Close" for its hidden menu bar: take the right-most,
+                        # then the largest (the tab strip's real one).
+                        rank = (round(box[0] + box[2] / 2), box[2] * box[3])
+                        if best is None or rank > best[0]:
+                            best = (rank, (rank[0], round(box[1] + box[3] / 2)))
+                    continue
+                if depth < 8 and role not in {"document web", "document frame", "menu", "popup menu"}:
+                    for index in range(min(node.get_child_count(), 60)):
+                        child = node.get_child_at_index(index)
+                        if child is not None:
+                            queue.append((child, depth + 1))
+            except Exception:
+                continue
+        return best[1] if best else None
+
     # -- live locate
     def locate(self, request):
         atspi = self.atspi
@@ -719,7 +786,8 @@ def main():
                 else:
                     if reader is None:
                         reader = Reader()
-                    response = reader.locate(request) if op == "locate" else reader.snapshot(request)
+                    response = (reader.locate(request) if op == "locate" else
+                                reader.button(request) if op == "button" else reader.snapshot(request))
             except Exception as exc:
                 print(f"pcpilot AT-SPI: {exc}", file=sys.stderr)
                 response = {"error": str(exc)}
