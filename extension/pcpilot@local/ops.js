@@ -964,6 +964,8 @@ export class Ops {
         if (!Array.isArray(uris) || uris.some(u => typeof u !== 'string'))
             throw new OpError(E_BAD_ARGS, 'uris must be an array of strings');
         const waitMs = num(args.wait_ms, 'wait_ms', {min: 0, max: MAX_LAUNCH_WAIT_MS, def: 8000});
+        const style = styleOf(args);
+        const started = GLib.get_monotonic_time();
         const running = app.get_windows().length > 0;
         const allBefore = new Set(listWindows().map(w => w.get_id()));
         const result = {app_id: app.get_id(), name: app.get_name()};
@@ -971,7 +973,7 @@ export class Ops {
         if (running && uris.length === 0) {
             // Already running: bring it forward rather than spawning another window.
             const [w] = app.get_windows();
-            await this._activateRecorded(w, token);
+            await this._activateRecorded(w, token, style);
             await token.sleep(100);
             result.window = this._info(w);
             return result;
@@ -992,8 +994,8 @@ export class Ops {
             if (spawned)
                 this.session.author(w);
             // Focus-stealing prevention can leave a freshly launched window unfocused;
-            // the agent launched it to use it.
-            await this._activate(w, token);
+            // the agent launched it to use it (human style: by clicking its title bar).
+            await this._activateWindow(w, this._launchStyle(style, started), token);
             await token.sleep(100);
             result.window = this._info(w);
         } else if (running) {
@@ -1022,6 +1024,8 @@ export class Ops {
         if (!GLib.uri_peek_scheme(uri))
             throw new OpError(E_BAD_ARGS, 'uri needs a scheme (https://, file://, ...)');
         const waitMs = num(args.wait_ms, 'wait_ms', {min: 0, max: MAX_LAUNCH_WAIT_MS, def: 8000});
+        const style = styleOf(args);
+        const started = GLib.get_monotonic_time();
         const handler = await this._defaultHandler(uri, token);
         token.check();
         const app = handler ? Shell.AppSystem.get_default().lookup_app(handler.get_id()) : null;
@@ -1053,7 +1057,7 @@ export class Ops {
             return {};
         if (spawned)
             this.session.author(w);
-        await this._activate(w, token);
+        await this._activateWindow(w, this._launchStyle(style, started), token);
         return {window: this._info(w)};
     }
 
@@ -1070,6 +1074,132 @@ export class Ops {
             w.activate(global.get_current_time());
         if (this._fixKeyFocus())
             await token.sleep(50);
+    }
+
+    // ---- pointer-driven window actions (human style) ----
+
+    _onActiveWorkspace(w) {
+        return w.is_on_all_workspaces() ||
+            w.get_workspace()?.index() === global.workspace_manager.get_active_workspace_index();
+    }
+
+    // Can a click reach this window right now: on screen, this workspace, no overview?
+    _pointerReachable(w) {
+        return !w.minimized && !w.is_fullscreen() && !Main.overview.visible &&
+            !Main.overview.animationInProgress && this._onActiveWorkspace(w);
+    }
+
+    // Is `w` the topmost visible window at (x, y)?
+    _topmostAt(w, x, y) {
+        const hit = listWindows().find(o => {
+            const r = o.get_frame_rect();
+            return !o.minimized && this._onActiveWorkspace(o) &&
+                x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+        });
+        return hit === w;
+    }
+
+    // A visible spot on the title bar where a click only focuses the window.
+    _titleSpot(w, xs = TITLE_SPOTS.map(fx => w.get_frame_rect().x + w.get_frame_rect().width * fx)) {
+        const f = w.get_frame_rect();
+        const y = f.y + Math.min(18, Math.floor(f.height / 2));
+        for (const x0 of xs) {
+            const x = Math.round(x0 + (Math.random() - 0.5) * 8);
+            if (onMonitor(x, y) && this._topmostAt(w, x, y))
+                return [x, y];
+        }
+        return null;
+    }
+
+    // Where a titlebar button of `kind` usually sits (right-hand corner): where the
+    // pointer rests before a programmatic close/minimize/maximize. Falls back to any
+    // visible title bar spot.
+    _buttonSpot(w, kind) {
+        const f = w.get_frame_rect();
+        const off = TITLEBAR_BUTTON_OFFSET[kind];
+        return (off !== undefined ? this._titleSpot(w, [f.x + f.width - off]) : null) ?? this._titleSpot(w);
+    }
+
+    _titlebarDoubleClickMaximizes() {
+        try {
+            const src = Gio.SettingsSchemaSource.get_default();
+            if (!src?.lookup('org.gnome.desktop.wm.preferences', true))
+                return false;
+            return new Gio.Settings({schema_id: 'org.gnome.desktop.wm.preferences'})
+                .get_string('action-double-click-titlebar') === 'toggle-maximize';
+        } catch {
+            return false;
+        }
+    }
+
+    // Human activation is skipped (programmatic instead) when the op has waited so long
+    // for its window that the pointer route would not fit the op guard any more.
+    _launchStyle(style, startedUs) {
+        const left = LAUNCH_OP_BUDGET_MS - (GLib.get_monotonic_time() - startedUs) / 1000;
+        return left >= POINTER_ACTIVATE_MS ? style : 'fast';
+    }
+
+    // Activate `w`. Human style clicks its title bar with the AI pointer (focused already:
+    // nothing to do; minimized, on another workspace, covered, in the overview or if the
+    // click did not focus it: the programmatic activation). Returns how it was done.
+    async _activateWindow(w, style, token) {
+        if (style === 'human' && w.has_focus() && !Main.overview.visible) {
+            if (this._fixKeyFocus())
+                await token.sleep(50);
+            return 'focused';
+        }
+        if (style === 'human' && this._pointerReachable(w)) {
+            const spot = this._titleSpot(w);
+            if (spot) {
+                await this._glideTo(...spot, style, token);
+                await this._hover(style, token);
+                await this._pressRelease(BUTTONS.left, 1, style, token);
+                for (let i = 0; i < 12 && !w.has_focus(); i++)
+                    await token.sleep(40);
+                if (this._fixKeyFocus())
+                    await token.sleep(50);
+                if (w.has_focus())
+                    return 'pointer';
+            }
+        }
+        await this._activate(w, token);
+        return 'programmatic';
+    }
+
+    // Pointer route for close/minimize/maximize/unmaximize (human style). The pointer
+    // glides to the caller's `at` (the real titlebar button, found by the caller) and
+    // clicks it; without `at`, to the title bar: double-clicking it to (un)maximize when
+    // the desktop is set that way, otherwise just resting where the button would be. The
+    // shell cannot locate client-drawn buttons by itself, so it never clicks blind.
+    // done(windowsBefore) tells whether the click had the wanted effect. Returns 'pointer'
+    // if it did, null when the caller must apply the action programmatically.
+    async _chromeByPointer(w, args, style, token, kind, done) {
+        if (style !== 'human' || !this._pointerReachable(w))
+            return null;
+        let at = null;
+        if (args.at !== undefined && args.at !== null) {
+            at = point(args.at, 'at');
+            const f = w.get_frame_rect();
+            if (at[0] < f.x || at[0] >= f.x + f.width || at[1] < f.y || at[1] >= f.y + f.height)
+                throw new OpError(E_BAD_ARGS, 'at must lie inside the window');
+            if (!this._topmostAt(w, ...at))
+                at = null; // covered by another window: not a click we can aim
+        }
+        const doubleClick = !at && (kind === 'maximize' || kind === 'unmaximize') &&
+            this._titlebarDoubleClickMaximizes();
+        const target = at ?? (doubleClick ? this._titleSpot(w) : this._buttonSpot(w, kind));
+        if (!target)
+            return null;
+        await this._glideTo(...target, style, token);
+        await this._hover(style, token);
+        if (!at && !doubleClick)
+            return null;
+        const before = new Set(listWindows().map(x => x.get_id()));
+        await this._pressRelease(BUTTONS.left, doubleClick ? 2 : 1, style, token);
+        for (let waited = 0; waited < CHROME_WAIT_MS && !done(before); waited += 40)
+            await token.sleep(40);
+        this._fixKeyFocus();
+        return done(before) ? 'pointer' : null;
     }
 
     // windowInfo plus `new` (created during this session) and `ai` (opened by the AI:
@@ -1139,16 +1269,17 @@ export class Ops {
         return num(v, name, {min: MIN_WINDOW_PX, max: 32767});
     }
 
-    // Activate a window on the AI's behalf, journaling what that changed.
-    async _activateRecorded(w, token) {
+    // Activate a window on the AI's behalf, journaling what that changed. Returns how.
+    async _activateRecorded(w, token, style = 'instant') {
         const ws = global.workspace_manager.get_active_workspace_index();
         const before = windowState(w);
-        await this._activate(w, token);
+        const via = await this._activateWindow(w, style, token);
         if (before.minimized) // activation only mutates the minimized state
             this.session.record(w, before, ['minimized']);
         const now = global.workspace_manager.get_active_workspace_index();
         if (now !== ws)
             this.session.recordWorkspace(now);
+        return via;
     }
 
     // Wait (briefly) for a client to finish applying a new geometry.
@@ -1187,7 +1318,6 @@ export class Ops {
 
     async _windowActionImpl(w, args, token, mut) {
         const style = styleOf(args);
-        const time = global.get_current_time();
         const corner = r => [r.x + r.width - 10, r.y + r.height - 10];
         const titlebar = r => [r.x + r.width / 2, r.y + 14];
         switch (args.action) {
@@ -1223,29 +1353,41 @@ export class Ops {
             return {changed: true, ...await this._animateGeometry(w, target, corner, style, token, mut)};
         }
         }
+        let via = 'programmatic';
         switch (args.action) {
         case 'activate':
-            await this._activateRecorded(w, token);
+            via = await this._activateRecorded(w, token, style);
             break;
         case 'close':
-            w.delete(time);
+            via = await this._chromeByPointer(w, args, style, token, 'close',
+                before => !listWindows().includes(w) || listWindows().some(x => !before.has(x.get_id()))) ??
+                'programmatic';
+            if (via !== 'pointer')
+                w.delete(global.get_current_time());
             break;
         case 'maximize':
-            if (!w.is_maximized()) {
+        case 'unmaximize': {
+            const want = args.action === 'maximize';
+            if (w.is_maximized() !== want) {
                 mut.add('maximized').add('geometry');
-                w.maximize();
+                via = await this._chromeByPointer(w, args, style, token, args.action,
+                    () => w.is_maximized() === want) ?? 'programmatic';
+                if (via !== 'pointer') {
+                    if (want)
+                        w.maximize();
+                    else
+                        w.unmaximize();
+                }
             }
             break;
-        case 'unmaximize':
-            if (w.is_maximized()) {
-                mut.add('maximized').add('geometry');
-                w.unmaximize();
-            }
-            break;
+        }
         case 'minimize':
             if (!w.minimized) {
                 mut.add('minimized');
-                w.minimize();
+                via = await this._chromeByPointer(w, args, style, token, 'minimize', () => w.minimized) ??
+                    'programmatic';
+                if (via !== 'pointer')
+                    w.minimize();
             }
             break;
         case 'fullscreen':
@@ -1266,7 +1408,7 @@ export class Ops {
                 'unfullscreen, resize, move or fit');
         }
         await token.sleep(50);
-        return {};
+        return {via};
     }
 
     // ---- session wrapup ----
@@ -1436,7 +1578,7 @@ export class Ops {
             const [hx, hy] = clampToMonitors(...home);
             const [px, py] = global.get_pointer();
             if (Math.hypot(hx - px, hy - py) >= 1.5)
-                await this._glideTo(hx, hy, 'human', token);
+                await this._glideTo(hx, hy, 'human', token, {pace: WRAPUP_PACE});
         }
     }
 
